@@ -22,25 +22,33 @@ First, check for custom review guidelines at `~/.config/reviewer/review_guide.md
 
 ### Phase 1: Gather Information
 
-1. **Determine the PR context:**
+**IMPORTANT:** You are already in a git worktree with the PR branch checked out. The code is local - use git directly, NOT `gh` commands to fetch diffs.
+
+1. **Get the PR base commit and diff:**
+   ```bash
+   # Get the PR's base branch and find the merge-base (where PR diverged)
+   PR_NUMBER=<from initial prompt>
+   BASE_SHA=$(gh pr view $PR_NUMBER --json baseRefOid --jq '.baseRefOid')
+
+   # Diff from the merge-base to HEAD (the PR's changes only)
+   git diff -U10 $BASE_SHA...HEAD
+   ```
+
+   If `gh pr view` fails, fall back to merge-base with origin/main:
+   ```bash
+   MERGE_BASE=$(git merge-base origin/main HEAD)
+   git diff -U10 $MERGE_BASE HEAD
+   ```
+
+2. **Get PR metadata** (for comment submission):
    ```bash
    # Get repo info
    gh repo view --json nameWithOwner --jq '.nameWithOwner'
 
-   # List open PRs to find the one we're reviewing
-   gh pr list --json number,headRefName,title
-
-   # Get current branch
-   git branch --show-current
+   # The PR number is provided in the initial prompt
    ```
 
-2. **Get the diff:**
-   ```bash
-   # Get diff with context (10 lines)
-   git diff -U10 main...HEAD
-   ```
-
-3. **Read surrounding code** for additional context when needed.
+3. **Read surrounding code** using local files for additional context when needed.
 
 ### Phase 2: Analyze and Identify Issues
 
@@ -121,17 +129,26 @@ Parse user input:
 For each selected comment, submit using `gh` CLI:
 
 ```bash
-# For line-specific comments on a PR (note: line must be integer with -F, not -f)
-gh api repos/{owner}/{repo}/pulls/{pr_number}/comments \
-  -X POST \
-  -f body="[Comment text]" \
-  -f commit_id="$(git rev-parse HEAD)" \
-  -f path="[file path]" \
-  -F line=[line number] \
-  -f side="RIGHT" \
-  -f subject_type="line"
+# For line-specific comments, use a review with comments array                                                                          
+  gh api repos/{owner}/{repo}/pulls/{pr_number}/reviews \
+    -X POST \
+    -f event="COMMENT" \
+    -f body="" \
+    --raw-field comments='[{"path":"[file path]","line":[line number],"body":"[Comment text]"}]'
 ```
 
+Or for a single inline comment without creating a full review:                                                                                             
+
+```bash
+# Use the correct parameters for single-line comments                                                                                   
+  gh api repos/{owner}/{repo}/pulls/{pr_number}/comments \
+    -X POST \
+    -f body="[Comment text]" \
+    -f commit_id="$(git rev-parse HEAD)" \
+    -f path="[file path]" \
+    -F line=[line number] \
+    -f side="RIGHT"
+```
 **Important API notes:**
 - Use `-F line=123` (not `-f`) so the number is sent as integer, not string
 - `subject_type` must be `"line"` for single-line comments

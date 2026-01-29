@@ -121,15 +121,22 @@ Parse user input:
 For each selected comment, submit using `gh` CLI:
 
 ```bash
-# For line-specific comments on a PR
+# For line-specific comments on a PR (note: line must be integer with -F, not -f)
 gh api repos/{owner}/{repo}/pulls/{pr_number}/comments \
   -X POST \
   -f body="[Comment text]" \
   -f commit_id="$(git rev-parse HEAD)" \
   -f path="[file path]" \
-  -f line=[line number] \
-  -f side="RIGHT"
+  -F line=[line number] \
+  -f side="RIGHT" \
+  -f subject_type="line"
 ```
+
+**Important API notes:**
+- Use `-F line=123` (not `-f`) so the number is sent as integer, not string
+- `subject_type` must be `"line"` for single-line comments
+- `side` should be `"RIGHT"` for new code (lines with `+`)
+- `commit_id` must be the HEAD commit of the PR branch
 
 If line-level comment fails, fall back to a general PR comment:
 ```bash

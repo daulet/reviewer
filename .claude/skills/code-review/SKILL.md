@@ -56,37 +56,69 @@ Keep track of:
 - Issue description
 - Severity level
 
-### Phase 3: Interactive Review
+### Phase 3: Present All Issues At Once
 
-Present each issue ONE AT A TIME to the user for approval.
+Show ALL issues in a summary table first:
 
-For each issue, show:
 ```
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Issue 1 of N [SEVERITY]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ #  │ Severity │ Location              │ Issue Summary
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 1  │ CRITICAL │ auth.rs:45            │ Token expiration not checked
+ 2  │ SUGGEST  │ auth.rs:23            │ Use constant-time comparison
+ 3  │ SUGGEST  │ middleware.rs:67      │ Error message reveals user existence
+ 4  │ NITPICK  │ auth.rs:12            │ Unused import
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
 
-File: path/to/file.rs
-Line: 42
+Then show FULL details of each issue below the table:
 
-Comment:
-  [Your detailed comment about the issue]
+```
+──────────────────────────────────────────────────────
+[1] CRITICAL - auth.rs:45
+──────────────────────────────────────────────────────
+Token expiration is not being checked. An expired token will still be
+accepted, allowing unauthorized access.
 
 Context:
-  [Show the relevant code snippet]
+    43│     let token = extract_token(&headers)?;
+    44│     let claims = decode_token(&token)?;
+  > 45│     Ok(claims.user_id)  // Missing: check claims.exp
+    46│ }
+──────────────────────────────────────────────────────
 
+[2] SUGGEST - auth.rs:23
+...
+```
+
+### Phase 4: Batch Selection
+
+After showing all issues, prompt for batch action:
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Which comments to submit?
+
+  a = all          Submit all comments
+  c = critical     Submit only CRITICAL issues
+  n = none         Skip all, proceed to summary
+  1,2,4 or 1-3     Select specific numbers
+  q = quit         Cancel review
+
+Your choice:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
-Then ask: **"Submit this comment? (y)es / (s)kip / (e)dit / (q)uit review"**
+Parse user input:
+- `a` or `all`: Submit every comment
+- `c` or `critical`: Submit only CRITICAL severity
+- `n` or `none`: Don't submit any, proceed to summary
+- Numbers like `1,2,4` or `1-3,5`: Submit selected issues
+- `q` or `quit`: Cancel the entire review
 
-- **yes**: Submit the comment using `gh` CLI
-- **skip**: Skip this comment, move to next
-- **edit**: Let user modify the comment text, then ask again
-- **quit**: Stop the review process
+### Phase 5: Submit Selected Comments
 
-### Phase 4: Submit Comments
-
-When user approves a comment, submit it using:
+For each selected comment, submit using `gh` CLI:
 
 ```bash
 # For line-specific comments on a PR
@@ -101,12 +133,21 @@ gh api repos/{owner}/{repo}/pulls/{pr_number}/comments \
 
 If line-level comment fails, fall back to a general PR comment:
 ```bash
-gh pr comment {pr_number} --body "[File:Line] [Comment text]"
+gh pr comment {pr_number} --body "**[file:line]** [Comment text]"
 ```
 
-### Phase 5: Final Summary and Approval
+Show progress as comments are submitted:
+```
+Submitting comments...
+  [1] auth.rs:45 ✓
+  [2] auth.rs:23 ✓
+  [3] middleware.rs:67 ✗ (failed - added as general comment)
+Done. 3 comments submitted.
+```
 
-After reviewing all issues, show a summary:
+### Phase 6: Final Summary and Approval
+
+Show final summary:
 
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

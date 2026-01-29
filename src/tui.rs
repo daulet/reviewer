@@ -437,11 +437,6 @@ impl App {
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     // Clear screen only when view/tab/selection changed
-    if app.needs_clear {
-        frame.render_widget(Clear, frame.area());
-        app.needs_clear = false;
-    }
-
     match app.view {
         View::List => draw_list(frame, app),
         View::Detail => draw_detail(frame, app),
@@ -756,6 +751,11 @@ pub fn run(prs: Vec<PullRequest>, repos_root: PathBuf) -> Result<()> {
 
     // Main loop
     loop {
+        // Force full terminal clear when needed
+        if app.needs_clear {
+            terminal.clear()?;
+            app.needs_clear = false;
+        }
         terminal.draw(|f| draw(f, &mut app))?;
         app.handle_event()?;
 

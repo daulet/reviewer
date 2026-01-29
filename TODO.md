@@ -2,7 +2,7 @@
 
 ## Features
 
-- [ ] Still pane clearing issues while launching claude and hitting tabs
+- [x] Still pane clearing issues while launching claude and hitting tabs (fixed with terminal.clear())
 - [ ] **Line-level review comments** - Allow attaching comments to specific lines in the diff view
   - Track cursor position in diff
   - Capture file path + line number

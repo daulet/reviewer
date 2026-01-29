@@ -277,7 +277,7 @@ impl App {
             thread::spawn(move || {
                 let result = gh::create_pr_worktree(&pr, &repos_root)
                     .and_then(|worktree_path| {
-                        gh::launch_claude(&worktree_path)?;
+                        gh::launch_claude(&worktree_path, &pr)?;
                         Ok(worktree_path.display().to_string())
                     })
                     .map_err(|e| e.to_string());

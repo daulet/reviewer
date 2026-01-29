@@ -1,11 +1,11 @@
 ---
 name: code-review
-description: Review code changes using custom guidelines from ~/.config/reviewer/review_guide.md
+description: Interactive code review with GitHub comment submission using gh CLI
 ---
 
 # Code Review Skill
 
-Review code changes (commits, branches, or staged files) following custom review guidelines.
+Interactively review code changes and submit approved comments to GitHub using `gh` CLI.
 
 ## Review Guidelines
 
@@ -20,91 +20,120 @@ First, check for custom review guidelines at `~/.config/reviewer/review_guide.md
 
 ## Workflow
 
-1. **Determine what to review:**
-   - If in a git worktree for a PR, review changes from the base branch
-   - Otherwise, check for staged changes (`git diff --cached`)
-   - If no staged changes, review uncommitted changes (`git diff`)
-   - User can also specify a commit range or branch
+### Phase 1: Gather Information
 
-2. **Gather context:**
-   - Run `git diff` or `git log -p` to get the changes
-   - Identify the files and languages involved
-   - Read surrounding code for context when needed
+1. **Determine the PR context:**
+   ```bash
+   # Get repo info
+   gh repo view --json nameWithOwner --jq '.nameWithOwner'
 
-3. **Perform the review:**
-   - Analyze each changed file
-   - Apply the review guidelines
-   - Note specific line numbers for issues
+   # List open PRs to find the one we're reviewing
+   gh pr list --json number,headRefName,title
 
-4. **Provide structured feedback:**
+   # Get current branch
+   git branch --show-current
+   ```
 
-## Output Format
+2. **Get the diff:**
+   ```bash
+   # Get diff with context (10 lines)
+   git diff -U10 main...HEAD
+   ```
 
-Structure your review as follows:
+3. **Read surrounding code** for additional context when needed.
 
-### Summary
-Brief overview of what the changes do and overall assessment (1-3 sentences).
+### Phase 2: Analyze and Identify Issues
 
-### Issues Found
-List issues by severity:
+Analyze the diff and categorize issues:
 
-**Critical** (must fix before merge):
-- `file.rs:42` - Description of critical issue
+- **Critical**: Must fix before merge (bugs, security issues)
+- **Suggestions**: Recommended improvements
+- **Nitpicks**: Minor style/preference issues
 
-**Suggestions** (recommended improvements):
-- `file.rs:78` - Description of suggestion
+Keep track of:
+- File path
+- Line number (from the NEW version, lines with `+`)
+- Issue description
+- Severity level
 
-**Nitpicks** (minor style/preference):
-- `file.rs:100` - Description of nitpick
+### Phase 3: Interactive Review
 
-### What Looks Good
-Briefly note well-implemented aspects (helps authors know what to keep doing).
+Present each issue ONE AT A TIME to the user for approval.
 
-## Commands
+For each issue, show:
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Issue 1 of N [SEVERITY]
 
-Use these git commands to gather information:
+File: path/to/file.rs
+Line: 42
 
-```bash
-# Get current branch info
-git branch --show-current
+Comment:
+  [Your detailed comment about the issue]
 
-# Check if in a worktree
-git worktree list
+Context:
+  [Show the relevant code snippet]
 
-# Get diff against main/master
-git diff main...HEAD
-
-# Get staged changes
-git diff --cached
-
-# Get unstaged changes
-git diff
-
-# Get specific commit
-git show <commit>
-
-# Get file at specific revision for context
-git show HEAD~1:path/to/file.rs
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
-## Example Review
+Then ask: **"Submit this comment? (y)es / (s)kip / (e)dit / (q)uit review"**
 
-### Summary
-This PR adds user authentication with JWT tokens. The implementation is solid overall, but there's a potential security issue with token validation.
+- **yes**: Submit the comment using `gh` CLI
+- **skip**: Skip this comment, move to next
+- **edit**: Let user modify the comment text, then ask again
+- **quit**: Stop the review process
 
-### Issues Found
+### Phase 4: Submit Comments
 
-**Critical:**
-- `auth.rs:45` - Token expiration is not being checked. An expired token will still be accepted.
+When user approves a comment, submit it using:
 
-**Suggestions:**
-- `auth.rs:23` - Consider using constant-time comparison for token validation to prevent timing attacks.
-- `middleware.rs:67` - The error message reveals whether the user exists. Use a generic "invalid credentials" message instead.
+```bash
+# For line-specific comments on a PR
+gh api repos/{owner}/{repo}/pulls/{pr_number}/comments \
+  -X POST \
+  -f body="[Comment text]" \
+  -f commit_id="$(git rev-parse HEAD)" \
+  -f path="[file path]" \
+  -f line=[line number] \
+  -f side="RIGHT"
+```
 
-**Nitpicks:**
-- `auth.rs:12` - Unused import `std::collections::HashMap`
+If line-level comment fails, fall back to a general PR comment:
+```bash
+gh pr comment {pr_number} --body "[File:Line] [Comment text]"
+```
 
-### What Looks Good
-- Clean separation between authentication and authorization logic
-- Good use of the Result type for error handling
-- Comprehensive logging for auth failures (helpful for debugging)
+### Phase 5: Final Summary and Approval
+
+After reviewing all issues, show a summary:
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Review Complete
+
+Comments submitted: X
+Comments skipped: Y
+Critical issues: Z
+
+[If critical issues > 0]
+  ⚠️  Critical issues were found. PR should not be approved until addressed.
+
+[If critical issues == 0]
+  ✓ No critical issues found.
+  Would you like to approve this PR? (y)es / (n)o
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+If user chooses to approve:
+```bash
+gh pr review {pr_number} --approve --body "Looks good! [optional summary]"
+```
+
+## Important Notes
+
+- Always confirm the PR number before submitting any comments
+- Use `gh auth status` to verify authentication if commands fail
+- Line numbers must correspond to the NEW version of the file (right side of diff)
+- Be constructive and specific in comments
+- Explain *why* something is an issue, not just *what*

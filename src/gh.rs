@@ -368,19 +368,25 @@ pub fn create_pr_worktree(pr: &PullRequest, repos_root: &std::path::Path) -> Res
 }
 
 /// Launch Claude Code CLI in a directory with code review prompt
-pub fn launch_claude(working_dir: &std::path::Path) -> Result<()> {
-    // Prompt that triggers the code-review skill
-    let prompt = "Review the code changes in this branch. Use the code-review skill and follow the guidelines in ~/.config/reviewer/review_guide.md";
+pub fn launch_claude(working_dir: &std::path::Path, pr: &PullRequest) -> Result<()> {
+    // Prompt that triggers the code-review skill with PR context
+    let prompt = format!(
+        "Review PR #{} in repo {}. Title: \"{}\". \
+         Use the code-review skill to analyze changes, present each issue for approval, \
+         and submit approved comments using gh CLI. Follow guidelines in ~/.config/reviewer/review_guide.md",
+        pr.number, pr.repo_name, pr.title.replace('"', "\\\"")
+    );
 
     #[cfg(target_os = "macos")]
     {
+        let escaped_prompt = prompt.replace('\'', "'\\''").replace('"', "\\\"");
         let script = format!(
             r#"tell application "Terminal"
                 activate
                 do script "cd '{}' && claude '{}'"
             end tell"#,
             working_dir.display(),
-            prompt.replace('\'', "'\\''").replace('"', "\\\"")
+            escaped_prompt
         );
         Command::new("osascript")
             .args(["-e", &script])

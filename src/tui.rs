@@ -9,6 +9,13 @@ use ratatui::{
     Frame,
 };
 use std::io;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
+
+enum AsyncResult {
+    Diff(usize, String),      // (pr_index, diff_content)
+    Comments(usize, Vec<Comment>), // (pr_index, comments)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum View {
@@ -42,6 +49,11 @@ pub struct App {
     pub input_buffer: String,
     pub status_message: Option<String>,
     pub should_quit: bool,
+    // Async loading
+    async_tx: Sender<AsyncResult>,
+    async_rx: Receiver<AsyncResult>,
+    loading_diff: bool,
+    loading_comments: bool,
 }
 
 impl App {
@@ -50,6 +62,7 @@ impl App {
         if !prs.is_empty() {
             list_state.select(Some(0));
         }
+        let (async_tx, async_rx) = mpsc::channel();
         Self {
             prs,
             list_state,
@@ -62,6 +75,10 @@ impl App {
             input_buffer: String::new(),
             status_message: None,
             should_quit: false,
+            async_tx,
+            async_rx,
+            loading_diff: false,
+            loading_comments: false,
         }
     }
 
@@ -104,6 +121,8 @@ impl App {
             self.scroll_offset = 0;
             self.diff_cache = None;
             self.comments_cache = None;
+            self.loading_diff = false;
+            self.loading_comments = false;
         }
     }
 
@@ -112,6 +131,8 @@ impl App {
         self.scroll_offset = 0;
         self.diff_cache = None;
         self.comments_cache = None;
+        self.loading_diff = false;
+        self.loading_comments = false;
     }
 
     fn next_tab(&mut self) {
@@ -121,6 +142,7 @@ impl App {
             DetailTab::Comments => DetailTab::Description,
         };
         self.scroll_offset = 0;
+        self.load_tab_content();
     }
 
     fn prev_tab(&mut self) {
@@ -130,6 +152,15 @@ impl App {
             DetailTab::Comments => DetailTab::Diff,
         };
         self.scroll_offset = 0;
+        self.load_tab_content();
+    }
+
+    fn load_tab_content(&mut self) {
+        match self.detail_tab {
+            DetailTab::Description => {}
+            DetailTab::Diff => self.load_diff(),
+            DetailTab::Comments => self.load_comments(),
+        }
     }
 
     fn scroll_down(&mut self) {
@@ -149,20 +180,56 @@ impl App {
     }
 
     fn load_diff(&mut self) {
-        if self.diff_cache.is_some() {
+        if self.diff_cache.is_some() || self.loading_diff {
             return;
         }
-        if let Some(pr) = self.selected_pr() {
-            self.diff_cache = Some(gh::get_pr_diff(pr).unwrap_or_else(|e| e.to_string()));
+        if let Some(idx) = self.list_state.selected() {
+            if let Some(pr) = self.prs.get(idx) {
+                self.loading_diff = true;
+                let pr = pr.clone();
+                let tx = self.async_tx.clone();
+                thread::spawn(move || {
+                    let diff = gh::get_pr_diff(&pr).unwrap_or_else(|e| e.to_string());
+                    let _ = tx.send(AsyncResult::Diff(idx, diff));
+                });
+            }
         }
     }
 
     fn load_comments(&mut self) {
-        if self.comments_cache.is_some() {
+        if self.comments_cache.is_some() || self.loading_comments {
             return;
         }
-        if let Some(pr) = self.selected_pr() {
-            self.comments_cache = Some(gh::get_pr_comments(pr).unwrap_or_default());
+        if let Some(idx) = self.list_state.selected() {
+            if let Some(pr) = self.prs.get(idx) {
+                self.loading_comments = true;
+                let pr = pr.clone();
+                let tx = self.async_tx.clone();
+                thread::spawn(move || {
+                    let comments = gh::get_pr_comments(&pr).unwrap_or_default();
+                    let _ = tx.send(AsyncResult::Comments(idx, comments));
+                });
+            }
+        }
+    }
+
+    fn poll_async_results(&mut self) {
+        while let Ok(result) = self.async_rx.try_recv() {
+            match result {
+                AsyncResult::Diff(idx, diff) => {
+                    // Only update if still viewing the same PR
+                    if self.list_state.selected() == Some(idx) {
+                        self.diff_cache = Some(diff);
+                    }
+                    self.loading_diff = false;
+                }
+                AsyncResult::Comments(idx, comments) => {
+                    if self.list_state.selected() == Some(idx) {
+                        self.comments_cache = Some(comments);
+                    }
+                    self.loading_comments = false;
+                }
+            }
         }
     }
 
@@ -234,7 +301,10 @@ impl App {
     }
 
     pub fn handle_event(&mut self) -> Result<()> {
-        if event::poll(std::time::Duration::from_millis(100))? {
+        // Poll for async results (non-blocking)
+        self.poll_async_results();
+
+        if event::poll(std::time::Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     return Ok(());
@@ -267,20 +337,6 @@ impl App {
                 KeyCode::Char('q') | KeyCode::Esc => self.exit_detail(),
                 KeyCode::Tab => self.next_tab(),
                 KeyCode::BackTab => self.prev_tab(),
-                KeyCode::Char('1') => {
-                    self.detail_tab = DetailTab::Description;
-                    self.scroll_offset = 0;
-                }
-                KeyCode::Char('2') => {
-                    self.detail_tab = DetailTab::Diff;
-                    self.scroll_offset = 0;
-                    self.load_diff();
-                }
-                KeyCode::Char('3') => {
-                    self.detail_tab = DetailTab::Comments;
-                    self.scroll_offset = 0;
-                    self.load_comments();
-                }
                 KeyCode::Char('j') | KeyCode::Down => self.scroll_down(),
                 KeyCode::Char('k') | KeyCode::Up => self.scroll_up(),
                 KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => self.page_down(),
@@ -446,7 +502,7 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
     frame.render_widget(header, chunks[0]);
 
     // Tabs
-    let tabs = Tabs::new(vec!["[1] Description", "[2] Diff", "[3] Comments"])
+    let tabs = Tabs::new(vec!["Description", "Diff", "Comments"])
         .select(match app.detail_tab {
             DetailTab::Description => 0,
             DetailTab::Diff => 1,
@@ -484,10 +540,14 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
             frame.render_widget(para, chunks[2]);
         }
         DetailTab::Diff => {
-            if app.diff_cache.is_none() {
+            if app.diff_cache.is_none() && !app.loading_diff {
                 app.load_diff();
             }
-            let diff = app.diff_cache.as_deref().unwrap_or("Loading...");
+            let diff = if app.loading_diff {
+                "Loading diff..."
+            } else {
+                app.diff_cache.as_deref().unwrap_or("Loading diff...")
+            };
             let lines: Vec<Line> = diff
                 .lines()
                 .map(|line| {
@@ -511,34 +571,37 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
             frame.render_widget(para, chunks[2]);
         }
         DetailTab::Comments => {
-            if app.comments_cache.is_none() {
+            if app.comments_cache.is_none() && !app.loading_comments {
                 app.load_comments();
             }
-            let comments = app.comments_cache.as_ref();
-            let text = match comments {
-                Some(c) if c.is_empty() => Text::raw("No comments yet."),
-                Some(c) => {
-                    let mut lines = Vec::new();
-                    for comment in c {
-                        let author = comment
-                            .author
-                            .as_ref()
-                            .and_then(|a| a.login.as_ref())
-                            .map(|s| s.as_str())
-                            .unwrap_or("unknown");
-                        let date = comment.created_at.format("%Y-%m-%d %H:%M");
-                        lines.push(Line::styled(
-                            format!("@{} ({})", author, date),
-                            Style::default().fg(Color::Cyan).bold(),
-                        ));
-                        for body_line in comment.body.lines() {
-                            lines.push(Line::raw(format!("  {}", body_line)));
+            let text = if app.loading_comments {
+                Text::raw("Loading comments...")
+            } else {
+                match app.comments_cache.as_ref() {
+                    Some(c) if c.is_empty() => Text::raw("No comments yet."),
+                    Some(c) => {
+                        let mut lines = Vec::new();
+                        for comment in c {
+                            let author = comment
+                                .author
+                                .as_ref()
+                                .and_then(|a| a.login.as_ref())
+                                .map(|s| s.as_str())
+                                .unwrap_or("unknown");
+                            let date = comment.created_at.format("%Y-%m-%d %H:%M");
+                            lines.push(Line::styled(
+                                format!("@{} ({})", author, date),
+                                Style::default().fg(Color::Cyan).bold(),
+                            ));
+                            for body_line in comment.body.lines() {
+                                lines.push(Line::raw(format!("  {}", body_line)));
+                            }
+                            lines.push(Line::raw(""));
                         }
-                        lines.push(Line::raw(""));
+                        Text::from(lines)
                     }
-                    Text::from(lines)
+                    None => Text::raw("Loading comments..."),
                 }
-                None => Text::raw("Loading..."),
             };
             let para = Paragraph::new(text)
                 .block(content_block)
@@ -550,7 +613,7 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
 
     // Help
     let help = Paragraph::new(
-        " 1/2/3: tabs | j/k: scroll | n/p: next/prev PR | c: comment | a: approve | q: back",
+        " Tab: switch tabs | j/k: scroll | n/p: next/prev PR | c: comment | a: approve | q: back",
     )
     .style(Style::default().fg(Color::DarkGray))
     .block(Block::default().borders(Borders::ALL).title(" Help "));

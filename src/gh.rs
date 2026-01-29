@@ -169,15 +169,80 @@ pub fn get_pr_diff(pr: &PullRequest) -> Result<String> {
         .output()
         .context("Failed to get PR diff")?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("too_large") {
-            return Ok("Diff too large to display".to_string());
-        }
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.contains("too_large") {
         anyhow::bail!("Failed to get diff: {}", stderr);
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    // Fallback: fetch diff locally for large PRs
+    get_pr_diff_local(pr)
+}
+
+#[derive(Debug, Deserialize)]
+struct PrRefs {
+    #[serde(rename = "baseRefOid")]
+    base_ref_oid: String,
+    #[serde(rename = "headRefOid")]
+    head_ref_oid: String,
+}
+
+fn get_pr_diff_local(pr: &PullRequest) -> Result<String> {
+    // Get the base and head commit SHAs
+    let output = Command::new("gh")
+        .args([
+            "pr", "view",
+            &pr.number.to_string(),
+            "--json", "baseRefOid,headRefOid",
+        ])
+        .current_dir(&pr.repo_path)
+        .output()
+        .context("Failed to get PR refs")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to get PR refs: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let refs: PrRefs = serde_json::from_slice(&output.stdout)
+        .context("Failed to parse PR refs")?;
+
+    // Fetch the head commit
+    let fetch_output = Command::new("git")
+        .args(["fetch", "origin", &refs.head_ref_oid])
+        .current_dir(&pr.repo_path)
+        .output()
+        .context("Failed to fetch head ref")?;
+
+    if !fetch_output.status.success() {
+        // Try fetching via PR ref instead
+        let pr_ref = format!("refs/pull/{}/head", pr.number);
+        let _ = Command::new("git")
+            .args(["fetch", "origin", &pr_ref])
+            .current_dir(&pr.repo_path)
+            .output();
+    }
+
+    // Generate diff locally
+    let diff_output = Command::new("git")
+        .args(["diff", &format!("{}...{}", refs.base_ref_oid, refs.head_ref_oid)])
+        .current_dir(&pr.repo_path)
+        .output()
+        .context("Failed to generate local diff")?;
+
+    if !diff_output.status.success() {
+        anyhow::bail!(
+            "Failed to generate diff: {}",
+            String::from_utf8_lossy(&diff_output.stderr)
+        );
+    }
+
+    Ok(String::from_utf8_lossy(&diff_output.stdout).to_string())
 }
 
 pub fn get_pr_comments(pr: &PullRequest) -> Result<Vec<Comment>> {

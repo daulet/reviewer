@@ -27,6 +27,7 @@ pub enum DetailTab {
 pub enum InputMode {
     Normal,
     Comment,
+    ConfirmApprove,
 }
 
 pub struct App {
@@ -192,7 +193,13 @@ impl App {
         self.input_buffer.clear();
     }
 
-    fn approve(&mut self) {
+    fn start_approve(&mut self) {
+        if self.selected_pr().is_some() {
+            self.input_mode = InputMode::ConfirmApprove;
+        }
+    }
+
+    fn confirm_approve(&mut self) {
         if let Some(pr) = self.selected_pr().cloned() {
             match gh::approve_pr(&pr, None) {
                 Ok(()) => {
@@ -219,6 +226,11 @@ impl App {
                 }
             }
         }
+        self.input_mode = InputMode::Normal;
+    }
+
+    fn cancel_approve(&mut self) {
+        self.input_mode = InputMode::Normal;
     }
 
     pub fn handle_event(&mut self) -> Result<()> {
@@ -234,6 +246,7 @@ impl App {
                 match self.input_mode {
                     InputMode::Normal => self.handle_normal_key(key.code, key.modifiers),
                     InputMode::Comment => self.handle_comment_key(key.code),
+                    InputMode::ConfirmApprove => self.handle_confirm_key(key.code),
                 }
             }
         }
@@ -247,7 +260,7 @@ impl App {
                 KeyCode::Char('j') | KeyCode::Down => self.next(),
                 KeyCode::Char('k') | KeyCode::Up => self.previous(),
                 KeyCode::Enter => self.enter_detail(),
-                KeyCode::Char('a') => self.approve(),
+                KeyCode::Char('a') => self.start_approve(),
                 _ => {}
             },
             View::Detail => match code {
@@ -275,7 +288,7 @@ impl App {
                 KeyCode::PageDown => self.page_down(),
                 KeyCode::PageUp => self.page_up(),
                 KeyCode::Char('c') => self.start_comment(),
-                KeyCode::Char('a') => self.approve(),
+                KeyCode::Char('a') => self.start_approve(),
                 KeyCode::Char('n') => {
                     self.exit_detail();
                     self.next();
@@ -288,6 +301,14 @@ impl App {
                 }
                 _ => {}
             },
+        }
+    }
+
+    fn handle_confirm_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.confirm_approve(),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => self.cancel_approve(),
+            _ => {}
         }
     }
 
@@ -334,6 +355,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // Draw comment input if active
     if app.input_mode == InputMode::Comment {
         draw_comment_input(frame, app);
+    }
+
+    // Draw confirmation dialog if active
+    if app.input_mode == InputMode::ConfirmApprove {
+        draw_confirm_dialog(frame, app);
     }
 }
 
@@ -551,6 +577,50 @@ fn draw_comment_input(frame: &mut Frame, app: &App) {
 
     frame.render_widget(Clear, popup_area);
     frame.render_widget(input, popup_area);
+}
+
+fn draw_confirm_dialog(frame: &mut Frame, app: &App) {
+    let pr = match app.selected_pr() {
+        Some(pr) => pr,
+        None => return,
+    };
+
+    let area = frame.area();
+    let popup_area = Rect {
+        x: area.width / 6,
+        y: area.height / 3,
+        width: area.width * 2 / 3,
+        height: 7,
+    };
+
+    let text = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  Approve "),
+            Span::styled(
+                format!("[{}] #{}", pr.repo_name, pr.number),
+                Style::default().fg(Color::Cyan).bold(),
+            ),
+            Span::raw("?"),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  [Y]", Style::default().fg(Color::Green).bold()),
+            Span::raw(" Yes    "),
+            Span::styled("[N]", Style::default().fg(Color::Red).bold()),
+            Span::raw(" No"),
+        ]),
+    ];
+
+    let dialog = Paragraph::new(text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Confirm Approval ")
+            .style(Style::default().fg(Color::Yellow)),
+    );
+
+    frame.render_widget(Clear, popup_area);
+    frame.render_widget(dialog, popup_area);
 }
 
 pub fn run(prs: Vec<PullRequest>) -> Result<()> {

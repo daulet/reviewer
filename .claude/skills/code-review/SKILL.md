@@ -191,12 +191,17 @@ Critical issues: Z
 ```
 
 If user chooses to approve:
+
 ```bash
-gh pr review {pr_number} --approve --body "Looks good! [optional summary]"
+# Approve WITHOUT --body to avoid duplicate comments
+gh pr review {pr_number} --approve
 ```
+
+**DO NOT use `--body` with approve** - review comments were already submitted in Phase 5. Adding `--body` creates a duplicate.
 
 ## Important Notes
 
+- **NO `--body` on approve** - comments are submitted separately in Phase 5
 - Always confirm the PR number before submitting any comments
 - Use `gh auth status` to verify authentication if commands fail
 - Line numbers must correspond to the NEW version of the file (right side of diff)

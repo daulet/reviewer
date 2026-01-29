@@ -4,8 +4,10 @@ mod repos;
 mod tui;
 
 use anyhow::Result;
+use rayon::prelude::*;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn prompt_for_repos_root() -> Result<PathBuf> {
     println!("First time setup: Please enter the root directory containing your repos.");
@@ -83,21 +85,29 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Fetch PRs from all repos
-    let mut all_prs = Vec::new();
-    for repo in &repo_list {
-        let name = repo.file_name().unwrap_or_default().to_string_lossy();
-        print!("  Checking {}...", name);
-        io::stdout().flush()?;
-        let prs = gh::fetch_prs_for_repo(repo, &username);
-        println!(" {} PRs", prs.len());
-        all_prs.extend(prs);
-    }
+    // Fetch PRs from all repos in parallel
+    println!("Fetching PRs from {} repositories...", repo_list.len());
+    let completed = AtomicUsize::new(0);
+    let total = repo_list.len();
+
+    let all_prs: Vec<_> = repo_list
+        .par_iter()
+        .flat_map(|repo| {
+            let prs = gh::fetch_prs_for_repo(repo, &username);
+            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+            eprint!("\r  Progress: {}/{}          ", done, total);
+            let _ = io::stderr().flush();
+            prs
+        })
+        .collect();
+
+    eprintln!("\r  Checked {} repositories.   ", total);
 
     // Sort by most recent first
+    let mut all_prs = all_prs;
     all_prs.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
 
-    println!("\nFound {} PRs requiring review. Launching TUI...\n", all_prs.len());
+    println!("\nFound {} PRs requiring review. Launching TUI...", all_prs.len());
 
     if all_prs.is_empty() {
         println!("No PRs need your attention. You're all caught up!");

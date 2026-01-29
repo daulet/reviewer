@@ -311,3 +311,107 @@ pub fn approve_pr(pr: &PullRequest, comment: Option<&str>) -> Result<()> {
 
     Ok(())
 }
+
+/// Create a worktree for a PR and return the path
+pub fn create_pr_worktree(pr: &PullRequest, repos_root: &std::path::Path) -> Result<std::path::PathBuf> {
+    let worktree_base = repos_root.join(".worktrees");
+    std::fs::create_dir_all(&worktree_base)?;
+
+    let worktree_name = format!("{}-pr-{}", pr.repo_name.replace('/', "-"), pr.number);
+    let worktree_path = worktree_base.join(&worktree_name);
+
+    // Remove existing worktree if it exists
+    if worktree_path.exists() {
+        let _ = Command::new("git")
+            .args(["worktree", "remove", "--force", worktree_path.to_str().unwrap()])
+            .current_dir(&pr.repo_path)
+            .output();
+        // Also try removing the directory directly if worktree remove failed
+        let _ = std::fs::remove_dir_all(&worktree_path);
+    }
+
+    // Fetch the PR head ref
+    let pr_ref = format!("refs/pull/{}/head", pr.number);
+    let fetch_output = Command::new("git")
+        .args(["fetch", "origin", &pr_ref])
+        .current_dir(&pr.repo_path)
+        .output()
+        .context("Failed to fetch PR ref")?;
+
+    if !fetch_output.status.success() {
+        anyhow::bail!(
+            "Failed to fetch PR: {}",
+            String::from_utf8_lossy(&fetch_output.stderr)
+        );
+    }
+
+    // Create worktree at FETCH_HEAD
+    let output = Command::new("git")
+        .args([
+            "worktree",
+            "add",
+            worktree_path.to_str().unwrap(),
+            "FETCH_HEAD",
+        ])
+        .current_dir(&pr.repo_path)
+        .output()
+        .context("Failed to create worktree")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to create worktree: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    Ok(worktree_path)
+}
+
+/// Launch Claude Code CLI in a directory
+pub fn launch_claude(working_dir: &std::path::Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!(
+            r#"tell application "Terminal"
+                activate
+                do script "cd '{}' && claude"
+            end tell"#,
+            working_dir.display()
+        );
+        Command::new("osascript")
+            .args(["-e", &script])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .context("Failed to launch Terminal")?;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let terminals = ["gnome-terminal", "konsole", "xterm"];
+        let mut launched = false;
+        for term in terminals {
+            let result = match term {
+                "gnome-terminal" => Command::new(term)
+                    .args(["--", "bash", "-c", &format!("cd '{}' && claude; exec bash", working_dir.display())])
+                    .spawn(),
+                "konsole" => Command::new(term)
+                    .args(["-e", "bash", "-c", &format!("cd '{}' && claude; exec bash", working_dir.display())])
+                    .spawn(),
+                _ => Command::new(term)
+                    .args(["-e", &format!("cd '{}' && claude", working_dir.display())])
+                    .spawn(),
+            };
+            if result.is_ok() {
+                launched = true;
+                break;
+            }
+        }
+        if !launched {
+            anyhow::bail!("Could not find a terminal emulator");
+        }
+    }
+
+    Ok(())
+}

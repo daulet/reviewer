@@ -9,12 +9,14 @@ use ratatui::{
     Frame,
 };
 use std::io;
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
 enum AsyncResult {
-    Diff(usize, String),      // (pr_index, diff_content)
+    Diff(usize, String),           // (pr_index, diff_content)
     Comments(usize, Vec<Comment>), // (pr_index, comments)
+    ClaudeLaunch(Result<String, String>), // worktree path or error
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -39,6 +41,7 @@ pub enum InputMode {
 
 pub struct App {
     pub prs: Vec<PullRequest>,
+    pub repos_root: PathBuf,
     pub list_state: ListState,
     pub view: View,
     pub detail_tab: DetailTab,
@@ -56,10 +59,12 @@ pub struct App {
     loading_comments: bool,
     // Screen state
     needs_clear: bool,
+    // Claude launch state
+    launching_claude: bool,
 }
 
 impl App {
-    pub fn new(prs: Vec<PullRequest>) -> Self {
+    pub fn new(prs: Vec<PullRequest>, repos_root: PathBuf) -> Self {
         let mut list_state = ListState::default();
         if !prs.is_empty() {
             list_state.select(Some(0));
@@ -67,6 +72,7 @@ impl App {
         let (async_tx, async_rx) = mpsc::channel();
         Self {
             prs,
+            repos_root,
             list_state,
             view: View::List,
             detail_tab: DetailTab::Description,
@@ -82,6 +88,7 @@ impl App {
             loading_diff: false,
             loading_comments: false,
             needs_clear: true,
+            launching_claude: false,
         }
     }
 
@@ -236,6 +243,18 @@ impl App {
                     }
                     self.loading_comments = false;
                 }
+                AsyncResult::ClaudeLaunch(result) => {
+                    self.launching_claude = false;
+                    self.needs_clear = true;
+                    match result {
+                        Ok(path) => {
+                            self.status_message = Some(format!("Launched Claude in {}", path));
+                        }
+                        Err(e) => {
+                            self.status_message = Some(format!("Failed: {}", e));
+                        }
+                    }
+                }
             }
         }
     }
@@ -243,6 +262,28 @@ impl App {
     fn start_comment(&mut self) {
         self.input_mode = InputMode::Comment;
         self.input_buffer.clear();
+    }
+
+    fn launch_claude_review(&mut self) {
+        if self.launching_claude {
+            return;
+        }
+        if let Some(pr) = self.selected_pr().cloned() {
+            self.launching_claude = true;
+            self.status_message = Some("Creating worktree and launching Claude...".to_string());
+
+            let tx = self.async_tx.clone();
+            let repos_root = self.repos_root.clone();
+            thread::spawn(move || {
+                let result = gh::create_pr_worktree(&pr, &repos_root)
+                    .and_then(|worktree_path| {
+                        gh::launch_claude(&worktree_path)?;
+                        Ok(worktree_path.display().to_string())
+                    })
+                    .map_err(|e| e.to_string());
+                let _ = tx.send(AsyncResult::ClaudeLaunch(result));
+            });
+        }
     }
 
     fn submit_comment(&mut self) {
@@ -352,6 +393,7 @@ impl App {
                 KeyCode::PageUp => self.page_up(),
                 KeyCode::Char('c') => self.start_comment(),
                 KeyCode::Char('a') => self.start_approve(),
+                KeyCode::Char('r') => self.launch_claude_review(),
                 KeyCode::Char('n') => {
                     self.exit_detail();
                     self.next();
@@ -625,7 +667,7 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
 
     // Help
     let help = Paragraph::new(
-        " Tab: switch tabs | j/k: scroll | n/p: next/prev PR | c: comment | a: approve | q: back",
+        " Tab: tabs | j/k: scroll | r: claude review | c: comment | a: approve | n/p: PR | q: back",
     )
     .style(Style::default().fg(Color::DarkGray))
     .block(Block::default().borders(Borders::ALL).title(" Help "));
@@ -698,7 +740,7 @@ fn draw_confirm_dialog(frame: &mut Frame, app: &App) {
     frame.render_widget(dialog, popup_area);
 }
 
-pub fn run(prs: Vec<PullRequest>) -> Result<()> {
+pub fn run(prs: Vec<PullRequest>, repos_root: PathBuf) -> Result<()> {
     // Setup terminal
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -710,7 +752,7 @@ pub fn run(prs: Vec<PullRequest>) -> Result<()> {
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::new(backend)?;
 
-    let mut app = App::new(prs);
+    let mut app = App::new(prs, repos_root);
 
     // Main loop
     loop {

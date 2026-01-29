@@ -115,7 +115,7 @@ fn main() -> Result<()> {
     }
 
     // Launch TUI
-    tui::run(all_prs)?;
+    tui::run(all_prs, repos_root)?;
 
     Ok(())
 }

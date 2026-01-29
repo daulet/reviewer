@@ -367,16 +367,20 @@ pub fn create_pr_worktree(pr: &PullRequest, repos_root: &std::path::Path) -> Res
     Ok(worktree_path)
 }
 
-/// Launch Claude Code CLI in a directory
+/// Launch Claude Code CLI in a directory with code review prompt
 pub fn launch_claude(working_dir: &std::path::Path) -> Result<()> {
+    // Prompt that triggers the code-review skill
+    let prompt = "Review the code changes in this branch. Use the code-review skill and follow the guidelines in ~/.config/reviewer/review_guide.md";
+
     #[cfg(target_os = "macos")]
     {
         let script = format!(
             r#"tell application "Terminal"
                 activate
-                do script "cd '{}' && claude"
+                do script "cd '{}' && claude '{}'"
             end tell"#,
-            working_dir.display()
+            working_dir.display(),
+            prompt.replace('\'', "'\\''").replace('"', "\\\"")
         );
         Command::new("osascript")
             .args(["-e", &script])
@@ -389,18 +393,19 @@ pub fn launch_claude(working_dir: &std::path::Path) -> Result<()> {
 
     #[cfg(target_os = "linux")]
     {
+        let escaped_prompt = prompt.replace('\'', "'\\''");
         let terminals = ["gnome-terminal", "konsole", "xterm"];
         let mut launched = false;
         for term in terminals {
             let result = match term {
                 "gnome-terminal" => Command::new(term)
-                    .args(["--", "bash", "-c", &format!("cd '{}' && claude; exec bash", working_dir.display())])
+                    .args(["--", "bash", "-c", &format!("cd '{}' && claude '{}'; exec bash", working_dir.display(), escaped_prompt)])
                     .spawn(),
                 "konsole" => Command::new(term)
-                    .args(["-e", "bash", "-c", &format!("cd '{}' && claude; exec bash", working_dir.display())])
+                    .args(["-e", "bash", "-c", &format!("cd '{}' && claude '{}'; exec bash", working_dir.display(), escaped_prompt)])
                     .spawn(),
                 _ => Command::new(term)
-                    .args(["-e", &format!("cd '{}' && claude", working_dir.display())])
+                    .args(["-e", &format!("cd '{}' && claude '{}'", working_dir.display(), escaped_prompt)])
                     .spawn(),
             };
             if result.is_ok() {

@@ -54,6 +54,8 @@ pub struct App {
     async_rx: Receiver<AsyncResult>,
     loading_diff: bool,
     loading_comments: bool,
+    // Screen state
+    needs_clear: bool,
 }
 
 impl App {
@@ -79,6 +81,7 @@ impl App {
             async_rx,
             loading_diff: false,
             loading_comments: false,
+            needs_clear: true,
         }
     }
 
@@ -123,6 +126,7 @@ impl App {
             self.comments_cache = None;
             self.loading_diff = false;
             self.loading_comments = false;
+            self.needs_clear = true;
         }
     }
 
@@ -133,6 +137,7 @@ impl App {
         self.comments_cache = None;
         self.loading_diff = false;
         self.loading_comments = false;
+        self.needs_clear = true;
     }
 
     fn next_tab(&mut self) {
@@ -142,6 +147,7 @@ impl App {
             DetailTab::Comments => DetailTab::Description,
         };
         self.scroll_offset = 0;
+        self.needs_clear = true;
         self.load_tab_content();
     }
 
@@ -152,6 +158,7 @@ impl App {
             DetailTab::Comments => DetailTab::Diff,
         };
         self.scroll_offset = 0;
+        self.needs_clear = true;
         self.load_tab_content();
     }
 
@@ -387,6 +394,12 @@ impl App {
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    // Clear screen only when view/tab/selection changed
+    if app.needs_clear {
+        frame.render_widget(Clear, frame.area());
+        app.needs_clear = false;
+    }
+
     match app.view {
         View::List => draw_list(frame, app),
         View::Detail => draw_detail(frame, app),
@@ -517,7 +530,6 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
         .block(Block::default().borders(Borders::ALL));
     frame.render_widget(tabs, chunks[1]);
 
-    // Content
     let content_block = Block::default()
         .borders(Borders::ALL)
         .title(match app.detail_tab {

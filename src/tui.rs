@@ -1896,4 +1896,164 @@ test.rs
         assert!(stripped.contains("⋮"));
         assert!(stripped.contains("│"));
     }
+
+    // ==================== Tests for parse_diff (non-delta built-in mode) ====================
+
+    #[test]
+    fn test_parse_diff_basic() {
+        let diff = r#"diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -10,4 +10,5 @@ fn main() {
+     let x = 1;
++    let y = 2;
+     println!("test");
+ }"#;
+
+        let result = parse_diff(diff);
+
+        // Line 0: diff --git header
+        assert_eq!(result[0].file_path.as_deref(), Some("src/main.rs"));
+        assert_eq!(result[0].line_type, DiffLineType::Header);
+
+        // Line 1-2: --- and +++ headers
+        assert_eq!(result[1].line_type, DiffLineType::Header);
+        assert_eq!(result[2].line_type, DiffLineType::Header);
+
+        // Line 3: @@ hunk header
+        assert_eq!(result[3].line_type, DiffLineType::Hunk);
+
+        // Line 4: context line "     let x = 1;"
+        assert_eq!(result[4].line_type, DiffLineType::Context);
+        assert_eq!(result[4].old_line_number, Some(10));
+        assert_eq!(result[4].line_number, Some(10));
+
+        // Line 5: added line "+    let y = 2;"
+        assert_eq!(result[5].line_type, DiffLineType::Added);
+        assert_eq!(result[5].old_line_number, None);
+        assert_eq!(result[5].line_number, Some(11));
+
+        // Line 6: context line "     println!..."
+        assert_eq!(result[6].line_type, DiffLineType::Context);
+        assert_eq!(result[6].old_line_number, Some(11));
+        assert_eq!(result[6].line_number, Some(12));
+    }
+
+    #[test]
+    fn test_parse_diff_removed_lines() {
+        let diff = r#"diff --git a/test.rs b/test.rs
+--- a/test.rs
++++ b/test.rs
+@@ -1,4 +1,3 @@
+ fn main() {
+-    let old = 1;
+     let keep = 2;
+ }"#;
+
+        let result = parse_diff(diff);
+
+        // Line 4: context "fn main()"
+        assert_eq!(result[4].line_type, DiffLineType::Context);
+        assert_eq!(result[4].old_line_number, Some(1));
+        assert_eq!(result[4].line_number, Some(1));
+
+        // Line 5: removed line (has old_line_number, no line_number)
+        assert_eq!(result[5].line_type, DiffLineType::Removed);
+        assert_eq!(result[5].old_line_number, Some(2));
+        assert_eq!(result[5].line_number, None);
+
+        // Line 6: context "let keep" - shifted in new file
+        assert_eq!(result[6].line_type, DiffLineType::Context);
+        assert_eq!(result[6].old_line_number, Some(3));
+        assert_eq!(result[6].line_number, Some(2));
+    }
+
+    #[test]
+    fn test_parse_diff_multiple_files() {
+        let diff = r#"diff --git a/file1.rs b/file1.rs
+--- a/file1.rs
++++ b/file1.rs
+@@ -1,2 +1,2 @@
+-old content
++new content
+diff --git a/file2.rs b/file2.rs
+--- a/file2.rs
++++ b/file2.rs
+@@ -5,2 +5,3 @@
+ existing
++added line"#;
+
+        let result = parse_diff(diff);
+
+        // First file
+        assert_eq!(result[0].file_path.as_deref(), Some("file1.rs"));
+        assert_eq!(result[4].file_path.as_deref(), Some("file1.rs"));
+        assert_eq!(result[4].line_type, DiffLineType::Removed);
+        assert_eq!(result[5].line_type, DiffLineType::Added);
+
+        // Second file - should switch file path
+        assert_eq!(result[6].file_path.as_deref(), Some("file2.rs"));
+        assert_eq!(result[6].line_type, DiffLineType::Header);
+
+        // Lines in second file start at line 5
+        assert_eq!(result[10].line_type, DiffLineType::Context);
+        assert_eq!(result[10].old_line_number, Some(5));
+        assert_eq!(result[11].line_type, DiffLineType::Added);
+        assert_eq!(result[11].line_number, Some(6));
+    }
+
+    #[test]
+    fn test_parse_diff_hunk_header_parsing() {
+        // Test various hunk header formats
+        let diff = r#"diff --git a/test.rs b/test.rs
+--- a/test.rs
++++ b/test.rs
+@@ -100,5 +200,10 @@ fn context_function() {
+ context line"#;
+
+        let result = parse_diff(diff);
+
+        // After hunk header, lines should start at correct numbers
+        // Old file: starts at 100, new file: starts at 200
+        assert_eq!(result[4].line_type, DiffLineType::Context);
+        assert_eq!(result[4].old_line_number, Some(100));
+        assert_eq!(result[4].line_number, Some(200));
+    }
+
+    #[test]
+    fn test_parse_diff_no_newline_marker() {
+        // "\ No newline at end of file" should be treated as Other
+        let diff = r#"diff --git a/test.rs b/test.rs
+--- a/test.rs
++++ b/test.rs
+@@ -1,2 +1,2 @@
+-old
++new
+\ No newline at end of file"#;
+
+        let result = parse_diff(diff);
+
+        // The backslash line should be Other type
+        assert_eq!(result[6].line_type, DiffLineType::Other);
+        assert_eq!(result[6].line_number, None);
+        assert_eq!(result[6].old_line_number, None);
+    }
+
+    #[test]
+    fn test_parse_diff_file_path_extraction() {
+        // Test file path extraction from various diff formats
+        let diff = r#"diff --git a/path/to/file.rs b/path/to/file.rs
+--- a/path/to/file.rs
++++ b/path/to/file.rs
+@@ -1 +1 @@
+-old
++new"#;
+
+        let result = parse_diff(diff);
+
+        // All lines should have the correct file path
+        for line in &result {
+            assert_eq!(line.file_path.as_deref(), Some("path/to/file.rs"));
+        }
+    }
 }

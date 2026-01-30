@@ -109,7 +109,7 @@ fn parse_diff(diff: &str) -> Vec<DiffLine> {
 }
 
 enum AsyncResult {
-    Diff(usize, String),                  // (pr_index, diff_content)
+    Diff(usize, String, Option<String>),  // (pr_index, diff_content, delta_output)
     Comments(usize, Vec<Comment>),        // (pr_index, comments)
     ClaudeLaunch(Result<String, String>), // worktree path or error
     Refresh(Vec<PullRequest>),            // refreshed PR list
@@ -154,7 +154,8 @@ pub struct App {
     pub detail_tab: DetailTab,
     pub scroll_offset: u16,
     pub diff_cache: Option<String>,
-    pub diff_lines: Vec<DiffLine>, // Parsed diff with line info
+    pub delta_cache: Option<String>, // Pre-processed delta output (ANSI)
+    pub diff_lines: Vec<DiffLine>,   // Parsed diff with line info
     pub comments_cache: Option<Vec<Comment>>,
     pub input_mode: InputMode,
     pub input_buffer: String,
@@ -195,6 +196,7 @@ impl App {
             detail_tab: DetailTab::Description,
             scroll_offset: 0,
             diff_cache: None,
+            delta_cache: None,
             diff_lines: Vec::new(),
             comments_cache: None,
             input_mode: InputMode::Normal,
@@ -303,6 +305,7 @@ impl App {
             self.detail_tab = DetailTab::Description;
             self.scroll_offset = 0;
             self.diff_cache = None;
+            self.delta_cache = None;
             self.diff_lines.clear();
             self.comments_cache = None;
             self.loading_diff = false;
@@ -315,6 +318,7 @@ impl App {
         self.view = View::List;
         self.scroll_offset = 0;
         self.diff_cache = None;
+        self.delta_cache = None;
         self.diff_lines.clear();
         self.comments_cache = None;
         self.loading_diff = false;
@@ -377,9 +381,13 @@ impl App {
                 self.loading_diff = true;
                 let pr = pr.clone();
                 let tx = self.async_tx.clone();
+                // Get terminal width for delta's side-by-side mode
+                let width = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(120);
                 thread::spawn(move || {
                     let diff = gh::get_pr_diff(&pr).unwrap_or_else(|e| e.to_string());
-                    let _ = tx.send(AsyncResult::Diff(idx, diff));
+                    // Process with delta in background
+                    let delta_output = diff::process_with_delta(&diff, width);
+                    let _ = tx.send(AsyncResult::Diff(idx, diff, delta_output));
                 });
             }
         }
@@ -405,11 +413,12 @@ impl App {
     fn poll_async_results(&mut self) {
         while let Ok(result) = self.async_rx.try_recv() {
             match result {
-                AsyncResult::Diff(idx, diff) => {
+                AsyncResult::Diff(idx, diff, delta_output) => {
                     // Only update if still viewing the same PR
                     if self.list_state.selected() == Some(idx) {
                         self.diff_lines = parse_diff(&diff);
                         self.diff_cache = Some(diff);
+                        self.delta_cache = delta_output;
                     }
                     self.loading_diff = false;
                 }
@@ -889,11 +898,16 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
         .block(Block::default().borders(Borders::ALL));
     frame.render_widget(tabs, chunks[1]);
 
+    let diff_title = if diff::delta_available() {
+        " Diff (delta) "
+    } else {
+        " Diff (built-in) "
+    };
     let content_block = Block::default()
         .borders(Borders::ALL)
         .title(match app.detail_tab {
             DetailTab::Description => " Description ",
-            DetailTab::Diff => " Diff ",
+            DetailTab::Diff => diff_title,
             DetailTab::Comments => " Comments ",
         });
 
@@ -916,7 +930,11 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
             }
             let lines: Vec<Line> = if app.loading_diff {
                 vec![Line::raw("Loading diff...")]
+            } else if let Some(delta_output) = app.delta_cache.as_deref() {
+                // Use pre-processed delta output
+                diff::render_from_ansi(delta_output)
             } else if let Some(diff_content) = app.diff_cache.as_deref() {
+                // Fallback to built-in rendering
                 diff::render_diff(diff_content, &app.syntax_highlighter)
             } else {
                 vec![Line::raw("Loading diff...")]

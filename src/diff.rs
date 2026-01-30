@@ -1,13 +1,121 @@
+use ansi_to_tui::IntoText;
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
 use similar::{ChangeTag, TextDiff};
+use std::io::Write;
 use std::path::Path;
+use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use syntect::{
     highlighting::{Theme, ThemeSet},
     parsing::SyntaxSet,
 };
+
+/// Check if delta is available on the system (cached)
+fn is_delta_available() -> bool {
+    static DELTA_AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *DELTA_AVAILABLE.get_or_init(|| {
+        Command::new("delta")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
+}
+
+/// Pipe diff content through delta and return ANSI-colored output
+fn run_delta(diff: &str, width: u16) -> Option<String> {
+    use std::time::Duration;
+
+    // Skip delta for very large diffs (>100KB) to avoid slow processing
+    if diff.len() > 100_000 {
+        return None;
+    }
+
+    let mut child = Command::new("delta")
+        .args([
+            "--dark",
+            "--paging=never",
+            "--line-numbers",
+            "--side-by-side",
+            &format!("--width={}", width),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    // Write to stdin and close it
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(diff.as_bytes());
+        // stdin is dropped here, closing the pipe
+    }
+
+    // Wait with timeout using a separate thread
+    let timeout = Duration::from_secs(10);
+    let handle = std::thread::spawn(move || child.wait_with_output());
+
+    // Wait for the thread with timeout
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if handle.is_finished() {
+            return handle
+                .join()
+                .ok()
+                .and_then(|r| r.ok())
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Timeout - we can't easily kill the child from here, but the thread will eventually finish
+    None
+}
+
+/// Process diff through delta asynchronously (call from background thread)
+/// Returns Some(ansi_output) if delta is available, None otherwise
+pub fn process_with_delta(diff: &str, width: u16) -> Option<String> {
+    if is_delta_available() {
+        run_delta(diff, width)
+    } else {
+        None
+    }
+}
+
+/// Convert a Line with borrowed content to owned content
+fn line_to_owned(line: Line<'_>) -> Line<'static> {
+    Line::from(
+        line.spans
+            .into_iter()
+            .map(|span| Span::styled(span.content.to_string(), span.style))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// Render ANSI-colored string to ratatui Lines (for cached delta output)
+pub fn render_from_ansi(ansi_text: &str) -> Vec<Line<'static>> {
+    match ansi_text.into_text() {
+        Ok(text) => text.lines.into_iter().map(line_to_owned).collect(),
+        Err(_) => {
+            // Fallback: just split by newlines without ANSI parsing
+            ansi_text
+                .lines()
+                .map(|l| Line::raw(l.to_string()))
+                .collect()
+        }
+    }
+}
+
+/// Check if delta is available for rendering (public API)
+pub fn delta_available() -> bool {
+    is_delta_available()
+}
 
 /// Holds syntax highlighting state
 pub struct SyntaxHighlighter {

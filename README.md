@@ -4,10 +4,12 @@ Automate mundane parts of code review. Speed up your workflow with LLM.
 
 ## Features
 
-- List PRs needing your attention;
-- Approve PRs or add comments without leaving the terminal;
-- Launch [Claude Code](https://github.com/anthropics/claude-code) for AI-assisted reviews;
-- Continuously learn from your own feedback to improve AI accuracy on next review;
+- List PRs needing your attention across multiple repositories
+- Approve PRs or add comments without leaving the terminal
+- Add line-level comments directly from the diff view
+- Enhanced diff rendering with [delta](https://github.com/dandavison/delta) (side-by-side, syntax highlighting)
+- Launch [Claude Code](https://github.com/anthropics/claude-code) for AI-assisted reviews
+- Continuously learn from your feedback to improve AI accuracy
 
 ## Installation
 
@@ -28,10 +30,20 @@ Download the latest binary from [Releases](https://github.com/daulet/reviewer/re
 cargo install --git https://github.com/daulet/reviewer
 ```
 
-## Requirements
+## Setup
+
+### Required
 
 - [GitHub CLI](https://cli.github.com/) (`gh`) - authenticated with `gh auth login`
-- [Claude Code](https://github.com/anthropics/claude-code) (optional) - for AI-assisted reviews
+
+### Optional
+
+| Tool | Purpose | Install |
+|------|---------|---------|
+| [delta](https://github.com/dandavison/delta) | Enhanced diff rendering (side-by-side, syntax highlighting) | `brew install git-delta` |
+| [Claude Code](https://github.com/anthropics/claude-code) | AI-assisted code reviews | `npm install -g @anthropic-ai/claude-code` |
+
+The diff view automatically detects if delta is installed and uses it for rendering. Otherwise, falls back to built-in syntax highlighting.
 
 ## Usage
 
@@ -64,22 +76,27 @@ On first run, you'll be prompted to set your repos root directory.
 |-----|--------|
 | `Tab` | Switch tabs (Description/Diff/Comments) |
 | `j/k` | Scroll |
+| `Ctrl+d/u` | Page down/up |
 | `c` | Add line comment (in Diff tab) |
 | `r` | Launch Claude review |
 | `a` | Approve |
 | `n/p` | Next/previous PR |
 | `q` | Back to list |
 
-## Claude Code Setup
+## Claude Code Integration
 
-For AI-assisted reviews, install the code-review skill:
+For AI-assisted reviews, set up the code-review skill:
+
+### 1. Install the skill
 
 ```bash
 mkdir -p ~/.claude/skills/code-review
 cp .claude/skills/code-review/SKILL.md ~/.claude/skills/code-review/
 ```
 
-If running Claude sandboxed, add these permissions to `~/.claude/settings.json`:
+### 2. Configure Claude Code permissions
+
+Add to `~/.claude/settings.json`:
 
 ```json
 {
@@ -91,6 +108,36 @@ If running Claude sandboxed, add these permissions to `~/.claude/settings.json`:
   "sandbox": {
     "excludedCommands": ["gh"]
   }
+}
+```
+
+### 3. Customize review guidelines (optional)
+
+Create `~/.config/reviewer/review_guide.md` to customize what the AI looks for:
+
+```markdown
+## Focus Areas
+- Security vulnerabilities
+- Performance issues
+- Error handling
+
+## Skip These
+- Unused imports
+- Minor style issues
+```
+
+The AI learns from skipped comments and offers to update this file automatically.
+
+## Configuration
+
+Config is stored at:
+- macOS/Linux: `~/.config/reviewer/config.json`
+- Windows: `%APPDATA%\reviewer\config.json`
+
+```json
+{
+  "repos_root": "/path/to/your/repos",
+  "exclude": ["archived", "vendor"]
 }
 ```
 

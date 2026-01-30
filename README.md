@@ -51,6 +51,8 @@ On first run, you'll be prompted to set your repos root directory.
 | Key | Action |
 |-----|--------|
 | `j/k` | Navigate |
+| `Ctrl+d/u` | Page down/up |
+| `g/G` | First/last |
 | `Enter` | Open PR details |
 | `a` | Approve PR |
 | `R` | Refresh |

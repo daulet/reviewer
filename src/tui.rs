@@ -151,6 +151,42 @@ impl App {
         self.list_state.select(Some(i));
     }
 
+    fn next_page(&mut self) {
+        if self.prs.is_empty() {
+            return;
+        }
+        let page_size = 10;
+        let i = match self.list_state.selected() {
+            Some(i) => (i + page_size).min(self.prs.len() - 1),
+            None => 0,
+        };
+        self.list_state.select(Some(i));
+    }
+
+    fn previous_page(&mut self) {
+        if self.prs.is_empty() {
+            return;
+        }
+        let page_size = 10;
+        let i = match self.list_state.selected() {
+            Some(i) => i.saturating_sub(page_size),
+            None => 0,
+        };
+        self.list_state.select(Some(i));
+    }
+
+    fn go_to_first(&mut self) {
+        if !self.prs.is_empty() {
+            self.list_state.select(Some(0));
+        }
+    }
+
+    fn go_to_last(&mut self) {
+        if !self.prs.is_empty() {
+            self.list_state.select(Some(self.prs.len() - 1));
+        }
+    }
+
     fn enter_detail(&mut self) {
         if self.selected_pr().is_some() {
             self.view = View::Detail;
@@ -448,6 +484,16 @@ impl App {
                 KeyCode::Char('q') => self.should_quit = true,
                 KeyCode::Char('j') | KeyCode::Down => self.next(),
                 KeyCode::Char('k') | KeyCode::Up => self.previous(),
+                KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => self.next_page(),
+                KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.previous_page()
+                }
+                KeyCode::PageDown => self.next_page(),
+                KeyCode::PageUp => self.previous_page(),
+                KeyCode::Char('g') => self.go_to_first(),
+                KeyCode::Char('G') => self.go_to_last(),
+                KeyCode::Home => self.go_to_first(),
+                KeyCode::End => self.go_to_last(),
                 KeyCode::Enter => self.enter_detail(),
                 KeyCode::Char('a') => self.start_approve(),
                 KeyCode::Char('R') => self.refresh(),
@@ -599,7 +645,7 @@ fn draw_list(frame: &mut Frame, app: &mut App) {
     frame.render_stateful_widget(list, chunks[0], &mut app.list_state);
 
     let help = Paragraph::new(
-        " j/k: navigate | Enter: open | R: refresh | d: toggle drafts | a: approve | q: quit",
+        " j/k: navigate | Ctrl+d/u: page | g/G: first/last | Enter: open | R: refresh | d: drafts | a: approve | q: quit",
     )
     .style(Style::default().fg(Color::DarkGray))
     .block(Block::default().borders(Borders::ALL).title(" Help "));

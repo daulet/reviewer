@@ -38,8 +38,9 @@ fn strip_ansi_codes(s: &str) -> String {
 #[derive(Debug, Clone)]
 pub struct DiffLine {
     pub file_path: Option<String>,
-    pub line_number: Option<u32>, // Line number in the new file (for + lines)
-    #[allow(dead_code)] // May be used for line type indicators in future
+    pub line_number: Option<u32>,     // Line number in the new file (for + and context lines)
+    pub old_line_number: Option<u32>, // Line number in the old file (for - and context lines)
+    #[allow(dead_code)] // Used for potential future styling
     pub line_type: DiffLineType,
 }
 
@@ -53,10 +54,108 @@ pub enum DiffLineType {
     Other,
 }
 
+/// Represents a line in delta output with parsed file/line info
+#[derive(Debug, Clone, Default)]
+pub struct DeltaLineInfo {
+    pub file_path: Option<String>,
+    pub old_line_number: Option<u32>,
+    pub new_line_number: Option<u32>,
+}
+
+/// Parse delta output to extract file paths and line numbers
+/// Delta format: " <old_num> ⋮ <new_num> │ <content>" for code lines
+/// File headers appear as plain text matching known file paths
+fn parse_delta_output(delta_output: &str, raw_diff: &str) -> Vec<DeltaLineInfo> {
+    let mut result = Vec::new();
+    let mut current_file: Option<String> = None;
+
+    // Extract all file paths from the raw diff
+    let mut known_files: Vec<String> = Vec::new();
+    for line in raw_diff.lines() {
+        if line.starts_with("diff --git") {
+            if let Some(b_path) = line.split(" b/").nth(1) {
+                known_files.push(b_path.to_string());
+            }
+        }
+    }
+
+    for line in delta_output.lines() {
+        let clean = strip_ansi_codes(line);
+        let trimmed = clean.trim();
+
+        // Check if this line is a file header (matches a known file path)
+        for file in &known_files {
+            if trimmed == file || trimmed.ends_with(file) {
+                current_file = Some(file.clone());
+                break;
+            }
+        }
+
+        // Try to parse line numbers from delta format
+        // Format 1 (unified): " <old>⋮ <new>│" for diff lines
+        // Format 2 (side-by-side): "│ <old>│<content>│ <new>│<content>"
+        // Format 3 (hunk header): "<num>: <content>"
+
+        let mut old_num: Option<u32> = None;
+        let mut new_num: Option<u32> = None;
+
+        if let Some(separator_pos) = clean.find('⋮') {
+            // Unified mode with ⋮ separator
+            let before_sep = &clean[..separator_pos];
+            let after_sep = &clean[separator_pos + '⋮'.len_utf8()..];
+
+            old_num = before_sep
+                .split_whitespace()
+                .last()
+                .and_then(|s| s.parse().ok());
+
+            new_num = if let Some(pipe_pos) = after_sep.find('│') {
+                after_sep[..pipe_pos]
+                    .split_whitespace()
+                    .next()
+                    .and_then(|s| s.parse().ok())
+            } else {
+                after_sep.split_whitespace().next().and_then(|s| s.parse().ok())
+            };
+        } else if clean.starts_with('│') {
+            // Side-by-side mode: "│ <num>│<content>│ <num>│<content>"
+            // Split by │ and look for numbers
+            let parts: Vec<&str> = clean.split('│').collect();
+            // parts[0] is empty (before first │)
+            // parts[1] might be " 130" (old line number)
+            // parts[2] is content
+            // parts[3] might be " 130" (new line number)
+            // parts[4] is content
+            if parts.len() >= 2 {
+                old_num = parts[1].trim().parse().ok();
+            }
+            if parts.len() >= 4 {
+                new_num = parts[3].trim().parse().ok();
+            }
+        } else if let Some(colon_pos) = clean.find(':') {
+            // Hunk header format: "<num>: <content>"
+            let before_colon = clean[..colon_pos].trim();
+            if let Ok(line_num) = before_colon.parse::<u32>() {
+                old_num = Some(line_num);
+                new_num = Some(line_num);
+            }
+        }
+
+        result.push(DeltaLineInfo {
+            file_path: current_file.clone(),
+            old_line_number: old_num,
+            new_line_number: new_num,
+        });
+    }
+
+    result
+}
+
 /// Parse a unified diff and extract file paths and line numbers
 fn parse_diff(diff: &str) -> Vec<DiffLine> {
     let mut result = Vec::new();
     let mut current_file: Option<String> = None;
+    let mut old_line_num: u32 = 0;
     let mut new_line_num: u32 = 0;
 
     for line in diff.lines() {
@@ -68,23 +167,27 @@ fn parse_diff(diff: &str) -> Vec<DiffLine> {
             result.push(DiffLine {
                 file_path: current_file.clone(),
                 line_number: None,
+                old_line_number: None,
                 line_type: DiffLineType::Header,
             });
         } else if line.starts_with("+++") || line.starts_with("---") {
             result.push(DiffLine {
                 file_path: current_file.clone(),
                 line_number: None,
+                old_line_number: None,
                 line_type: DiffLineType::Header,
             });
         } else if line.starts_with("@@") {
-            // Parse hunk header: @@ -start,count +start,count @@
-            // Extract the +start number for new file line tracking
+            // Parse hunk header: @@ -old_start,count +new_start,count @@
+            if let Some(minus_part) = line.split('-').nth(1) {
+                if let Some(start_str) = minus_part.split(',').next().or_else(|| minus_part.split(' ').next()) {
+                    if let Ok(start) = start_str.parse::<u32>() {
+                        old_line_num = start;
+                    }
+                }
+            }
             if let Some(plus_part) = line.split('+').nth(1) {
-                if let Some(start_str) = plus_part
-                    .split(',')
-                    .next()
-                    .or_else(|| plus_part.split(' ').next())
-                {
+                if let Some(start_str) = plus_part.split(',').next().or_else(|| plus_part.split(' ').next()) {
                     if let Ok(start) = start_str.parse::<u32>() {
                         new_line_num = start;
                     }
@@ -93,33 +196,40 @@ fn parse_diff(diff: &str) -> Vec<DiffLine> {
             result.push(DiffLine {
                 file_path: current_file.clone(),
                 line_number: None,
+                old_line_number: None,
                 line_type: DiffLineType::Hunk,
             });
         } else if line.starts_with('+') && !line.starts_with("+++") {
             result.push(DiffLine {
                 file_path: current_file.clone(),
                 line_number: Some(new_line_num),
+                old_line_number: None,
                 line_type: DiffLineType::Added,
             });
             new_line_num += 1;
         } else if line.starts_with('-') && !line.starts_with("---") {
             result.push(DiffLine {
                 file_path: current_file.clone(),
-                line_number: None, // Removed lines don't have a line number in new file
+                line_number: None,
+                old_line_number: Some(old_line_num),
                 line_type: DiffLineType::Removed,
             });
+            old_line_num += 1;
         } else if line.starts_with(' ') || (!line.starts_with('\\') && !line.is_empty()) {
             // Context line (unchanged)
             result.push(DiffLine {
                 file_path: current_file.clone(),
                 line_number: Some(new_line_num),
+                old_line_number: Some(old_line_num),
                 line_type: DiffLineType::Context,
             });
+            old_line_num += 1;
             new_line_num += 1;
         } else {
             result.push(DiffLine {
                 file_path: current_file.clone(),
                 line_number: None,
+                old_line_number: None,
                 line_type: DiffLineType::Other,
             });
         }
@@ -163,6 +273,13 @@ pub enum InputMode {
 pub struct LineCommentContext {
     pub file_path: String,
     pub line_number: u32,
+    pub side: CommentSide,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CommentSide {
+    Left,  // Old file (removed lines)
+    Right, // New file (added/context lines)
 }
 
 pub struct App {
@@ -177,7 +294,9 @@ pub struct App {
     pub scroll_offset: u16,
     pub diff_cache: Option<String>,
     pub delta_cache: Option<String>, // Pre-processed delta output (ANSI)
+    pub use_delta: bool,             // Whether to use delta for rendering
     pub diff_lines: Vec<DiffLine>,   // Parsed diff with line info
+    pub delta_line_info: Vec<DeltaLineInfo>, // Parsed delta output line info
     pub comments_cache: Option<Vec<Comment>>,
     pub input_mode: InputMode,
     pub input_buffer: String,
@@ -223,7 +342,9 @@ impl App {
             scroll_offset: 0,
             diff_cache: None,
             delta_cache: None,
+            use_delta: true, // Use delta by default if available
             diff_lines: Vec::new(),
+            delta_line_info: Vec::new(),
             comments_cache: None,
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
@@ -336,6 +457,7 @@ impl App {
             self.diff_cache = None;
             self.delta_cache = None;
             self.diff_lines.clear();
+            self.delta_line_info.clear();
             self.comments_cache = None;
             self.loading_diff = false;
             self.loading_comments = false;
@@ -349,6 +471,7 @@ impl App {
         self.diff_cache = None;
         self.delta_cache = None;
         self.diff_lines.clear();
+        self.delta_line_info.clear();
         self.comments_cache = None;
         self.loading_diff = false;
         self.loading_comments = false;
@@ -447,6 +570,12 @@ impl App {
                     // Only update if still viewing the same PR
                     if self.list_state.selected() == Some(idx) {
                         self.diff_lines = parse_diff(&diff);
+                        // Parse delta output for line info if available
+                        if let Some(ref delta) = delta_output {
+                            self.delta_line_info = parse_delta_output(delta, &diff);
+                        } else {
+                            self.delta_line_info.clear();
+                        }
                         self.diff_cache = Some(diff);
                         self.delta_cache = delta_output;
                     }
@@ -504,25 +633,98 @@ impl App {
             return;
         }
 
-        // Get the diff line at current scroll position
+        let using_delta = self.use_delta && self.delta_cache.is_some();
         let line_idx = self.scroll_offset as usize;
+
+        if using_delta {
+            // Use parsed delta line info for accurate file/line lookup
+            if let Some(info) = self.delta_line_info.get(line_idx) {
+                if let Some(file_path) = &info.file_path {
+                    // Prefer new line number (RIGHT side), fall back to old (LEFT side)
+                    if let Some(line_num) = info.new_line_number {
+                        self.line_comment_ctx = Some(LineCommentContext {
+                            file_path: file_path.clone(),
+                            line_number: line_num,
+                            side: CommentSide::Right,
+                        });
+                        self.input_mode = InputMode::LineComment;
+                        self.input_buffer.clear();
+                        return;
+                    }
+                    if let Some(line_num) = info.old_line_number {
+                        self.line_comment_ctx = Some(LineCommentContext {
+                            file_path: file_path.clone(),
+                            line_number: line_num,
+                            side: CommentSide::Left,
+                        });
+                        self.input_mode = InputMode::LineComment;
+                        self.input_buffer.clear();
+                        return;
+                    }
+                }
+            }
+            // Debug: write full info to file
+            let mut debug_output = format!("=== Line {} ===\n", line_idx);
+            debug_output.push_str(&format!("delta_line_info.len() = {}\n", self.delta_line_info.len()));
+            debug_output.push_str(&format!("delta_cache lines = {}\n\n", self.delta_cache.as_ref().map(|d| d.lines().count()).unwrap_or(0)));
+
+            // Show lines around current position
+            let start = line_idx.saturating_sub(5);
+            let end = (line_idx + 5).min(self.delta_line_info.len().saturating_sub(1));
+            if !self.delta_line_info.is_empty() && start <= end {
+                for i in start..=end {
+                    let marker = if i == line_idx { ">>>" } else { "   " };
+                    let info = self.delta_line_info.get(i);
+                    let delta_line = self.delta_cache.as_ref()
+                        .and_then(|d| d.lines().nth(i))
+                        .map(strip_ansi_codes)
+                        .unwrap_or_default();
+                    debug_output.push_str(&format!(
+                        "{} [{}] file={:?} old={:?} new={:?}\n    content: {}\n",
+                        marker, i,
+                        info.and_then(|i| i.file_path.as_ref()),
+                        info.and_then(|i| i.old_line_number),
+                        info.and_then(|i| i.new_line_number),
+                        delta_line
+                    ));
+                }
+            }
+            let _ = std::fs::write("/tmp/reviewer_debug.txt", &debug_output);
+            self.set_status("Debug written to /tmp/reviewer_debug.txt".to_string());
+            return;
+        }
+
+        // Built-in mode: direct index lookup
         if let Some(diff_line) = self.diff_lines.get(line_idx) {
-            // Only allow comments on added or context lines (they have line numbers)
-            if let (Some(file_path), Some(line_num)) = (&diff_line.file_path, diff_line.line_number)
-            {
-                self.line_comment_ctx = Some(LineCommentContext {
-                    file_path: file_path.clone(),
-                    line_number: line_num,
-                });
-                self.input_mode = InputMode::LineComment;
-                self.input_buffer.clear();
-                return;
+            if let Some(file_path) = &diff_line.file_path {
+                // For added/context lines, use new file line number (RIGHT side)
+                if let Some(line_num) = diff_line.line_number {
+                    self.line_comment_ctx = Some(LineCommentContext {
+                        file_path: file_path.clone(),
+                        line_number: line_num,
+                        side: CommentSide::Right,
+                    });
+                    self.input_mode = InputMode::LineComment;
+                    self.input_buffer.clear();
+                    return;
+                }
+                // For removed lines, use old file line number (LEFT side)
+                if let Some(line_num) = diff_line.old_line_number {
+                    self.line_comment_ctx = Some(LineCommentContext {
+                        file_path: file_path.clone(),
+                        line_number: line_num,
+                        side: CommentSide::Left,
+                    });
+                    self.input_mode = InputMode::LineComment;
+                    self.input_buffer.clear();
+                    return;
+                }
             }
         }
 
         // Fall back to general comment if no valid line
         self.set_status(
-            "Cannot comment on this line. Move to an added (+) or context line.".to_string(),
+            "Cannot comment on this line. Move to an added, removed, or context line.".to_string(),
         );
     }
 
@@ -534,11 +736,16 @@ impl App {
         }
 
         if let (Some(pr), Some(ctx)) = (self.selected_pr().cloned(), self.line_comment_ctx.take()) {
-            match gh::add_line_comment(&pr, &ctx.file_path, ctx.line_number, &self.input_buffer) {
+            let side = match ctx.side {
+                CommentSide::Left => "LEFT",
+                CommentSide::Right => "RIGHT",
+            };
+            match gh::add_line_comment(&pr, &ctx.file_path, ctx.line_number, side, &self.input_buffer) {
                 Ok(()) => {
+                    let side_label = if ctx.side == CommentSide::Left { " (old)" } else { "" };
                     self.set_status(format!(
-                        "Comment added at {}:{}",
-                        ctx.file_path, ctx.line_number
+                        "Comment added at {}:{}{}",
+                        ctx.file_path, ctx.line_number, side_label
                     ));
                 }
                 Err(e) => {
@@ -664,6 +871,20 @@ impl App {
         self.refresh();
     }
 
+    fn toggle_delta(&mut self) {
+        if !diff::delta_available() {
+            self.set_status("Delta not installed".to_string());
+            return;
+        }
+        self.use_delta = !self.use_delta;
+        let status = if self.use_delta {
+            "Using delta renderer"
+        } else {
+            "Using built-in renderer (line comments enabled)"
+        };
+        self.set_status(status.to_string());
+    }
+
     pub fn handle_event(&mut self) -> Result<()> {
         // Poll for async results (non-blocking)
         self.poll_async_results();
@@ -739,6 +960,8 @@ impl App {
                     self.previous();
                     self.enter_detail();
                 }
+                // Toggle delta rendering (only in Diff tab)
+                KeyCode::Char('D') if self.detail_tab == DetailTab::Diff => self.toggle_delta(),
                 _ => {}
             },
         }
@@ -1088,18 +1311,27 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
 
     // Build diff title with current line info
     let diff_title = {
-        let renderer = if diff::delta_available() { "delta" } else { "built-in" };
+        let using_delta = app.use_delta && app.delta_cache.is_some();
+        let renderer = if using_delta { "delta" } else { "built-in" };
         let line_idx = app.scroll_offset as usize;
-        if let Some(dl) = app.diff_lines.get(line_idx) {
-            if let (Some(file), Some(line_num)) = (&dl.file_path, dl.line_number) {
-                format!(" Diff ({}) - {}:{} ", renderer, file, line_num)
-            } else if let Some(file) = &dl.file_path {
-                format!(" Diff ({}) - {} ", renderer, file)
+        // Only show line info when using built-in renderer (line indices match)
+        if !using_delta {
+            if let Some(dl) = app.diff_lines.get(line_idx) {
+                if let Some(file) = &dl.file_path {
+                    let line_info = match (dl.line_number, dl.old_line_number) {
+                        (Some(new), _) => format!(":{}", new),
+                        (None, Some(old)) => format!(":{} (old)", old),
+                        _ => String::new(),
+                    };
+                    format!(" Diff ({}) - {}{} ", renderer, file, line_info)
+                } else {
+                    format!(" Diff ({}) [D to toggle] ", renderer)
+                }
             } else {
-                format!(" Diff ({}) ", renderer)
+                format!(" Diff ({}) [D to toggle] ", renderer)
             }
         } else {
-            format!(" Diff ({}) ", renderer)
+            format!(" Diff ({}) [D to toggle] ", renderer)
         }
     };
     let content_block = Block::default()
@@ -1129,11 +1361,18 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
             }
             let mut lines: Vec<Line> = if app.loading_diff {
                 vec![Line::raw("Loading diff...")]
-            } else if let Some(delta_output) = app.delta_cache.as_deref() {
-                // Use pre-processed delta output
-                diff::render_from_ansi(delta_output)
+            } else if app.use_delta {
+                if let Some(delta_output) = app.delta_cache.as_deref() {
+                    // Use pre-processed delta output
+                    diff::render_from_ansi(delta_output)
+                } else if let Some(diff_content) = app.diff_cache.as_deref() {
+                    // Delta not available, fallback to built-in
+                    diff::render_diff(diff_content, &app.syntax_highlighter)
+                } else {
+                    vec![Line::raw("Loading diff...")]
+                }
             } else if let Some(diff_content) = app.diff_cache.as_deref() {
-                // Fallback to built-in rendering
+                // Built-in rendering (delta disabled)
                 diff::render_diff(diff_content, &app.syntax_highlighter)
             } else {
                 vec![Line::raw("Loading diff...")]
@@ -1205,7 +1444,7 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
 
     // Help - context-aware based on tab
     let help_text = if app.detail_tab == DetailTab::Diff {
-        " j/k: scroll | /: search | :: goto line | n/N: next/prev match | c: comment | a: approve | q: back"
+        " j/k: scroll | /: search | :: goto | c: comment | D: toggle delta | a: approve | q: back"
     } else {
         " Tab: tabs | j/k: scroll | a: approve | n/p: PR | q: back"
     };

@@ -265,6 +265,7 @@ pub enum InputMode {
     LineComment, // Comment on a specific line in diff
     ConfirmApprove,
     Search,      // Searching in diff
+    ListSearch,  // Searching in PR list
     GotoLine,    // Jump to specific line
 }
 
@@ -876,6 +877,7 @@ impl App {
                     InputMode::LineComment => self.handle_line_comment_key(key.code),
                     InputMode::ConfirmApprove => self.handle_confirm_key(key.code),
                     InputMode::Search => self.handle_search_key(key.code),
+                    InputMode::ListSearch => self.handle_list_search_key(key.code),
                     InputMode::GotoLine => self.handle_goto_key(key.code),
                 }
             }
@@ -887,12 +889,14 @@ impl App {
         match self.view {
             View::List => match code {
                 KeyCode::Char('q') => self.should_quit = true,
-                KeyCode::Char('j') | KeyCode::Down => self.next(),
-                KeyCode::Char('k') | KeyCode::Up => self.previous(),
+                // Page navigation with Ctrl+d/u (must be before non-Ctrl)
                 KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => self.next_page(),
                 KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
                     self.previous_page()
                 }
+                // Regular navigation
+                KeyCode::Char('j') | KeyCode::Down => self.next(),
+                KeyCode::Char('k') | KeyCode::Up => self.previous(),
                 KeyCode::PageDown => self.next_page(),
                 KeyCode::PageUp => self.previous_page(),
                 KeyCode::Char('g') => self.go_to_first(),
@@ -900,19 +904,24 @@ impl App {
                 KeyCode::Home => self.go_to_first(),
                 KeyCode::End => self.go_to_last(),
                 KeyCode::Enter => self.enter_detail(),
-                KeyCode::Char('a') => self.start_approve(),
                 KeyCode::Char('R') => self.refresh(),
                 KeyCode::Char('d') => self.toggle_drafts(),
+                // Search in PR list
+                KeyCode::Char('/') => self.start_list_search(),
+                KeyCode::Char('n') if !self.search_query.is_empty() => self.next_list_search_match(),
+                KeyCode::Char('N') if !self.search_query.is_empty() => self.prev_list_search_match(),
                 _ => {}
             },
             View::Detail => match code {
                 KeyCode::Char('q') | KeyCode::Esc => self.exit_detail(),
                 KeyCode::Tab => self.next_tab(),
                 KeyCode::BackTab => self.prev_tab(),
-                KeyCode::Char('j') | KeyCode::Down => self.scroll_down(),
-                KeyCode::Char('k') | KeyCode::Up => self.scroll_up(),
+                // Page navigation with Ctrl+d/u
                 KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => self.page_down(),
                 KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => self.page_up(),
+                // Regular navigation
+                KeyCode::Char('j') | KeyCode::Down => self.scroll_down(),
+                KeyCode::Char('k') | KeyCode::Up => self.scroll_up(),
                 KeyCode::PageDown => self.page_down(),
                 KeyCode::PageUp => self.page_up(),
                 KeyCode::Char('c') => self.start_line_comment(),
@@ -988,6 +997,23 @@ impl App {
     fn handle_search_key(&mut self, code: KeyCode) {
         match code {
             KeyCode::Enter => self.execute_search(),
+            KeyCode::Esc => {
+                self.input_mode = InputMode::Normal;
+                self.input_buffer.clear();
+            }
+            KeyCode::Backspace => {
+                self.input_buffer.pop();
+            }
+            KeyCode::Char(c) => {
+                self.input_buffer.push(c);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_list_search_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Enter => self.execute_list_search(),
             KeyCode::Esc => {
                 self.input_mode = InputMode::Normal;
                 self.input_buffer.clear();
@@ -1095,6 +1121,81 @@ impl App {
         ));
     }
 
+    // List search methods
+    fn start_list_search(&mut self) {
+        self.input_mode = InputMode::ListSearch;
+        self.input_buffer.clear();
+    }
+
+    fn execute_list_search(&mut self) {
+        if self.input_buffer.is_empty() {
+            self.input_mode = InputMode::Normal;
+            return;
+        }
+
+        self.search_query = self.input_buffer.clone();
+        self.search_matches.clear();
+        self.search_match_idx = 0;
+
+        // Search in PR titles and repo names
+        let query_lower = self.search_query.to_lowercase();
+        for (idx, pr) in self.prs.iter().enumerate() {
+            if pr.title.to_lowercase().contains(&query_lower)
+                || pr.repo_name.to_lowercase().contains(&query_lower)
+                || pr.author.to_lowercase().contains(&query_lower)
+            {
+                self.search_matches.push(idx);
+            }
+        }
+
+        self.input_mode = InputMode::Normal;
+        self.input_buffer.clear();
+
+        if self.search_matches.is_empty() {
+            self.set_status(format!("No PRs matching '{}'", self.search_query));
+        } else {
+            // Jump to first match
+            self.list_state.select(Some(self.search_matches[0]));
+            self.set_status(format!(
+                "Match 1/{} for '{}'",
+                self.search_matches.len(),
+                self.search_query
+            ));
+        }
+    }
+
+    fn next_list_search_match(&mut self) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        self.search_match_idx = (self.search_match_idx + 1) % self.search_matches.len();
+        self.list_state.select(Some(self.search_matches[self.search_match_idx]));
+        self.set_status(format!(
+            "Match {}/{} for '{}'",
+            self.search_match_idx + 1,
+            self.search_matches.len(),
+            self.search_query
+        ));
+    }
+
+    fn prev_list_search_match(&mut self) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        self.search_match_idx = if self.search_match_idx == 0 {
+            self.search_matches.len() - 1
+        } else {
+            self.search_match_idx - 1
+        };
+        self.list_state.select(Some(self.search_matches[self.search_match_idx]));
+        self.set_status(format!(
+            "Match {}/{} for '{}'",
+            self.search_match_idx + 1,
+            self.search_matches.len(),
+            self.search_query
+        ));
+    }
+
     fn start_goto_line(&mut self) {
         self.input_mode = InputMode::GotoLine;
         self.input_buffer.clear();
@@ -1163,7 +1264,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     // Draw search input if active
-    if app.input_mode == InputMode::Search {
+    if app.input_mode == InputMode::Search || app.input_mode == InputMode::ListSearch {
         draw_search_input(frame, app);
     }
 
@@ -1231,7 +1332,7 @@ fn draw_list(frame: &mut Frame, app: &mut App) {
     frame.render_stateful_widget(list, chunks[0], &mut app.list_state);
 
     let help = Paragraph::new(
-        " j/k: navigate | Ctrl+d/u: page | g/G: first/last | Enter: open | R: refresh | d: drafts | a: approve | q: quit",
+        " j/k: navigate | Ctrl+d/u: page | g/G: first/last | Enter: open | /: search | R: refresh | d: drafts | q: quit",
     )
     .style(Style::default().fg(Color::DarkGray))
     .block(Block::default().borders(Borders::ALL).title(" Help "));

@@ -66,7 +66,8 @@ On first run, you'll be prompted to set your repos root directory.
 | `Ctrl+d/u` | Page down/up |
 | `g/G` | First/last |
 | `Enter` | Open PR details |
-| `a` | Approve PR |
+| `/` | Search PRs |
+| `n/N` | Next/previous search match |
 | `R` | Refresh |
 | `d` | Toggle drafts |
 | `q` | Quit |

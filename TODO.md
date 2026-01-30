@@ -8,6 +8,7 @@
   - Capture file path + line number
   - Use GitHub review comments API: `POST /repos/{owner}/{repo}/pulls/{pr}/comments`
   - Required fields: `path`, `line`, `commit_id`, `body`
+- [ ] add age to PRs?
 - [ ] Better diff view, research better algos, check the stars
 - [ ] Add an option to close PRs with comment
 - [ ] Review my PRs, ie address comments

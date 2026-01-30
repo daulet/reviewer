@@ -1,13 +1,12 @@
 # reviewer
 
-A TUI for reviewing GitHub PRs across all your local repositories.
+Automate mundane parts of code review. Speed up your workflow with LLM.
 
 ## Features
 
-- Scans a directory for git repos and fetches open PRs needing your review
-- Keyboard-driven interface for browsing PRs, viewing diffs, and comments
-- Launch [Claude Code](https://github.com/anthropics/claude-code) for AI-assisted reviews
-- Approve PRs or add comments without leaving the terminal
+- List PRs needing your attention;
+- Approve PRs or add comments without leaving the terminal;
+- Launch [Claude Code](https://github.com/anthropics/claude-code) for AI-assisted reviews;
 
 ## Installation
 

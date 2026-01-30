@@ -14,6 +14,26 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
+/// Strip ANSI escape codes from a string for searching
+fn strip_ansi_codes(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Skip until we hit a letter (end of escape sequence)
+            while let Some(&next) = chars.peek() {
+                chars.next();
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
 /// Represents a line in the parsed diff with its location info
 #[derive(Debug, Clone)]
 pub struct DiffLine {
@@ -816,11 +836,14 @@ impl App {
         self.search_matches.clear();
         self.search_match_idx = 0;
 
-        // Search in diff content (raw diff, not delta output)
-        if let Some(diff) = &self.diff_cache {
+        // Search in displayed content (delta output if available, otherwise raw diff)
+        let search_content = self.delta_cache.as_ref().or(self.diff_cache.as_ref());
+        if let Some(content) = search_content {
             let query_lower = self.search_query.to_lowercase();
-            for (idx, line) in diff.lines().enumerate() {
-                if line.to_lowercase().contains(&query_lower) {
+            for (idx, line) in content.lines().enumerate() {
+                // Strip ANSI codes for searching in delta output
+                let clean_line = strip_ansi_codes(line);
+                if clean_line.to_lowercase().contains(&query_lower) {
                     self.search_matches.push(idx);
                 }
             }
@@ -1063,17 +1086,28 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
         .block(Block::default().borders(Borders::ALL));
     frame.render_widget(tabs, chunks[1]);
 
-    let diff_title = if diff::delta_available() {
-        " Diff (delta) "
-    } else {
-        " Diff (built-in) "
+    // Build diff title with current line info
+    let diff_title = {
+        let renderer = if diff::delta_available() { "delta" } else { "built-in" };
+        let line_idx = app.scroll_offset as usize;
+        if let Some(dl) = app.diff_lines.get(line_idx) {
+            if let (Some(file), Some(line_num)) = (&dl.file_path, dl.line_number) {
+                format!(" Diff ({}) - {}:{} ", renderer, file, line_num)
+            } else if let Some(file) = &dl.file_path {
+                format!(" Diff ({}) - {} ", renderer, file)
+            } else {
+                format!(" Diff ({}) ", renderer)
+            }
+        } else {
+            format!(" Diff ({}) ", renderer)
+        }
     };
     let content_block = Block::default()
         .borders(Borders::ALL)
         .title(match app.detail_tab {
-            DetailTab::Description => " Description ",
+            DetailTab::Description => " Description ".to_string(),
             DetailTab::Diff => diff_title,
-            DetailTab::Comments => " Comments ",
+            DetailTab::Comments => " Comments ".to_string(),
         });
 
     match app.detail_tab {
@@ -1093,7 +1127,7 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
             if app.diff_cache.is_none() && !app.loading_diff {
                 app.load_diff();
             }
-            let lines: Vec<Line> = if app.loading_diff {
+            let mut lines: Vec<Line> = if app.loading_diff {
                 vec![Line::raw("Loading diff...")]
             } else if let Some(delta_output) = app.delta_cache.as_deref() {
                 // Use pre-processed delta output
@@ -1104,6 +1138,25 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
             } else {
                 vec![Line::raw("Loading diff...")]
             };
+
+            // Add margin prefix to all lines, with indicator on focused line
+            let focus_idx = app.scroll_offset as usize;
+            for (idx, line) in lines.iter_mut().enumerate() {
+                let old_line = std::mem::take(line);
+                let prefix = if idx == focus_idx {
+                    Span::styled("▶ ", Style::default().fg(Color::Yellow).bold())
+                } else {
+                    Span::raw("  ")
+                };
+                let mut new_spans = vec![prefix];
+                new_spans.extend(old_line.spans);
+                *line = if idx == focus_idx {
+                    Line::from(new_spans).style(Style::default().bg(Color::DarkGray))
+                } else {
+                    Line::from(new_spans)
+                };
+            }
+
             let para = Paragraph::new(lines)
                 .block(content_block)
                 .scroll((app.scroll_offset, 0));

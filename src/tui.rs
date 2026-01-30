@@ -70,14 +70,14 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(repos_root: PathBuf, repo_list: Vec<PathBuf>, username: String) -> Self {
+    pub fn new(repos_root: PathBuf, repo_list: Vec<PathBuf>, username: String, include_drafts: bool) -> Self {
         let (async_tx, async_rx) = mpsc::channel();
         Self {
             prs: Vec::new(),
             repos_root,
             repo_list,
             username,
-            include_drafts: false,
+            include_drafts,
             list_state: ListState::default(),
             view: View::List,
             detail_tab: DetailTab::Description,
@@ -804,7 +804,7 @@ fn draw_confirm_dialog(frame: &mut Frame, app: &App) {
     frame.render_widget(dialog, popup_area);
 }
 
-pub fn run(repos_root: PathBuf, repo_list: Vec<PathBuf>, username: String) -> Result<()> {
+pub fn run(repos_root: PathBuf, repo_list: Vec<PathBuf>, username: String, include_drafts: bool) -> Result<()> {
     // Setup terminal
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -816,7 +816,7 @@ pub fn run(repos_root: PathBuf, repo_list: Vec<PathBuf>, username: String) -> Re
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::new(backend)?;
 
-    let mut app = App::new(repos_root, repo_list, username);
+    let mut app = App::new(repos_root, repo_list, username, include_drafts);
 
     // Start fetching PRs immediately in background
     app.refresh();

@@ -4,9 +4,24 @@ mod repos;
 mod tui;
 
 use anyhow::Result;
+use clap::Parser;
 use rayon::prelude::*;
 use std::io::{self, Write};
 use std::path::PathBuf;
+
+/// TUI for reviewing GitHub PRs across multiple repositories
+#[derive(Parser)]
+#[command(name = "reviewer")]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// Include draft PRs in the list
+    #[arg(short, long)]
+    drafts: bool,
+
+    /// Override the repos root directory
+    #[arg(short, long)]
+    root: Option<PathBuf>,
+}
 
 pub fn fetch_all_prs(repo_list: &[PathBuf], username: &str, include_drafts: bool) -> Vec<gh::PullRequest> {
     let all_prs: Vec<_> = repo_list
@@ -61,28 +76,38 @@ fn prompt_for_repos_root() -> Result<PathBuf> {
 }
 
 fn main() -> Result<()> {
+    let args = Args::parse();
+
     // Get current GitHub user
     let username = gh::get_current_user()?;
     println!("Authenticated as: {}\n", username);
 
-    // Load or prompt for config
+    // Determine repos root: CLI arg > config > prompt
     let mut cfg = config::load_config();
-    let repos_root = match &cfg.repos_root {
-        Some(root) => {
-            let path = PathBuf::from(root);
-            if !path.exists() {
-                eprintln!("Error: Configured repos root no longer exists: {}", root);
-                eprintln!("Delete {:?} to reconfigure.", config::config_path());
-                std::process::exit(1);
-            }
-            path
+    let repos_root = if let Some(root) = args.root {
+        if !root.exists() {
+            eprintln!("Error: Specified path does not exist: {}", root.display());
+            std::process::exit(1);
         }
-        None => {
-            let path = prompt_for_repos_root()?;
-            cfg.repos_root = Some(path.to_string_lossy().to_string());
-            config::save_config(&cfg)?;
-            println!("\nSaved repos root: {}\n", path.display());
-            path
+        root
+    } else {
+        match &cfg.repos_root {
+            Some(root) => {
+                let path = PathBuf::from(root);
+                if !path.exists() {
+                    eprintln!("Error: Configured repos root no longer exists: {}", root);
+                    eprintln!("Delete {:?} to reconfigure.", config::config_path());
+                    std::process::exit(1);
+                }
+                path
+            }
+            None => {
+                let path = prompt_for_repos_root()?;
+                cfg.repos_root = Some(path.to_string_lossy().to_string());
+                config::save_config(&cfg)?;
+                println!("\nSaved repos root: {}\n", path.display());
+                path
+            }
         }
     };
 
@@ -98,7 +123,7 @@ fn main() -> Result<()> {
 
     // Launch TUI immediately - it will fetch PRs in background
     println!("Launching TUI...");
-    tui::run(repos_root, repo_list, username)?;
+    tui::run(repos_root, repo_list, username, args.drafts)?;
 
     Ok(())
 }

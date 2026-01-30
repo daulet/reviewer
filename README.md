@@ -1,24 +1,95 @@
-## Setup
+# reviewer
 
-If you are running `claude` sandboxed, at the very least enable the following permissions and excluded commands (`~/.claude/settings.json`):
+A TUI for reviewing GitHub PRs across all your local repositories.
+
+## Features
+
+- Scans a directory for git repos and fetches open PRs needing your review
+- Keyboard-driven interface for browsing PRs, viewing diffs, and comments
+- Launch [Claude Code](https://github.com/anthropics/claude-code) for AI-assisted reviews
+- Approve PRs or add comments without leaving the terminal
+
+## Installation
+
+### Homebrew (macOS)
+
+```bash
+brew tap daulet/tap
+brew install reviewer
 ```
+
+### From releases
+
+Download the latest binary from [Releases](https://github.com/daulet/reviewer/releases).
+
+### From source
+
+```bash
+cargo install --git https://github.com/daulet/reviewer
+```
+
+## Requirements
+
+- [GitHub CLI](https://cli.github.com/) (`gh`) - authenticated with `gh auth login`
+- [Claude Code](https://github.com/anthropics/claude-code) (optional) - for AI-assisted reviews
+
+## Usage
+
+```bash
+reviewer              # Scan configured directory
+reviewer -r ~/dev     # Specify repos directory
+reviewer -d           # Include draft PRs
+```
+
+On first run, you'll be prompted to set your repos root directory.
+
+### Keybindings
+
+**List view:**
+| Key | Action |
+|-----|--------|
+| `j/k` | Navigate |
+| `Enter` | Open PR details |
+| `a` | Approve PR |
+| `R` | Refresh |
+| `d` | Toggle drafts |
+| `q` | Quit |
+
+**Detail view:**
+| Key | Action |
+|-----|--------|
+| `Tab` | Switch tabs (Description/Diff/Comments) |
+| `j/k` | Scroll |
+| `r` | Launch Claude review |
+| `c` | Add comment |
+| `a` | Approve |
+| `n/p` | Next/previous PR |
+| `q` | Back to list |
+
+## Claude Code Setup
+
+For AI-assisted reviews, install the code-review skill:
+
+```bash
+mkdir -p ~/.claude/skills/code-review
+cp .claude/skills/code-review/SKILL.md ~/.claude/skills/code-review/
+```
+
+If running Claude sandboxed, add these permissions to `~/.claude/settings.json`:
+
+```json
 {
   "permissions": {
     "allow": [
-      "Read(path:~/.config/reviewer/**)",
-      "WebFetch(domain:api.github.com)",
-      "WebFetch(domain:github.com)",
-      "WebFetch(domain:raw.githubusercontent.com)"
+      "Read(path:~/.config/reviewer/**)"
     ]
   },
-  "model": "opus",
-  "enabledPlugins": {
-    "rust-analyzer-lsp@claude-plugins-official": true
-  },
   "sandbox": {
-    "enabled": true,
-    "autoAllowBashIfSandboxed": true,
     "excludedCommands": ["gh"]
   }
 }
 ```
+
+## License
+
+MIT

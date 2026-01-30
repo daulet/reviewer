@@ -14,10 +14,10 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
 enum AsyncResult {
-    Diff(usize, String),           // (pr_index, diff_content)
-    Comments(usize, Vec<Comment>), // (pr_index, comments)
+    Diff(usize, String),                  // (pr_index, diff_content)
+    Comments(usize, Vec<Comment>),        // (pr_index, comments)
     ClaudeLaunch(Result<String, String>), // worktree path or error
-    Refresh(Vec<PullRequest>),     // refreshed PR list
+    Refresh(Vec<PullRequest>),            // refreshed PR list
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -70,7 +70,12 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(repos_root: PathBuf, repo_list: Vec<PathBuf>, username: String, include_drafts: bool) -> Self {
+    pub fn new(
+        repos_root: PathBuf,
+        repo_list: Vec<PathBuf>,
+        username: String,
+        include_drafts: bool,
+    ) -> Self {
         let (async_tx, async_rx) = mpsc::channel();
         Self {
             prs: Vec::new(),
@@ -288,7 +293,11 @@ impl App {
                     } else {
                         self.list_state.select(Some(0));
                     }
-                    let draft_status = if self.include_drafts { " (incl. drafts)" } else { "" };
+                    let draft_status = if self.include_drafts {
+                        " (incl. drafts)"
+                    } else {
+                        ""
+                    };
                     self.set_status(format!("Refreshed: {} PRs{}", count, draft_status));
                 }
             }
@@ -516,8 +525,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             width: msg_width,
             height: 1,
         };
-        let popup = Paragraph::new(msg.as_str())
-            .style(Style::default().fg(Color::Black).bg(Color::Yellow));
+        let popup =
+            Paragraph::new(msg.as_str()).style(Style::default().fg(Color::Black).bg(Color::Yellow));
         frame.render_widget(popup, popup_area);
     }
 
@@ -552,12 +561,21 @@ fn draw_list(frame: &mut Frame, app: &mut App) {
                 Span::raw(format!("#{}: ", pr.number)),
             ];
             if pr.is_draft {
-                title_spans.push(Span::styled("[DRAFT] ", Style::default().fg(Color::Magenta)));
+                title_spans.push(Span::styled(
+                    "[DRAFT] ",
+                    Style::default().fg(Color::Magenta),
+                ));
             }
-            title_spans.push(Span::styled(&pr.title, Style::default().add_modifier(Modifier::BOLD)));
+            title_spans.push(Span::styled(
+                &pr.title,
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
             let line = Line::from(title_spans);
             let details = Line::from(vec![
-                Span::styled(format!("  @{}", pr.author), Style::default().fg(Color::Green)),
+                Span::styled(
+                    format!("  @{}", pr.author),
+                    Style::default().fg(Color::Green),
+                ),
                 Span::raw(" | "),
                 Span::styled(stats, Style::default().fg(Color::Yellow)),
                 Span::raw(" | "),
@@ -570,11 +588,7 @@ fn draw_list(frame: &mut Frame, app: &mut App) {
     let draft_status = if app.include_drafts { " +drafts" } else { "" };
     let title = format!(" PRs requiring review ({}){} ", app.prs.len(), draft_status);
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(title),
-        )
+        .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(
             Style::default()
                 .bg(Color::DarkGray)
@@ -584,9 +598,11 @@ fn draw_list(frame: &mut Frame, app: &mut App) {
 
     frame.render_stateful_widget(list, chunks[0], &mut app.list_state);
 
-    let help = Paragraph::new(" j/k: navigate | Enter: open | R: refresh | d: toggle drafts | a: approve | q: quit")
-        .style(Style::default().fg(Color::DarkGray))
-        .block(Block::default().borders(Borders::ALL).title(" Help "));
+    let help = Paragraph::new(
+        " j/k: navigate | Enter: open | R: refresh | d: toggle drafts | a: approve | q: quit",
+    )
+    .style(Style::default().fg(Color::DarkGray))
+    .block(Block::default().borders(Borders::ALL).title(" Help "));
     frame.render_widget(help, chunks[1]);
 }
 
@@ -804,7 +820,12 @@ fn draw_confirm_dialog(frame: &mut Frame, app: &App) {
     frame.render_widget(dialog, popup_area);
 }
 
-pub fn run(repos_root: PathBuf, repo_list: Vec<PathBuf>, username: String, include_drafts: bool) -> Result<()> {
+pub fn run(
+    repos_root: PathBuf,
+    repo_list: Vec<PathBuf>,
+    username: String,
+    include_drafts: bool,
+) -> Result<()> {
     // Setup terminal
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();

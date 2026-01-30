@@ -123,7 +123,11 @@ fn has_user_approved(pr: &PrData, username: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub fn fetch_prs_for_repo(repo_path: &PathBuf, username: &str, include_drafts: bool) -> Vec<PullRequest> {
+pub fn fetch_prs_for_repo(
+    repo_path: &PathBuf,
+    username: &str,
+    include_drafts: bool,
+) -> Vec<PullRequest> {
     let repo_info = match get_repo_info(repo_path) {
         Some(info) => info,
         None => return Vec::new(),
@@ -203,9 +207,11 @@ fn get_pr_diff_local(pr: &PullRequest) -> Result<String> {
     // Get the base and head commit SHAs
     let output = Command::new("gh")
         .args([
-            "pr", "view",
+            "pr",
+            "view",
             &pr.number.to_string(),
-            "--json", "baseRefOid,headRefOid",
+            "--json",
+            "baseRefOid,headRefOid",
         ])
         .current_dir(&pr.repo_path)
         .output()
@@ -218,8 +224,7 @@ fn get_pr_diff_local(pr: &PullRequest) -> Result<String> {
         );
     }
 
-    let refs: PrRefs = serde_json::from_slice(&output.stdout)
-        .context("Failed to parse PR refs")?;
+    let refs: PrRefs = serde_json::from_slice(&output.stdout).context("Failed to parse PR refs")?;
 
     // Fetch the head commit
     let fetch_output = Command::new("git")
@@ -239,7 +244,10 @@ fn get_pr_diff_local(pr: &PullRequest) -> Result<String> {
 
     // Generate diff locally
     let diff_output = Command::new("git")
-        .args(["diff", &format!("{}...{}", refs.base_ref_oid, refs.head_ref_oid)])
+        .args([
+            "diff",
+            &format!("{}...{}", refs.base_ref_oid, refs.head_ref_oid),
+        ])
         .current_dir(&pr.repo_path)
         .output()
         .context("Failed to generate local diff")?;
@@ -322,7 +330,10 @@ pub fn approve_pr(pr: &PullRequest, comment: Option<&str>) -> Result<()> {
 }
 
 /// Create a worktree for a PR and return the path
-pub fn create_pr_worktree(pr: &PullRequest, repos_root: &std::path::Path) -> Result<std::path::PathBuf> {
+pub fn create_pr_worktree(
+    pr: &PullRequest,
+    repos_root: &std::path::Path,
+) -> Result<std::path::PathBuf> {
     let worktree_base = repos_root.join(".worktrees");
     std::fs::create_dir_all(&worktree_base)?;
 
@@ -332,7 +343,12 @@ pub fn create_pr_worktree(pr: &PullRequest, repos_root: &std::path::Path) -> Res
     // Remove existing worktree if it exists
     if worktree_path.exists() {
         let _ = Command::new("git")
-            .args(["worktree", "remove", "--force", worktree_path.to_str().unwrap()])
+            .args([
+                "worktree",
+                "remove",
+                "--force",
+                worktree_path.to_str().unwrap(),
+            ])
             .current_dir(&pr.repo_path)
             .output();
         // Also try removing the directory directly if worktree remove failed
@@ -389,7 +405,10 @@ pub fn launch_claude(working_dir: &std::path::Path, pr: &PullRequest) -> Result<
         "Review PR #{} in repo {}. Title: \"{}\". \
          Use the code-review skill to analyze changes, present each issue for approval, \
          and submit approved comments using gh CLI. Follow guidelines in {}",
-        pr.number, pr.repo_name, pr.title.replace('"', "\\\""), review_guide.display()
+        pr.number,
+        pr.repo_name,
+        pr.title.replace('"', "\\\""),
+        review_guide.display()
     );
 
     #[cfg(target_os = "macos")]
@@ -420,13 +439,38 @@ pub fn launch_claude(working_dir: &std::path::Path, pr: &PullRequest) -> Result<
         for term in terminals {
             let result = match term {
                 "gnome-terminal" => Command::new(term)
-                    .args(["--", "bash", "-c", &format!("cd '{}' && claude '{}'; exec bash", working_dir.display(), escaped_prompt)])
+                    .args([
+                        "--",
+                        "bash",
+                        "-c",
+                        &format!(
+                            "cd '{}' && claude '{}'; exec bash",
+                            working_dir.display(),
+                            escaped_prompt
+                        ),
+                    ])
                     .spawn(),
                 "konsole" => Command::new(term)
-                    .args(["-e", "bash", "-c", &format!("cd '{}' && claude '{}'; exec bash", working_dir.display(), escaped_prompt)])
+                    .args([
+                        "-e",
+                        "bash",
+                        "-c",
+                        &format!(
+                            "cd '{}' && claude '{}'; exec bash",
+                            working_dir.display(),
+                            escaped_prompt
+                        ),
+                    ])
                     .spawn(),
                 _ => Command::new(term)
-                    .args(["-e", &format!("cd '{}' && claude '{}'", working_dir.display(), escaped_prompt)])
+                    .args([
+                        "-e",
+                        &format!(
+                            "cd '{}' && claude '{}'",
+                            working_dir.display(),
+                            escaped_prompt
+                        ),
+                    ])
                     .spawn(),
             };
             if result.is_ok() {

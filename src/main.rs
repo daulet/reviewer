@@ -23,7 +23,11 @@ struct Args {
     root: Option<PathBuf>,
 }
 
-pub fn fetch_all_prs(repo_list: &[PathBuf], username: &str, include_drafts: bool) -> Vec<gh::PullRequest> {
+pub fn fetch_all_prs(
+    repo_list: &[PathBuf],
+    username: &str,
+    include_drafts: bool,
+) -> Vec<gh::PullRequest> {
     let all_prs: Vec<_> = repo_list
         .par_iter()
         .flat_map(|repo| gh::fetch_prs_for_repo(repo, username, include_drafts))

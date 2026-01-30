@@ -10,12 +10,13 @@
   - Capture file path + line number
   - Use GitHub review comments API: `POST /repos/{owner}/{repo}/pulls/{pr}/comments`
   - Required fields: `path`, `line`, `commit_id`, `body`
-- [ ] Update readme with install instructions eg installing skill under `~/.claude/skills/code-review/`
-- [ ] brew install option
+- [x] Update readme with install instructions eg installing skill under `~/.claude/skills/code-review/`
+- [x] brew install option
+- [ ] release brew
 - [ ] Review my PRs, ie address comments 
 
 ## Bugs
 - [ ] Where do we config the root, looks like its implied
 - [ ] Add an option to exclude dirs, def exclude worktrees
-- [ ] Proper linter
+- [x] Proper linter
 - [ ] Double PR approve, the PR in question received the approve comment twice.

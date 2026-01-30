@@ -1,11 +1,11 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
-fn is_git_repo(path: &PathBuf) -> bool {
+fn is_git_repo(path: &Path) -> bool {
     path.join(".git").is_dir()
 }
 
-pub fn find_repos(root: &PathBuf, max_depth: usize) -> Vec<PathBuf> {
+pub fn find_repos(root: &Path, max_depth: usize) -> Vec<PathBuf> {
     let mut repos = Vec::new();
 
     for entry in WalkDir::new(root)

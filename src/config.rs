@@ -8,9 +8,16 @@ pub struct Config {
 }
 
 pub fn config_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".config")
+    // Use platform-appropriate config directory:
+    // - Windows: C:\Users\<User>\AppData\Roaming\reviewer
+    // - macOS: ~/Library/Application Support/reviewer
+    // - Linux: ~/.config/reviewer
+    dirs::config_dir()
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".config")
+        })
         .join("reviewer")
         .join("config.json")
 }

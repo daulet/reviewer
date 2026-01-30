@@ -16,9 +16,15 @@ jobs:
           - target: x86_64-apple-darwin
             os: macos-latest
             name: reviewer-x86_64-apple-darwin.tar.gz
+            binary: reviewer
           - target: aarch64-apple-darwin
             os: macos-latest
             name: reviewer-aarch64-apple-darwin.tar.gz
+            binary: reviewer
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            name: reviewer-x86_64-pc-windows-msvc.zip
+            binary: reviewer.exe
 
     runs-on: ${{ matrix.os }}
 
@@ -33,10 +39,18 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
         run: |
           cd target/${{ matrix.target }}/release
-          tar czvf ../../../${{ matrix.name }} reviewer
+          tar czvf ../../../${{ matrix.name }} ${{ matrix.binary }}
+          cd -
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          7z a ../../../${{ matrix.name }} ${{ matrix.binary }}
           cd -
 
       - name: Upload artifact

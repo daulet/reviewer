@@ -7,7 +7,7 @@ If you are running `claude` sandboxed, at the very least enable the following pe
     "allow": [
       "Read(path:~/.config/reviewer/**)",
       "WebFetch(domain:api.github.com)",
-      "WebFetch(domain:github.com)",                                                                                              
+      "WebFetch(domain:github.com)",
       "WebFetch(domain:raw.githubusercontent.com)"
     ]
   },

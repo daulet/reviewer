@@ -378,12 +378,18 @@ pub fn create_pr_worktree(pr: &PullRequest, repos_root: &std::path::Path) -> Res
 
 /// Launch Claude Code CLI in a directory with code review prompt
 pub fn launch_claude(working_dir: &std::path::Path, pr: &PullRequest) -> Result<()> {
+    // Get platform-appropriate config directory for review guide reference
+    let config_dir = dirs::config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("reviewer");
+    let review_guide = config_dir.join("review_guide.md");
+
     // Prompt that triggers the code-review skill with PR context
     let prompt = format!(
         "Review PR #{} in repo {}. Title: \"{}\". \
          Use the code-review skill to analyze changes, present each issue for approval, \
-         and submit approved comments using gh CLI. Follow guidelines in ~/.config/reviewer/review_guide.md",
-        pr.number, pr.repo_name, pr.title.replace('"', "\\\"")
+         and submit approved comments using gh CLI. Follow guidelines in {}",
+        pr.number, pr.repo_name, pr.title.replace('"', "\\\""), review_guide.display()
     );
 
     #[cfg(target_os = "macos")]
@@ -431,6 +437,30 @@ pub fn launch_claude(working_dir: &std::path::Path, pr: &PullRequest) -> Result<
         if !launched {
             anyhow::bail!("Could not find a terminal emulator");
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // Escape double quotes for Windows command line
+        let escaped_prompt = prompt.replace('"', "\\\"");
+        // Use 'start' to open a new cmd window, /K keeps it open after command
+        Command::new("cmd")
+            .args([
+                "/C",
+                "start",
+                "cmd",
+                "/K",
+                &format!(
+                    "cd /d \"{}\" && claude \"{}\"",
+                    working_dir.display(),
+                    escaped_prompt
+                ),
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .context("Failed to launch Command Prompt")?;
     }
 
     Ok(())

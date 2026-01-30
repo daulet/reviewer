@@ -1581,8 +1581,8 @@ pub fn run(
     let mut stdout = io::stdout();
     crossterm::execute!(
         stdout,
-        crossterm::terminal::EnterAlternateScreen,
-        crossterm::event::EnableMouseCapture
+        crossterm::terminal::EnterAlternateScreen
+        // Mouse capture disabled to allow text selection in terminal
     )?;
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::new(backend)?;
@@ -1615,8 +1615,7 @@ pub fn run(
     crossterm::terminal::disable_raw_mode()?;
     crossterm::execute!(
         terminal.backend_mut(),
-        crossterm::terminal::LeaveAlternateScreen,
-        crossterm::event::DisableMouseCapture
+        crossterm::terminal::LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
 

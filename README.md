@@ -77,10 +77,13 @@ On first run, you'll be prompted to set your repos root directory.
 | `Tab` | Switch tabs (Description/Diff/Comments) |
 | `j/k` | Scroll |
 | `Ctrl+d/u` | Page down/up |
+| `/` | Search in diff |
+| `:` | Go to line number |
+| `n/N` | Next/previous search match |
 | `c` | Add line comment (in Diff tab) |
 | `r` | Launch Claude review |
 | `a` | Approve |
-| `n/p` | Next/previous PR |
+| `p` | Previous PR |
 | `q` | Back to list |
 
 ## Claude Code Integration

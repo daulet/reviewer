@@ -134,6 +134,8 @@ pub enum InputMode {
     Comment,
     LineComment, // Comment on a specific line in diff
     ConfirmApprove,
+    Search,      // Searching in diff
+    GotoLine,    // Jump to specific line
 }
 
 /// Context for a line-level comment
@@ -160,6 +162,10 @@ pub struct App {
     pub input_mode: InputMode,
     pub input_buffer: String,
     pub line_comment_ctx: Option<LineCommentContext>, // For line-level comments
+    // Search state
+    pub search_query: String,
+    pub search_matches: Vec<usize>, // Line indices that match
+    pub search_match_idx: usize,    // Current match index
     pub status_message: Option<String>,
     pub status_time: Option<std::time::Instant>,
     pub should_quit: bool,
@@ -202,6 +208,9 @@ impl App {
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             line_comment_ctx: None,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_match_idx: 0,
             status_message: None,
             status_time: None,
             should_quit: false,
@@ -324,6 +333,7 @@ impl App {
         self.loading_diff = false;
         self.loading_comments = false;
         self.needs_clear = true;
+        self.clear_search();
     }
 
     fn next_tab(&mut self) {
@@ -649,6 +659,8 @@ impl App {
                     InputMode::Comment => self.handle_comment_key(key.code),
                     InputMode::LineComment => self.handle_line_comment_key(key.code),
                     InputMode::ConfirmApprove => self.handle_confirm_key(key.code),
+                    InputMode::Search => self.handle_search_key(key.code),
+                    InputMode::GotoLine => self.handle_goto_key(key.code),
                 }
             }
         }
@@ -690,7 +702,14 @@ impl App {
                 KeyCode::Char('c') => self.start_line_comment(),
                 KeyCode::Char('a') => self.start_approve(),
                 KeyCode::Char('r') => self.launch_claude_review(),
-                KeyCode::Char('n') => {
+                // Search (only in Diff tab)
+                KeyCode::Char('/') if self.detail_tab == DetailTab::Diff => self.start_search(),
+                KeyCode::Char('n') if !self.search_query.is_empty() => self.next_search_match(),
+                KeyCode::Char('N') if !self.search_query.is_empty() => self.prev_search_match(),
+                // Goto line (only in Diff tab)
+                KeyCode::Char(':') if self.detail_tab == DetailTab::Diff => self.start_goto_line(),
+                // Next/prev PR (when not searching)
+                KeyCode::Char('n') if self.search_query.is_empty() => {
                     self.exit_detail();
                     self.next();
                     self.enter_detail();
@@ -747,6 +766,142 @@ impl App {
             _ => {}
         }
     }
+
+    fn handle_search_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Enter => self.execute_search(),
+            KeyCode::Esc => {
+                self.input_mode = InputMode::Normal;
+                self.input_buffer.clear();
+            }
+            KeyCode::Backspace => {
+                self.input_buffer.pop();
+            }
+            KeyCode::Char(c) => {
+                self.input_buffer.push(c);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_goto_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Enter => self.execute_goto_line(),
+            KeyCode::Esc => {
+                self.input_mode = InputMode::Normal;
+                self.input_buffer.clear();
+            }
+            KeyCode::Backspace => {
+                self.input_buffer.pop();
+            }
+            KeyCode::Char(c) if c.is_ascii_digit() => {
+                self.input_buffer.push(c);
+            }
+            _ => {}
+        }
+    }
+
+    fn start_search(&mut self) {
+        self.input_mode = InputMode::Search;
+        self.input_buffer.clear();
+    }
+
+    fn execute_search(&mut self) {
+        if self.input_buffer.is_empty() {
+            self.input_mode = InputMode::Normal;
+            return;
+        }
+
+        self.search_query = self.input_buffer.clone();
+        self.search_matches.clear();
+        self.search_match_idx = 0;
+
+        // Search in diff content (raw diff, not delta output)
+        if let Some(diff) = &self.diff_cache {
+            let query_lower = self.search_query.to_lowercase();
+            for (idx, line) in diff.lines().enumerate() {
+                if line.to_lowercase().contains(&query_lower) {
+                    self.search_matches.push(idx);
+                }
+            }
+        }
+
+        self.input_mode = InputMode::Normal;
+        self.input_buffer.clear();
+
+        if self.search_matches.is_empty() {
+            self.set_status(format!("No matches for '{}'", self.search_query));
+        } else {
+            // Jump to first match
+            self.scroll_offset = self.search_matches[0] as u16;
+            self.set_status(format!(
+                "Match 1/{} for '{}'",
+                self.search_matches.len(),
+                self.search_query
+            ));
+        }
+    }
+
+    fn next_search_match(&mut self) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        self.search_match_idx = (self.search_match_idx + 1) % self.search_matches.len();
+        self.scroll_offset = self.search_matches[self.search_match_idx] as u16;
+        self.set_status(format!(
+            "Match {}/{} for '{}'",
+            self.search_match_idx + 1,
+            self.search_matches.len(),
+            self.search_query
+        ));
+    }
+
+    fn prev_search_match(&mut self) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        self.search_match_idx = if self.search_match_idx == 0 {
+            self.search_matches.len() - 1
+        } else {
+            self.search_match_idx - 1
+        };
+        self.scroll_offset = self.search_matches[self.search_match_idx] as u16;
+        self.set_status(format!(
+            "Match {}/{} for '{}'",
+            self.search_match_idx + 1,
+            self.search_matches.len(),
+            self.search_query
+        ));
+    }
+
+    fn start_goto_line(&mut self) {
+        self.input_mode = InputMode::GotoLine;
+        self.input_buffer.clear();
+    }
+
+    fn execute_goto_line(&mut self) {
+        if let Ok(line_num) = self.input_buffer.parse::<u16>() {
+            // Find the diff line that corresponds to this line number
+            if let Some(idx) = self.diff_lines.iter().position(|dl| {
+                dl.line_number.map(|n| n as u16) == Some(line_num)
+            }) {
+                self.scroll_offset = idx as u16;
+                self.set_status(format!("Jumped to line {}", line_num));
+            } else {
+                // Just scroll to that offset as fallback
+                self.scroll_offset = line_num.saturating_sub(1);
+                self.set_status(format!("Scrolled to position {}", line_num));
+            }
+        }
+        self.input_mode = InputMode::Normal;
+        self.input_buffer.clear();
+    }
+
+    fn clear_search(&mut self) {
+        self.search_query.clear();
+        self.search_matches.clear();
+        self.search_match_idx = 0;
+    }
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -784,6 +939,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // Draw confirmation dialog if active
     if app.input_mode == InputMode::ConfirmApprove {
         draw_confirm_dialog(frame, app);
+    }
+
+    // Draw search input if active
+    if app.input_mode == InputMode::Search {
+        draw_search_input(frame, app);
+    }
+
+    // Draw goto line input if active
+    if app.input_mode == InputMode::GotoLine {
+        draw_goto_input(frame, app);
     }
 }
 
@@ -985,12 +1150,15 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
         }
     }
 
-    // Help
-    let help = Paragraph::new(
-        " Tab: tabs | j/k: scroll | c: line comment | r: claude review | a: approve | n/p: PR | q: back",
-    )
-    .style(Style::default().fg(Color::DarkGray))
-    .block(Block::default().borders(Borders::ALL).title(" Help "));
+    // Help - context-aware based on tab
+    let help_text = if app.detail_tab == DetailTab::Diff {
+        " j/k: scroll | /: search | :: goto line | n/N: next/prev match | c: comment | a: approve | q: back"
+    } else {
+        " Tab: tabs | j/k: scroll | a: approve | n/p: PR | q: back"
+    };
+    let help = Paragraph::new(help_text)
+        .style(Style::default().fg(Color::DarkGray))
+        .block(Block::default().borders(Borders::ALL).title(" Help "));
     frame.render_widget(help, chunks[3]);
 }
 
@@ -1089,6 +1257,50 @@ fn draw_confirm_dialog(frame: &mut Frame, app: &App) {
 
     frame.render_widget(Clear, popup_area);
     frame.render_widget(dialog, popup_area);
+}
+
+fn draw_search_input(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    // Draw at bottom of screen like vim
+    let popup_area = Rect {
+        x: 0,
+        y: area.height.saturating_sub(3),
+        width: area.width,
+        height: 3,
+    };
+
+    let input = Paragraph::new(format!("/{}", app.input_buffer))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Search (Enter to find, Esc to cancel) ")
+                .style(Style::default().fg(Color::Yellow)),
+        );
+
+    frame.render_widget(Clear, popup_area);
+    frame.render_widget(input, popup_area);
+}
+
+fn draw_goto_input(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    // Draw at bottom of screen like vim
+    let popup_area = Rect {
+        x: 0,
+        y: area.height.saturating_sub(3),
+        width: area.width,
+        height: 3,
+    };
+
+    let input = Paragraph::new(format!(":{}", app.input_buffer))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Go to line (Enter to jump, Esc to cancel) ")
+                .style(Style::default().fg(Color::Cyan)),
+        );
+
+    frame.render_widget(Clear, popup_area);
+    frame.render_widget(input, popup_area);
 }
 
 pub fn run(

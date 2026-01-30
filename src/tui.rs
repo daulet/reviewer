@@ -1,6 +1,7 @@
 use crate::diff::{self, SyntaxHighlighter};
 use crate::gh::{self, Comment, PullRequest};
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -13,6 +14,29 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
+
+/// Format a datetime as a human-readable age (e.g., "2h", "3d", "1w")
+fn format_age(dt: &DateTime<Utc>) -> String {
+    let now = Utc::now();
+    let duration = now.signed_duration_since(*dt);
+
+    let hours = duration.num_hours();
+    let days = duration.num_days();
+    let weeks = days / 7;
+    let months = days / 30;
+
+    if months > 0 {
+        format!("{}mo", months)
+    } else if weeks > 0 {
+        format!("{}w", weeks)
+    } else if days > 0 {
+        format!("{}d", days)
+    } else if hours > 0 {
+        format!("{}h", hours)
+    } else {
+        "now".to_string()
+    }
+}
 
 /// Strip ANSI escape codes from a string for searching
 fn strip_ansi_codes(s: &str) -> String {
@@ -264,9 +288,10 @@ pub enum InputMode {
     Comment,
     LineComment, // Comment on a specific line in diff
     ConfirmApprove,
-    Search,      // Searching in diff
-    ListSearch,  // Searching in PR list
-    GotoLine,    // Jump to specific line
+    ConfirmClose, // Confirm close with optional comment
+    Search,       // Searching in diff
+    ListSearch,   // Searching in PR list
+    GotoLine,     // Jump to specific line
 }
 
 /// Context for a line-level comment
@@ -818,6 +843,50 @@ impl App {
         self.input_mode = InputMode::Normal;
     }
 
+    fn start_close(&mut self) {
+        if self.selected_pr().is_some() {
+            self.input_mode = InputMode::ConfirmClose;
+            self.input_buffer.clear();
+        }
+    }
+
+    fn confirm_close(&mut self) {
+        if let Some(pr) = self.selected_pr().cloned() {
+            let comment = if self.input_buffer.trim().is_empty() {
+                None
+            } else {
+                Some(self.input_buffer.as_str())
+            };
+            match gh::close_pr(&pr, comment) {
+                Ok(()) => {
+                    self.set_status(format!("Closed PR #{}", pr.number));
+                    // Remove from list
+                    if let Some(idx) = self.list_state.selected() {
+                        self.prs.remove(idx);
+                        // Adjust selection
+                        if !self.prs.is_empty() {
+                            let new_idx = idx.min(self.prs.len() - 1);
+                            self.list_state.select(Some(new_idx));
+                        } else {
+                            self.list_state.select(None);
+                        }
+                    }
+                    self.exit_detail();
+                }
+                Err(e) => {
+                    self.set_status(format!("Error: {}", e));
+                }
+            }
+        }
+        self.input_mode = InputMode::Normal;
+        self.input_buffer.clear();
+    }
+
+    fn cancel_close(&mut self) {
+        self.input_mode = InputMode::Normal;
+        self.input_buffer.clear();
+    }
+
     fn refresh(&mut self) {
         if self.refreshing {
             return;
@@ -876,6 +945,7 @@ impl App {
                     InputMode::Comment => self.handle_comment_key(key.code),
                     InputMode::LineComment => self.handle_line_comment_key(key.code),
                     InputMode::ConfirmApprove => self.handle_confirm_key(key.code),
+                    InputMode::ConfirmClose => self.handle_close_key(key.code),
                     InputMode::Search => self.handle_search_key(key.code),
                     InputMode::ListSearch => self.handle_list_search_key(key.code),
                     InputMode::GotoLine => self.handle_goto_key(key.code),
@@ -926,6 +996,7 @@ impl App {
                 KeyCode::PageUp => self.page_up(),
                 KeyCode::Char('c') => self.start_line_comment(),
                 KeyCode::Char('a') => self.start_approve(),
+                KeyCode::Char('x') => self.start_close(),
                 KeyCode::Char('r') => self.launch_claude_review(),
                 // Search (only in Diff tab)
                 KeyCode::Char('/') if self.detail_tab == DetailTab::Diff => self.start_search(),
@@ -955,6 +1026,20 @@ impl App {
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.confirm_approve(),
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => self.cancel_approve(),
+            _ => {}
+        }
+    }
+
+    fn handle_close_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Enter => self.confirm_close(),
+            KeyCode::Esc => self.cancel_close(),
+            KeyCode::Backspace => {
+                self.input_buffer.pop();
+            }
+            KeyCode::Char(c) => {
+                self.input_buffer.push(c);
+            }
             _ => {}
         }
     }
@@ -1263,6 +1348,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_confirm_dialog(frame, app);
     }
 
+    // Draw close dialog if active
+    if app.input_mode == InputMode::ConfirmClose {
+        draw_close_dialog(frame, app);
+    }
+
     // Draw search input if active
     if app.input_mode == InputMode::Search || app.input_mode == InputMode::ListSearch {
         draw_search_input(frame, app);
@@ -1285,7 +1375,7 @@ fn draw_list(frame: &mut Frame, app: &mut App) {
         .iter()
         .map(|pr| {
             let stats = format!("+{}/-{}", pr.additions, pr.deletions);
-            let date = pr.updated_at.format("%m-%d");
+            let age = format_age(&pr.updated_at);
             let mut title_spans = vec![
                 Span::styled(
                     format!("[{}] ", pr.repo_name),
@@ -1312,7 +1402,7 @@ fn draw_list(frame: &mut Frame, app: &mut App) {
                 Span::raw(" | "),
                 Span::styled(stats, Style::default().fg(Color::Yellow)),
                 Span::raw(" | "),
-                Span::styled(date.to_string(), Style::default().fg(Color::DarkGray)),
+                Span::styled(age, Style::default().fg(Color::DarkGray)),
             ]);
             ListItem::new(vec![line, details])
         })
@@ -1520,9 +1610,9 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
 
     // Help - context-aware based on tab
     let help_text = if app.detail_tab == DetailTab::Diff {
-        " j/k: scroll | /: search | :: goto | c: comment | D: toggle delta | a: approve | q: back"
+        " j/k: scroll | /: search | :: goto | c: comment | D: toggle delta | a: approve | x: close | q: back"
     } else {
-        " Tab: tabs | j/k: scroll | a: approve | n/p: PR | q: back"
+        " Tab: tabs | j/k: scroll | a: approve | x: close | n/p: PR | q: back"
     };
     let help = Paragraph::new(help_text)
         .style(Style::default().fg(Color::DarkGray))
@@ -1621,6 +1711,53 @@ fn draw_confirm_dialog(frame: &mut Frame, app: &App) {
             .borders(Borders::ALL)
             .title(" Confirm Approval ")
             .style(Style::default().fg(Color::Yellow)),
+    );
+
+    frame.render_widget(Clear, popup_area);
+    frame.render_widget(dialog, popup_area);
+}
+
+fn draw_close_dialog(frame: &mut Frame, app: &App) {
+    let pr = match app.selected_pr() {
+        Some(pr) => pr,
+        None => return,
+    };
+
+    let area = frame.area();
+    let popup_area = Rect {
+        x: area.width / 6,
+        y: area.height / 3,
+        width: area.width * 2 / 3,
+        height: 9,
+    };
+
+    let text = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  Close "),
+            Span::styled(
+                format!("[{}] #{}", pr.repo_name, pr.number),
+                Style::default().fg(Color::Cyan).bold(),
+            ),
+            Span::raw("?"),
+        ]),
+        Line::from(""),
+        Line::from("  Optional comment:"),
+        Line::from(format!("  > {}", app.input_buffer)),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  [Enter]", Style::default().fg(Color::Red).bold()),
+            Span::raw(" Close    "),
+            Span::styled("[Esc]", Style::default().fg(Color::Green).bold()),
+            Span::raw(" Cancel"),
+        ]),
+    ];
+
+    let dialog = Paragraph::new(text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Close PR ")
+            .style(Style::default().fg(Color::Red)),
     );
 
     frame.render_widget(Clear, popup_area);

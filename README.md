@@ -84,6 +84,7 @@ On first run, you'll be prompted to set your repos root directory.
 | `c` | Add line comment (in Diff tab) |
 | `r` | Launch Claude review |
 | `a` | Approve |
+| `x` | Close PR with comment |
 | `p` | Previous PR |
 | `q` | Back to list |
 

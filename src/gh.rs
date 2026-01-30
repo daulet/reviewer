@@ -381,6 +381,35 @@ pub fn approve_pr(pr: &PullRequest, comment: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Close a PR with an optional comment
+pub fn close_pr(pr: &PullRequest, comment: Option<&str>) -> Result<()> {
+    // Add comment first if provided (closing comment)
+    if let Some(c) = comment {
+        add_pr_comment(pr, c)?;
+    }
+
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "close",
+            &pr.number.to_string(),
+            "--repo",
+            &pr.repo_name,
+        ])
+        .current_dir(&pr.repo_path)
+        .output()
+        .context("Failed to close PR")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to close PR: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    Ok(())
+}
+
 /// Create a worktree for a PR and return the path
 pub fn create_pr_worktree(
     pr: &PullRequest,

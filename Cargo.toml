@@ -2,6 +2,12 @@
 name = "reviewer"
 version = "0.1.0"
 edition = "2021"
+description = "TUI for reviewing GitHub PRs across multiple repositories with Claude Code integration"
+license = "MIT"
+repository = "https://github.com/daulet/reviewer"
+authors = ["daulet"]
+keywords = ["github", "pull-request", "code-review", "tui", "cli"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -13,3 +19,4 @@ anyhow = "1"
 ratatui = "0.29"
 crossterm = "0.28"
 rayon = "1.10"
+clap = { version = "4", features = ["derive"] }

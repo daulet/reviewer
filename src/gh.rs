@@ -302,46 +302,46 @@ pub fn add_pr_comment(pr: &PullRequest, comment: &str) -> Result<()> {
     Ok(())
 }
 
-/// Add a line-level comment to a PR
+/// Add a line-level comment to a PR using the reviews API
 pub fn add_line_comment(pr: &PullRequest, file_path: &str, line: u32, comment: &str) -> Result<()> {
-    // Get the HEAD commit SHA
-    let commit_output = Command::new("git")
-        .args(["rev-parse", "HEAD"])
+    // Use the reviews endpoint with a comments array
+    let api_path = format!("repos/{}/pulls/{}/reviews", pr.repo_name, pr.number);
+
+    // Build complete JSON payload
+    let payload = serde_json::json!({
+        "event": "COMMENT",
+        "body": "",
+        "comments": [{
+            "path": file_path,
+            "line": line,
+            "side": "RIGHT",
+            "body": comment
+        }]
+    });
+
+    let mut child = Command::new("gh")
+        .args(["api", &api_path, "-X", "POST", "--input", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .current_dir(&pr.repo_path)
-        .output()
-        .context("Failed to get HEAD commit")?;
+        .spawn()
+        .context("Failed to spawn gh command")?;
 
-    let commit_id = String::from_utf8_lossy(&commit_output.stdout)
-        .trim()
-        .to_string();
+    // Write JSON payload to stdin
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        stdin
+            .write_all(payload.to_string().as_bytes())
+            .context("Failed to write to gh stdin")?;
+    }
 
-    // Use gh api to create a review comment
-    // API: POST /repos/{owner}/{repo}/pulls/{pull_number}/comments
-    let api_path = format!("repos/{}/pulls/{}/comments", pr.repo_name, pr.number);
-
-    let output = Command::new("gh")
-        .args([
-            "api",
-            &api_path,
-            "-X",
-            "POST",
-            "-f",
-            &format!("body={}", comment),
-            "-f",
-            &format!("commit_id={}", commit_id),
-            "-f",
-            &format!("path={}", file_path),
-            "-F",
-            &format!("line={}", line),
-            "-f",
-            "side=RIGHT",
-        ])
-        .current_dir(&pr.repo_path)
-        .output()
-        .context("Failed to add line comment")?;
+    let output = child.wait_with_output().context("Failed to wait for gh")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!("Line comment API failed: {}", stderr);
+        eprintln!("Payload was: {}", payload);
         // If line comment fails, fall back to a general comment with file:line reference
         let fallback_comment = format!("**{}:{}**\n\n{}", file_path, line, comment);
         return add_pr_comment(pr, &fallback_comment).context(format!(

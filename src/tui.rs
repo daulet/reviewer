@@ -663,34 +663,9 @@ impl App {
                     }
                 }
             }
-            // Debug: write full info to file
-            let mut debug_output = format!("=== Line {} ===\n", line_idx);
-            debug_output.push_str(&format!("delta_line_info.len() = {}\n", self.delta_line_info.len()));
-            debug_output.push_str(&format!("delta_cache lines = {}\n\n", self.delta_cache.as_ref().map(|d| d.lines().count()).unwrap_or(0)));
-
-            // Show lines around current position
-            let start = line_idx.saturating_sub(5);
-            let end = (line_idx + 5).min(self.delta_line_info.len().saturating_sub(1));
-            if !self.delta_line_info.is_empty() && start <= end {
-                for i in start..=end {
-                    let marker = if i == line_idx { ">>>" } else { "   " };
-                    let info = self.delta_line_info.get(i);
-                    let delta_line = self.delta_cache.as_ref()
-                        .and_then(|d| d.lines().nth(i))
-                        .map(strip_ansi_codes)
-                        .unwrap_or_default();
-                    debug_output.push_str(&format!(
-                        "{} [{}] file={:?} old={:?} new={:?}\n    content: {}\n",
-                        marker, i,
-                        info.and_then(|i| i.file_path.as_ref()),
-                        info.and_then(|i| i.old_line_number),
-                        info.and_then(|i| i.new_line_number),
-                        delta_line
-                    ));
-                }
-            }
-            let _ = std::fs::write("/tmp/reviewer_debug.txt", &debug_output);
-            self.set_status("Debug written to /tmp/reviewer_debug.txt".to_string());
+            self.set_status(
+                "Cannot comment on this line. Move to a code line with line numbers.".to_string(),
+            );
             return;
         }
 
@@ -1646,4 +1621,279 @@ pub fn run(
     terminal.show_cursor()?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Tests use output patterns captured from real `delta` CLI output
+
+    #[test]
+    fn test_parse_delta_unified_mode() {
+        // Real unified mode format from: delta --line-numbers
+        // Format: " <old>⋮ <new>│<content>"
+        let raw_diff = r#"diff --git a/src/gh.rs b/src/gh.rs
+--- a/src/gh.rs
++++ b/src/gh.rs
+@@ -303,7 +303,8 @@ pub fn add_pr_comment
+ }
+
+ /// Add a line-level comment
+-pub fn add_line_comment(old)
++/// side doc
++pub fn add_line_comment(new)"#;
+
+        // Captured from: git diff | delta --line-numbers | sed 's/\x1b\[[0-9;]*m//g'
+        let delta_output = r#"
+src/gh.rs
+────────────────────────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────────────────┐
+303: pub fn add_pr_comment(pr: &PullRequest, comment: &str) -> Result<()> { │
+────────────────────────────────────────────────────────────────────────────┘
+ 303⋮ 303│}
+ 304⋮ 304│
+ 305⋮ 305│/// Add a line-level comment to a PR using the reviews API
+ 306⋮    │pub fn add_line_comment(pr: &PullRequest, file_path: &str, line: u32, comment: &str) -> Result<()> {
+    ⋮ 306│/// `side` should be "LEFT" for removed lines (old file) or "RIGHT" for added/context lines (new file)
+    ⋮ 307│pub fn add_line_comment(pr: &PullRequest, file_path: &str, line: u32, side: &str, comment: &str) -> Result<()> {
+ 307⋮ 308│    // Use the reviews endpoint with a comments array"#;
+
+        let result = parse_delta_output(delta_output, raw_diff);
+
+        // Line 0: empty
+        assert_eq!(result[0].file_path, None);
+
+        // Line 1: file header "src/gh.rs"
+        assert_eq!(result[1].file_path.as_deref(), Some("src/gh.rs"));
+
+        // Line 5: hunk header "303: pub fn..."
+        assert_eq!(result[5].old_line_number, Some(303));
+        assert_eq!(result[5].new_line_number, Some(303));
+
+        // Line 7: " 303⋮ 303│" - context line
+        assert_eq!(result[7].file_path.as_deref(), Some("src/gh.rs"));
+        assert_eq!(result[7].old_line_number, Some(303));
+        assert_eq!(result[7].new_line_number, Some(303));
+
+        // Line 10: " 306⋮    │" - removed line (has old, no new)
+        assert_eq!(result[10].old_line_number, Some(306));
+        assert_eq!(result[10].new_line_number, None);
+
+        // Line 11: "    ⋮ 306│" - added line (no old, has new)
+        assert_eq!(result[11].old_line_number, None);
+        assert_eq!(result[11].new_line_number, Some(306));
+
+        // Line 13: " 307⋮ 308│" - context line (shifted)
+        assert_eq!(result[13].old_line_number, Some(307));
+        assert_eq!(result[13].new_line_number, Some(308));
+    }
+
+    #[test]
+    fn test_parse_delta_side_by_side_mode() {
+        // Real side-by-side format from: delta --side-by-side --line-numbers
+        // Format: "│ <old>│<content>│ <new>│<content>"
+        let raw_diff = r#"diff --git a/src/gh.rs b/src/gh.rs
+--- a/src/gh.rs
++++ b/src/gh.rs
+@@ -303,4 +303,5 @@ pub fn add_pr_comment
+ }
+
++/// new comment
+ /// Add a line-level comment"#;
+
+        // Captured from: git diff | delta --side-by-side --line-numbers | sed 's/\x1b\[[0-9;]*m//g'
+        let delta_output = r#"
+src/gh.rs
+────────────────────────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────────────────┐
+303: pub fn add_pr_comment(pr: &PullRequest, comment: &str) -> Result<()> { │
+────────────────────────────────────────────────────────────────────────────┘
+│ 303│}                                 │ 303│}
+│ 304│                                  │ 304│
+│    │                                  │ 305│/// new comment
+│ 305│/// Add a line-level comment      │ 306│/// Add a line-level comment"#;
+
+        let result = parse_delta_output(delta_output, raw_diff);
+
+        // Line 1: file header
+        assert_eq!(result[1].file_path.as_deref(), Some("src/gh.rs"));
+
+        // Line 7: "│ 303│...│ 303│..." - context line
+        assert_eq!(result[7].file_path.as_deref(), Some("src/gh.rs"));
+        assert_eq!(result[7].old_line_number, Some(303));
+        assert_eq!(result[7].new_line_number, Some(303));
+
+        // Line 9: "│    │...│ 305│..." - added line (no old, has new)
+        assert_eq!(result[9].old_line_number, None);
+        assert_eq!(result[9].new_line_number, Some(305));
+
+        // Line 10: "│ 305│...│ 306│..." - context line (shifted)
+        assert_eq!(result[10].old_line_number, Some(305));
+        assert_eq!(result[10].new_line_number, Some(306));
+    }
+
+    #[test]
+    fn test_parse_delta_side_by_side_removed_line() {
+        // Side-by-side with removed lines
+        let raw_diff = r#"diff --git a/test.rs b/test.rs
+--- a/test.rs
++++ b/test.rs
+@@ -1,3 +1,2 @@
+ keep
+-removed
+ also keep"#;
+
+        let delta_output = r#"
+test.rs
+────────────────────────────────────────
+│   1│keep                              │   1│keep
+│   2│removed                           │    │
+│   3│also keep                         │   2│also keep"#;
+
+        let result = parse_delta_output(delta_output, raw_diff);
+
+        // Line 3: context line
+        assert_eq!(result[3].old_line_number, Some(1));
+        assert_eq!(result[3].new_line_number, Some(1));
+
+        // Line 4: removed line (has old, no new)
+        assert_eq!(result[4].old_line_number, Some(2));
+        assert_eq!(result[4].new_line_number, None);
+
+        // Line 5: context line (shifted)
+        assert_eq!(result[5].old_line_number, Some(3));
+        assert_eq!(result[5].new_line_number, Some(2));
+    }
+
+    #[test]
+    fn test_parse_delta_hunk_header() {
+        // Hunk header format: "<num>: <content>" inside box decorations
+        let raw_diff = r#"diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -50,2 +50,3 @@ fn helper() {
+     code();
++    more();
+}"#;
+
+        let delta_output = r#"
+src/lib.rs
+────────────────────────────────────────
+────────────────┐
+50: fn helper() { │
+────────────────┘
+ 50⋮ 50│    code();
+    ⋮ 51│    more();
+ 51⋮ 52│}"#;
+
+        let result = parse_delta_output(delta_output, raw_diff);
+
+        // Line 4: hunk header "50: fn helper()"
+        assert_eq!(result[4].file_path.as_deref(), Some("src/lib.rs"));
+        assert_eq!(result[4].old_line_number, Some(50));
+        assert_eq!(result[4].new_line_number, Some(50));
+
+        // Line 6: code line
+        assert_eq!(result[6].old_line_number, Some(50));
+        assert_eq!(result[6].new_line_number, Some(50));
+    }
+
+    #[test]
+    fn test_parse_delta_multiple_files() {
+        let raw_diff = r#"diff --git a/file1.rs b/file1.rs
+--- a/file1.rs
++++ b/file1.rs
+@@ -1 +1 @@
+-old1
++new1
+diff --git a/file2.rs b/file2.rs
+--- a/file2.rs
++++ b/file2.rs
+@@ -1 +1 @@
+-old2
++new2"#;
+
+        let delta_output = r#"
+file1.rs
+────────────────────────────────────────
+  1⋮  1│new1
+
+file2.rs
+────────────────────────────────────────
+  1⋮  1│new2"#;
+
+        let result = parse_delta_output(delta_output, raw_diff);
+
+        // Find first file's code line
+        let file1_line = result.iter().find(|r| {
+            r.file_path.as_deref() == Some("file1.rs") && r.new_line_number.is_some()
+        });
+        assert!(file1_line.is_some());
+        assert_eq!(file1_line.unwrap().new_line_number, Some(1));
+
+        // Find second file's code line - should switch to file2.rs
+        let file2_line = result.iter().find(|r| {
+            r.file_path.as_deref() == Some("file2.rs") && r.new_line_number.is_some()
+        });
+        assert!(file2_line.is_some());
+        assert_eq!(file2_line.unwrap().new_line_number, Some(1));
+    }
+
+    #[test]
+    fn test_parse_delta_decoration_lines() {
+        // Decoration lines (separators, box corners) should have no line numbers
+        let raw_diff = r#"diff --git a/test.rs b/test.rs
+--- a/test.rs
++++ b/test.rs
+@@ -1 +1 @@
+ code"#;
+
+        let delta_output = r#"
+test.rs
+────────────────────────────────────────
+
+────────────────┐
+1: fn test() {   │
+────────────────┘
+  1⋮  1│code"#;
+
+        let result = parse_delta_output(delta_output, raw_diff);
+
+        // Line 2: separator line (────...)
+        assert_eq!(result[2].old_line_number, None);
+        assert_eq!(result[2].new_line_number, None);
+
+        // Line 3: empty line
+        assert_eq!(result[3].old_line_number, None);
+        assert_eq!(result[3].new_line_number, None);
+
+        // Line 4: box top (────...┐)
+        assert_eq!(result[4].old_line_number, None);
+        assert_eq!(result[4].new_line_number, None);
+
+        // Line 6: box bottom (────...┘)
+        assert_eq!(result[6].old_line_number, None);
+        assert_eq!(result[6].new_line_number, None);
+
+        // Line 7: actual code line
+        assert_eq!(result[7].old_line_number, Some(1));
+        assert_eq!(result[7].new_line_number, Some(1));
+    }
+
+    #[test]
+    fn test_strip_ansi_codes() {
+        // Test ANSI code stripping with real delta escape sequences
+        let with_ansi = "\x1b[34msrc/main.rs\x1b[0m";
+        assert_eq!(strip_ansi_codes(with_ansi), "src/main.rs");
+
+        // Real delta output: colored line numbers
+        let complex = "\x1b[38;2;68;68;68m 303⋮ 303\x1b[34m│\x1b[0m}";
+        let stripped = strip_ansi_codes(complex);
+        assert!(stripped.contains("303"));
+        assert!(stripped.contains("⋮"));
+        assert!(stripped.contains("│"));
+    }
 }

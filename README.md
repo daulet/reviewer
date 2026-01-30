@@ -36,9 +36,11 @@ cargo install --git https://github.com/daulet/reviewer
 ## Usage
 
 ```bash
-reviewer              # Scan configured directory
-reviewer -r ~/dev     # Specify repos directory
-reviewer -d           # Include draft PRs
+reviewer                       # Scan configured directory
+reviewer -r ~/dev              # Specify repos directory
+reviewer -d                    # Include draft PRs
+reviewer -e archived -e old    # Exclude directories
+reviewer -e vendor --save-exclude  # Save exclusions to config
 ```
 
 On first run, you'll be prompted to set your repos root directory.

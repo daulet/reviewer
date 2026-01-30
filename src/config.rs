@@ -5,6 +5,8 @@ use std::path::PathBuf;
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Config {
     pub repos_root: Option<String>,
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }
 
 pub fn config_path() -> PathBuf {

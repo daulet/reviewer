@@ -21,6 +21,15 @@ struct Args {
     /// Override the repos root directory
     #[arg(short, long)]
     root: Option<PathBuf>,
+
+    /// Exclude directories (relative to root). Can be specified multiple times.
+    /// Use --save-exclude to persist to config.
+    #[arg(short, long)]
+    exclude: Vec<String>,
+
+    /// Save excluded directories to config
+    #[arg(long)]
+    save_exclude: bool,
 }
 
 pub fn fetch_all_prs(
@@ -115,9 +124,27 @@ fn main() -> Result<()> {
         }
     };
 
+    // Merge CLI excludes with config excludes
+    let mut exclude = cfg.exclude.clone();
+    for e in &args.exclude {
+        if !exclude.contains(e) {
+            exclude.push(e.clone());
+        }
+    }
+
+    // Save excludes to config if requested
+    if args.save_exclude && !args.exclude.is_empty() {
+        cfg.exclude = exclude.clone();
+        config::save_config(&cfg)?;
+        println!("Saved exclusions to config: {:?}", args.exclude);
+    }
+
     // Find repos
     println!("Scanning for repos in: {}", repos_root.display());
-    let repo_list = repos::find_repos(&repos_root, 3);
+    if !exclude.is_empty() {
+        println!("Excluding: {}", exclude.join(", "));
+    }
+    let repo_list = repos::find_repos(&repos_root, 3, &exclude);
     println!("Found {} repositories", repo_list.len());
 
     if repo_list.is_empty() {

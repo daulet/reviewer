@@ -3,6 +3,7 @@
 ## Features
 
 - [ ] Update skill to update skill when user chooses "skip" to enhance review for the next time
+- [ ] Add an option to jump pages
 - [ ] **Line-level review comments** - Allow attaching comments to specific lines in the diff view
   - Track cursor position in diff
   - Capture file path + line number

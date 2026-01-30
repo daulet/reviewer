@@ -11,6 +11,7 @@
   - Use GitHub review comments API: `POST /repos/{owner}/{repo}/pulls/{pr}/comments`
   - Required fields: `path`, `line`, `commit_id`, `body`
 - [ ] Update readme with install instructions eg installing skill under `~/.claude/skills/code-review/`
+- [ ] brew install option
 - [ ] Review my PRs, ie address comments 
 
 ## Bugs

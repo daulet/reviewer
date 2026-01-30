@@ -55,6 +55,7 @@ pub struct App {
     pub input_mode: InputMode,
     pub input_buffer: String,
     pub status_message: Option<String>,
+    pub status_time: Option<std::time::Instant>,
     pub should_quit: bool,
     // Async loading
     async_tx: Sender<AsyncResult>,
@@ -69,19 +70,15 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(prs: Vec<PullRequest>, repos_root: PathBuf, repo_list: Vec<PathBuf>, username: String) -> Self {
-        let mut list_state = ListState::default();
-        if !prs.is_empty() {
-            list_state.select(Some(0));
-        }
+    pub fn new(repos_root: PathBuf, repo_list: Vec<PathBuf>, username: String) -> Self {
         let (async_tx, async_rx) = mpsc::channel();
         Self {
-            prs,
+            prs: Vec::new(),
             repos_root,
             repo_list,
             username,
             include_drafts: false,
-            list_state,
+            list_state: ListState::default(),
             view: View::List,
             detail_tab: DetailTab::Description,
             scroll_offset: 0,
@@ -90,6 +87,7 @@ impl App {
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             status_message: None,
+            status_time: None,
             should_quit: false,
             async_tx,
             async_rx,
@@ -98,6 +96,21 @@ impl App {
             refreshing: false,
             needs_clear: true,
             launching_claude: false,
+        }
+    }
+
+    fn set_status(&mut self, msg: String) {
+        self.status_message = Some(msg);
+        self.status_time = Some(std::time::Instant::now());
+    }
+
+    fn check_status_timeout(&mut self) {
+        if let (Some(time), Some(_)) = (self.status_time, &self.status_message) {
+            // Auto-dismiss after 3 seconds, but not while refreshing
+            if !self.refreshing && time.elapsed().as_secs() >= 3 {
+                self.status_message = None;
+                self.status_time = None;
+            }
         }
     }
 
@@ -257,10 +270,10 @@ impl App {
                     self.needs_clear = true;
                     match result {
                         Ok(path) => {
-                            self.status_message = Some(format!("Launched Claude in {}", path));
+                            self.set_status(format!("Launched Claude in {}", path));
                         }
                         Err(e) => {
-                            self.status_message = Some(format!("Failed: {}", e));
+                            self.set_status(format!("Failed: {}", e));
                         }
                     }
                 }
@@ -276,7 +289,7 @@ impl App {
                         self.list_state.select(Some(0));
                     }
                     let draft_status = if self.include_drafts { " (incl. drafts)" } else { "" };
-                    self.status_message = Some(format!("Refreshed: {} PRs{}", count, draft_status));
+                    self.set_status(format!("Refreshed: {} PRs{}", count, draft_status));
                 }
             }
         }
@@ -293,7 +306,7 @@ impl App {
         }
         if let Some(pr) = self.selected_pr().cloned() {
             self.launching_claude = true;
-            self.status_message = Some("Creating worktree and launching Claude...".to_string());
+            self.set_status("Creating worktree and launching Claude...".to_string());
 
             let tx = self.async_tx.clone();
             let repos_root = self.repos_root.clone();
@@ -318,11 +331,11 @@ impl App {
         if let Some(pr) = self.selected_pr().cloned() {
             match gh::add_pr_comment(&pr, &self.input_buffer) {
                 Ok(()) => {
-                    self.status_message = Some("Comment added successfully".to_string());
+                    self.set_status("Comment added successfully".to_string());
                     self.comments_cache = None; // Force reload
                 }
                 Err(e) => {
-                    self.status_message = Some(format!("Error: {}", e));
+                    self.set_status(format!("Error: {}", e));
                 }
             }
         }
@@ -341,7 +354,7 @@ impl App {
         if let Some(pr) = self.selected_pr().cloned() {
             match gh::approve_pr(&pr, None) {
                 Ok(()) => {
-                    self.status_message = Some(format!("Approved PR #{}", pr.number));
+                    self.set_status(format!("Approved PR #{}", pr.number));
                     // Remove from list
                     if let Some(idx) = self.list_state.selected() {
                         self.prs.remove(idx);
@@ -360,7 +373,7 @@ impl App {
                     }
                 }
                 Err(e) => {
-                    self.status_message = Some(format!("Error: {}", e));
+                    self.set_status(format!("Error: {}", e));
                 }
             }
         }
@@ -376,7 +389,7 @@ impl App {
             return;
         }
         self.refreshing = true;
-        self.status_message = Some("Refreshing PR list...".to_string());
+        self.set_status("Refreshing PR list...".to_string());
 
         let tx = self.async_tx.clone();
         let repo_list = self.repo_list.clone();
@@ -396,7 +409,7 @@ impl App {
         } else {
             "Excluding drafts - refreshing..."
         };
-        self.status_message = Some(status.to_string());
+        self.set_status(status.to_string());
         self.refresh();
     }
 
@@ -409,9 +422,6 @@ impl App {
                 if key.kind != KeyEventKind::Press {
                     return Ok(());
                 }
-
-                // Clear status message on any key
-                self.status_message = None;
 
                 match self.input_mode {
                     InputMode::Normal => self.handle_normal_key(key.code, key.modifiers),
@@ -496,19 +506,18 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         View::Detail => draw_detail(frame, app),
     }
 
-    // Draw status message if present
+    // Draw status message in top right corner if present
     if let Some(msg) = &app.status_message {
         let area = frame.area();
+        let msg_width = (msg.len() as u16 + 4).min(area.width / 2);
         let popup_area = Rect {
-            x: area.width / 4,
-            y: area.height - 3,
-            width: area.width / 2,
-            height: 3,
+            x: area.width.saturating_sub(msg_width + 1),
+            y: 0,
+            width: msg_width,
+            height: 1,
         };
         let popup = Paragraph::new(msg.as_str())
-            .block(Block::default().borders(Borders::ALL).title("Status"))
-            .style(Style::default().fg(Color::Yellow));
-        frame.render_widget(Clear, popup_area);
+            .style(Style::default().fg(Color::Black).bg(Color::Yellow));
         frame.render_widget(popup, popup_area);
     }
 
@@ -795,7 +804,7 @@ fn draw_confirm_dialog(frame: &mut Frame, app: &App) {
     frame.render_widget(dialog, popup_area);
 }
 
-pub fn run(prs: Vec<PullRequest>, repos_root: PathBuf, repo_list: Vec<PathBuf>, username: String) -> Result<()> {
+pub fn run(repos_root: PathBuf, repo_list: Vec<PathBuf>, username: String) -> Result<()> {
     // Setup terminal
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -807,7 +816,10 @@ pub fn run(prs: Vec<PullRequest>, repos_root: PathBuf, repo_list: Vec<PathBuf>, 
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::new(backend)?;
 
-    let mut app = App::new(prs, repos_root, repo_list, username);
+    let mut app = App::new(repos_root, repo_list, username);
+
+    // Start fetching PRs immediately in background
+    app.refresh();
 
     // Main loop
     loop {
@@ -816,6 +828,10 @@ pub fn run(prs: Vec<PullRequest>, repos_root: PathBuf, repo_list: Vec<PathBuf>, 
             terminal.clear()?;
             app.needs_clear = false;
         }
+
+        // Auto-dismiss status messages after timeout
+        app.check_status_timeout();
+
         terminal.draw(|f| draw(f, &mut app))?;
         app.handle_event()?;
 

@@ -7,25 +7,12 @@ use anyhow::Result;
 use rayon::prelude::*;
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub fn fetch_all_prs(repo_list: &[PathBuf], username: &str, include_drafts: bool) -> Vec<gh::PullRequest> {
-    println!("Fetching PRs from {} repositories...", repo_list.len());
-    let completed = AtomicUsize::new(0);
-    let total = repo_list.len();
-
     let all_prs: Vec<_> = repo_list
         .par_iter()
-        .flat_map(|repo| {
-            let prs = gh::fetch_prs_for_repo(repo, username, include_drafts);
-            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-            eprint!("\r  Progress: {}/{}          ", done, total);
-            let _ = io::stderr().flush();
-            prs
-        })
+        .flat_map(|repo| gh::fetch_prs_for_repo(repo, username, include_drafts))
         .collect();
-
-    eprintln!("\r  Checked {} repositories.   ", total);
 
     // Sort by most recent first
     let mut all_prs = all_prs;
@@ -102,25 +89,16 @@ fn main() -> Result<()> {
     // Find repos
     println!("Scanning for repos in: {}", repos_root.display());
     let repo_list = repos::find_repos(&repos_root, 3);
-    println!("Found {} repositories\n", repo_list.len());
+    println!("Found {} repositories", repo_list.len());
 
     if repo_list.is_empty() {
         println!("No repositories found.");
         return Ok(());
     }
 
-    // Fetch PRs from all repos in parallel (exclude drafts by default)
-    let all_prs = fetch_all_prs(&repo_list, &username, false);
-
-    println!("\nFound {} PRs requiring review. Launching TUI...", all_prs.len());
-
-    if all_prs.is_empty() {
-        println!("No PRs need your attention. You're all caught up!");
-        return Ok(());
-    }
-
-    // Launch TUI with context for refresh
-    tui::run(all_prs, repos_root, repo_list, username)?;
+    // Launch TUI immediately - it will fetch PRs in background
+    println!("Launching TUI...");
+    tui::run(repos_root, repo_list, username)?;
 
     Ok(())
 }

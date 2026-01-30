@@ -64,8 +64,8 @@ On first run, you'll be prompted to set your repos root directory.
 |-----|--------|
 | `Tab` | Switch tabs (Description/Diff/Comments) |
 | `j/k` | Scroll |
+| `c` | Add line comment (in Diff tab) |
 | `r` | Launch Claude review |
-| `c` | Add comment |
 | `a` | Approve |
 | `n/p` | Next/previous PR |
 | `q` | Back to list |

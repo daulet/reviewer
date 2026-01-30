@@ -302,6 +302,57 @@ pub fn add_pr_comment(pr: &PullRequest, comment: &str) -> Result<()> {
     Ok(())
 }
 
+/// Add a line-level comment to a PR
+pub fn add_line_comment(pr: &PullRequest, file_path: &str, line: u32, comment: &str) -> Result<()> {
+    // Get the HEAD commit SHA
+    let commit_output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&pr.repo_path)
+        .output()
+        .context("Failed to get HEAD commit")?;
+
+    let commit_id = String::from_utf8_lossy(&commit_output.stdout)
+        .trim()
+        .to_string();
+
+    // Use gh api to create a review comment
+    // API: POST /repos/{owner}/{repo}/pulls/{pull_number}/comments
+    let api_path = format!("repos/{}/pulls/{}/comments", pr.repo_name, pr.number);
+
+    let output = Command::new("gh")
+        .args([
+            "api",
+            &api_path,
+            "-X",
+            "POST",
+            "-f",
+            &format!("body={}", comment),
+            "-f",
+            &format!("commit_id={}", commit_id),
+            "-f",
+            &format!("path={}", file_path),
+            "-F",
+            &format!("line={}", line),
+            "-f",
+            "side=RIGHT",
+        ])
+        .current_dir(&pr.repo_path)
+        .output()
+        .context("Failed to add line comment")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // If line comment fails, fall back to a general comment with file:line reference
+        let fallback_comment = format!("**{}:{}**\n\n{}", file_path, line, comment);
+        return add_pr_comment(pr, &fallback_comment).context(format!(
+            "Line comment failed ({}), fallback also failed",
+            stderr
+        ));
+    }
+
+    Ok(())
+}
+
 pub fn approve_pr(pr: &PullRequest, comment: Option<&str>) -> Result<()> {
     let pr_number = pr.number.to_string();
     let mut args = vec!["pr", "review", &pr_number, "--approve"];

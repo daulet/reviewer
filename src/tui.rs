@@ -13,6 +13,100 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
+/// Represents a line in the parsed diff with its location info
+#[derive(Debug, Clone)]
+pub struct DiffLine {
+    pub file_path: Option<String>,
+    pub line_number: Option<u32>, // Line number in the new file (for + lines)
+    #[allow(dead_code)] // May be used for line type indicators in future
+    pub line_type: DiffLineType,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DiffLineType {
+    Header,  // diff --git, +++, ---
+    Hunk,    // @@ ... @@
+    Added,   // + lines
+    Removed, // - lines
+    Context, // unchanged lines
+    Other,
+}
+
+/// Parse a unified diff and extract file paths and line numbers
+fn parse_diff(diff: &str) -> Vec<DiffLine> {
+    let mut result = Vec::new();
+    let mut current_file: Option<String> = None;
+    let mut new_line_num: u32 = 0;
+
+    for line in diff.lines() {
+        if line.starts_with("diff --git") {
+            // Extract file path from "diff --git a/path b/path"
+            if let Some(b_path) = line.split(" b/").nth(1) {
+                current_file = Some(b_path.to_string());
+            }
+            result.push(DiffLine {
+                file_path: current_file.clone(),
+                line_number: None,
+                line_type: DiffLineType::Header,
+            });
+        } else if line.starts_with("+++") || line.starts_with("---") {
+            result.push(DiffLine {
+                file_path: current_file.clone(),
+                line_number: None,
+                line_type: DiffLineType::Header,
+            });
+        } else if line.starts_with("@@") {
+            // Parse hunk header: @@ -start,count +start,count @@
+            // Extract the +start number for new file line tracking
+            if let Some(plus_part) = line.split('+').nth(1) {
+                if let Some(start_str) = plus_part
+                    .split(',')
+                    .next()
+                    .or_else(|| plus_part.split(' ').next())
+                {
+                    if let Ok(start) = start_str.parse::<u32>() {
+                        new_line_num = start;
+                    }
+                }
+            }
+            result.push(DiffLine {
+                file_path: current_file.clone(),
+                line_number: None,
+                line_type: DiffLineType::Hunk,
+            });
+        } else if line.starts_with('+') && !line.starts_with("+++") {
+            result.push(DiffLine {
+                file_path: current_file.clone(),
+                line_number: Some(new_line_num),
+                line_type: DiffLineType::Added,
+            });
+            new_line_num += 1;
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            result.push(DiffLine {
+                file_path: current_file.clone(),
+                line_number: None, // Removed lines don't have a line number in new file
+                line_type: DiffLineType::Removed,
+            });
+        } else if line.starts_with(' ') || (!line.starts_with('\\') && !line.is_empty()) {
+            // Context line (unchanged)
+            result.push(DiffLine {
+                file_path: current_file.clone(),
+                line_number: Some(new_line_num),
+                line_type: DiffLineType::Context,
+            });
+            new_line_num += 1;
+        } else {
+            result.push(DiffLine {
+                file_path: current_file.clone(),
+                line_number: None,
+                line_type: DiffLineType::Other,
+            });
+        }
+    }
+
+    result
+}
+
 enum AsyncResult {
     Diff(usize, String),                  // (pr_index, diff_content)
     Comments(usize, Vec<Comment>),        // (pr_index, comments)
@@ -37,7 +131,15 @@ pub enum DetailTab {
 pub enum InputMode {
     Normal,
     Comment,
+    LineComment, // Comment on a specific line in diff
     ConfirmApprove,
+}
+
+/// Context for a line-level comment
+#[derive(Debug, Clone)]
+pub struct LineCommentContext {
+    pub file_path: String,
+    pub line_number: u32,
 }
 
 pub struct App {
@@ -51,9 +153,11 @@ pub struct App {
     pub detail_tab: DetailTab,
     pub scroll_offset: u16,
     pub diff_cache: Option<String>,
+    pub diff_lines: Vec<DiffLine>, // Parsed diff with line info
     pub comments_cache: Option<Vec<Comment>>,
     pub input_mode: InputMode,
     pub input_buffer: String,
+    pub line_comment_ctx: Option<LineCommentContext>, // For line-level comments
     pub status_message: Option<String>,
     pub status_time: Option<std::time::Instant>,
     pub should_quit: bool,
@@ -88,9 +192,11 @@ impl App {
             detail_tab: DetailTab::Description,
             scroll_offset: 0,
             diff_cache: None,
+            diff_lines: Vec::new(),
             comments_cache: None,
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
+            line_comment_ctx: None,
             status_message: None,
             status_time: None,
             should_quit: false,
@@ -193,6 +299,7 @@ impl App {
             self.detail_tab = DetailTab::Description;
             self.scroll_offset = 0;
             self.diff_cache = None;
+            self.diff_lines.clear();
             self.comments_cache = None;
             self.loading_diff = false;
             self.loading_comments = false;
@@ -204,6 +311,7 @@ impl App {
         self.view = View::List;
         self.scroll_offset = 0;
         self.diff_cache = None;
+        self.diff_lines.clear();
         self.comments_cache = None;
         self.loading_diff = false;
         self.loading_comments = false;
@@ -296,6 +404,7 @@ impl App {
                 AsyncResult::Diff(idx, diff) => {
                     // Only update if still viewing the same PR
                     if self.list_state.selected() == Some(idx) {
+                        self.diff_lines = parse_diff(&diff);
                         self.diff_cache = Some(diff);
                     }
                     self.loading_diff = false;
@@ -342,6 +451,60 @@ impl App {
 
     fn start_comment(&mut self) {
         self.input_mode = InputMode::Comment;
+        self.input_buffer.clear();
+    }
+
+    fn start_line_comment(&mut self) {
+        // Only works in diff view with a valid line selected
+        if self.detail_tab != DetailTab::Diff {
+            self.start_comment(); // Fall back to general comment
+            return;
+        }
+
+        // Get the diff line at current scroll position
+        let line_idx = self.scroll_offset as usize;
+        if let Some(diff_line) = self.diff_lines.get(line_idx) {
+            // Only allow comments on added or context lines (they have line numbers)
+            if let (Some(file_path), Some(line_num)) = (&diff_line.file_path, diff_line.line_number)
+            {
+                self.line_comment_ctx = Some(LineCommentContext {
+                    file_path: file_path.clone(),
+                    line_number: line_num,
+                });
+                self.input_mode = InputMode::LineComment;
+                self.input_buffer.clear();
+                return;
+            }
+        }
+
+        // Fall back to general comment if no valid line
+        self.set_status(
+            "Cannot comment on this line. Move to an added (+) or context line.".to_string(),
+        );
+    }
+
+    fn submit_line_comment(&mut self) {
+        if self.input_buffer.trim().is_empty() {
+            self.input_mode = InputMode::Normal;
+            self.line_comment_ctx = None;
+            return;
+        }
+
+        if let (Some(pr), Some(ctx)) = (self.selected_pr().cloned(), self.line_comment_ctx.take()) {
+            match gh::add_line_comment(&pr, &ctx.file_path, ctx.line_number, &self.input_buffer) {
+                Ok(()) => {
+                    self.set_status(format!(
+                        "Comment added at {}:{}",
+                        ctx.file_path, ctx.line_number
+                    ));
+                }
+                Err(e) => {
+                    self.set_status(format!("Error: {}", e));
+                }
+            }
+        }
+
+        self.input_mode = InputMode::Normal;
         self.input_buffer.clear();
     }
 
@@ -471,6 +634,7 @@ impl App {
                 match self.input_mode {
                     InputMode::Normal => self.handle_normal_key(key.code, key.modifiers),
                     InputMode::Comment => self.handle_comment_key(key.code),
+                    InputMode::LineComment => self.handle_line_comment_key(key.code),
                     InputMode::ConfirmApprove => self.handle_confirm_key(key.code),
                 }
             }
@@ -510,7 +674,7 @@ impl App {
                 KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => self.page_up(),
                 KeyCode::PageDown => self.page_down(),
                 KeyCode::PageUp => self.page_up(),
-                KeyCode::Char('c') => self.start_comment(),
+                KeyCode::Char('c') => self.start_line_comment(),
                 KeyCode::Char('a') => self.start_approve(),
                 KeyCode::Char('r') => self.launch_claude_review(),
                 KeyCode::Char('n') => {
@@ -552,6 +716,24 @@ impl App {
             _ => {}
         }
     }
+
+    fn handle_line_comment_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Enter => self.submit_line_comment(),
+            KeyCode::Esc => {
+                self.input_mode = InputMode::Normal;
+                self.input_buffer.clear();
+                self.line_comment_ctx = None;
+            }
+            KeyCode::Backspace => {
+                self.input_buffer.pop();
+            }
+            KeyCode::Char(c) => {
+                self.input_buffer.push(c);
+            }
+            _ => {}
+        }
+    }
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -579,6 +761,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // Draw comment input if active
     if app.input_mode == InputMode::Comment {
         draw_comment_input(frame, app);
+    }
+
+    // Draw line comment input if active
+    if app.input_mode == InputMode::LineComment {
+        draw_line_comment_input(frame, app);
     }
 
     // Draw confirmation dialog if active
@@ -793,7 +980,7 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
 
     // Help
     let help = Paragraph::new(
-        " Tab: tabs | j/k: scroll | r: claude review | c: comment | a: approve | n/p: PR | q: back",
+        " Tab: tabs | j/k: scroll | c: line comment | r: claude review | a: approve | n/p: PR | q: back",
     )
     .style(Style::default().fg(Color::DarkGray))
     .block(Block::default().borders(Borders::ALL).title(" Help "));
@@ -815,6 +1002,37 @@ fn draw_comment_input(frame: &mut Frame, app: &App) {
                 .borders(Borders::ALL)
                 .title(" Add Comment (Enter to submit, Esc to cancel) ")
                 .style(Style::default().fg(Color::Yellow)),
+        )
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, popup_area);
+    frame.render_widget(input, popup_area);
+}
+
+fn draw_line_comment_input(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    let popup_area = Rect {
+        x: area.width / 8,
+        y: area.height / 3,
+        width: area.width * 3 / 4,
+        height: 6,
+    };
+
+    let title = if let Some(ctx) = &app.line_comment_ctx {
+        format!(
+            " Comment on {}:{} (Enter to submit, Esc to cancel) ",
+            ctx.file_path, ctx.line_number
+        )
+    } else {
+        " Add Line Comment (Enter to submit, Esc to cancel) ".to_string()
+    };
+
+    let input = Paragraph::new(app.input_buffer.as_str())
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .style(Style::default().fg(Color::Cyan)),
         )
         .wrap(Wrap { trim: false });
 

@@ -321,8 +321,7 @@ fn fetch_pr_review_state(repo: &str, pr_number: u64) -> ReviewState {
 
     match output {
         Some(o) if o.status.success() => {
-            let response: Option<ReviewDecisionResponse> =
-                serde_json::from_slice(&o.stdout).ok();
+            let response: Option<ReviewDecisionResponse> = serde_json::from_slice(&o.stdout).ok();
             match response.and_then(|r| r.review_decision) {
                 Some(ref s) if s == "APPROVED" => ReviewState::Approved,
                 Some(ref s) if s == "CHANGES_REQUESTED" => ReviewState::ChangesRequested,
@@ -462,7 +461,13 @@ pub fn add_pr_comment(pr: &PullRequest, comment: &str) -> Result<()> {
 
 /// Add a line-level comment to a PR using the reviews API
 /// `side` should be "LEFT" for removed lines (old file) or "RIGHT" for added/context lines (new file)
-pub fn add_line_comment(pr: &PullRequest, file_path: &str, line: u32, side: &str, comment: &str) -> Result<()> {
+pub fn add_line_comment(
+    pr: &PullRequest,
+    file_path: &str,
+    line: u32,
+    side: &str,
+    comment: &str,
+) -> Result<()> {
     // Use the reviews endpoint with a comments array
     let api_path = format!("repos/{}/pulls/{}/reviews", pr.repo_name, pr.number);
 

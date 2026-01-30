@@ -42,7 +42,7 @@ fn run_delta(diff: &str, width: u16) -> Option<String> {
             "--paging=never",
             "--line-numbers",
             "--side-by-side",
-            &format!("--width={}", width),
+            &format!("--width={width}"),
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -184,14 +184,14 @@ pub struct EnhancedDiffLine {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DiffLineType {
-    FileHeader,  // diff --git line
-    OldFile,     // --- line
-    NewFile,     // +++ line
-    Hunk,        // @@ ... @@
-    Added,       // + lines
-    Removed,     // - lines
-    Context,     // unchanged lines
-    NoNewline,   // \ No newline at end of file
+    FileHeader, // diff --git line
+    OldFile,    // --- line
+    NewFile,    // +++ line
+    Hunk,       // @@ ... @@
+    Added,      // + lines
+    Removed,    // - lines
+    Context,    // unchanged lines
+    NoNewline,  // \ No newline at end of file
 }
 
 #[derive(Debug, Clone)]
@@ -426,17 +426,16 @@ pub fn render_diff_line<'a>(
         .unwrap_or("");
 
     match diff_line.line_type {
-        DiffLineType::FileHeader => {
-            Line::styled(
-                diff_line.content.clone(),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
-        }
-        DiffLineType::OldFile | DiffLineType::NewFile => {
-            Line::styled(diff_line.content.clone(), Style::default().fg(Color::Yellow))
-        }
+        DiffLineType::FileHeader => Line::styled(
+            diff_line.content.clone(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        DiffLineType::OldFile | DiffLineType::NewFile => Line::styled(
+            diff_line.content.clone(),
+            Style::default().fg(Color::Yellow),
+        ),
         DiffLineType::Hunk => {
             Line::styled(diff_line.content.clone(), Style::default().fg(Color::Cyan))
         }
@@ -499,8 +498,11 @@ pub fn render_diff_line<'a>(
             Line::from(spans)
         }
         DiffLineType::Context => {
-            let prefix =
-                format_line_numbers(diff_line.old_line_num, diff_line.new_line_num, line_number_width);
+            let prefix = format_line_numbers(
+                diff_line.old_line_num,
+                diff_line.new_line_num,
+                line_number_width,
+            );
             let content = if diff_line.content.is_empty() {
                 ""
             } else {
@@ -515,12 +517,10 @@ pub fn render_diff_line<'a>(
 
             Line::from(spans)
         }
-        DiffLineType::NoNewline => {
-            Line::styled(
-                diff_line.content.clone(),
-                Style::default().fg(Color::DarkGray),
-            )
-        }
+        DiffLineType::NoNewline => Line::styled(
+            diff_line.content.clone(),
+            Style::default().fg(Color::DarkGray),
+        ),
     }
 }
 

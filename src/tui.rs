@@ -81,7 +81,7 @@ fn format_search_status(idx: usize, total: usize, query: &str) -> String {
 #[derive(Debug, Clone)]
 pub struct DiffLine {
     pub file_path: Option<String>,
-    pub line_number: Option<u32>,     // Line number in the new file (for + and context lines)
+    pub line_number: Option<u32>, // Line number in the new file (for + and context lines)
     pub old_line_number: Option<u32>, // Line number in the old file (for - and context lines)
     #[allow(dead_code)] // Used for potential future styling
     pub line_type: DiffLineType,
@@ -158,7 +158,10 @@ fn parse_delta_output(delta_output: &str, raw_diff: &str) -> Vec<DeltaLineInfo> 
                     .next()
                     .and_then(|s| s.parse().ok())
             } else {
-                after_sep.split_whitespace().next().and_then(|s| s.parse().ok())
+                after_sep
+                    .split_whitespace()
+                    .next()
+                    .and_then(|s| s.parse().ok())
             };
         } else if clean.starts_with('│') {
             // Side-by-side mode: "│ <num>│<content>│ <num>│<content>"
@@ -223,14 +226,22 @@ fn parse_diff(diff: &str) -> Vec<DiffLine> {
         } else if line.starts_with("@@") {
             // Parse hunk header: @@ -old_start,count +new_start,count @@
             if let Some(minus_part) = line.split('-').nth(1) {
-                if let Some(start_str) = minus_part.split(',').next().or_else(|| minus_part.split(' ').next()) {
+                if let Some(start_str) = minus_part
+                    .split(',')
+                    .next()
+                    .or_else(|| minus_part.split(' ').next())
+                {
                     if let Ok(start) = start_str.parse::<u32>() {
                         old_line_num = start;
                     }
                 }
             }
             if let Some(plus_part) = line.split('+').nth(1) {
-                if let Some(start_str) = plus_part.split(',').next().or_else(|| plus_part.split(' ').next()) {
+                if let Some(start_str) = plus_part
+                    .split(',')
+                    .next()
+                    .or_else(|| plus_part.split(' ').next())
+                {
                     if let Ok(start) = start_str.parse::<u32>() {
                         new_line_num = start;
                     }
@@ -282,10 +293,10 @@ fn parse_diff(diff: &str) -> Vec<DiffLine> {
 }
 
 enum AsyncResult {
-    Diff(usize, String, Option<String>),  // (pr_index, diff_content, delta_output)
-    Comments(usize, Vec<Comment>),        // (pr_index, comments)
+    Diff(usize, String, Option<String>), // (pr_index, diff_content, delta_output)
+    Comments(usize, Vec<Comment>),       // (pr_index, comments)
     ClaudeLaunch(Result<String, String>), // worktree path or error
-    Refresh(Vec<PullRequest>),            // refreshed PR list
+    Refresh(Vec<PullRequest>),           // refreshed PR list
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -314,7 +325,7 @@ pub enum AppMode {
 pub enum InputMode {
     Normal,
     Comment,
-    LineComment,  // Comment on a specific line in diff
+    LineComment, // Comment on a specific line in diff
     ConfirmApprove,
     ConfirmClose, // Confirm close with optional comment
     ConfirmMerge, // Confirm merge (squash)
@@ -773,9 +784,19 @@ impl App {
                 CommentSide::Left => "LEFT",
                 CommentSide::Right => "RIGHT",
             };
-            match gh::add_line_comment(&pr, &ctx.file_path, ctx.line_number, side, &self.input_buffer) {
+            match gh::add_line_comment(
+                &pr,
+                &ctx.file_path,
+                ctx.line_number,
+                side,
+                &self.input_buffer,
+            ) {
                 Ok(()) => {
-                    let side_label = if ctx.side == CommentSide::Left { " (old)" } else { "" };
+                    let side_label = if ctx.side == CommentSide::Left {
+                        " (old)"
+                    } else {
+                        ""
+                    };
                     self.set_status(format!(
                         "Comment added at {}:{}{}",
                         ctx.file_path, ctx.line_number, side_label
@@ -932,7 +953,9 @@ impl App {
             if status.can_merge {
                 self.input_mode = InputMode::ConfirmMerge;
             } else {
-                let reason = status.reason.unwrap_or_else(|| "Unknown reason".to_string());
+                let reason = status
+                    .reason
+                    .unwrap_or_else(|| "Unknown reason".to_string());
                 self.set_status(format!("Cannot merge: {}", reason));
             }
         }
@@ -1063,8 +1086,12 @@ impl App {
                 KeyCode::Char('d') => self.toggle_drafts(),
                 // Search in PR list
                 KeyCode::Char('/') => self.start_list_search(),
-                KeyCode::Char('n') if !self.search_query.is_empty() => self.next_list_search_match(),
-                KeyCode::Char('N') if !self.search_query.is_empty() => self.prev_list_search_match(),
+                KeyCode::Char('n') if !self.search_query.is_empty() => {
+                    self.next_list_search_match()
+                }
+                KeyCode::Char('N') if !self.search_query.is_empty() => {
+                    self.prev_list_search_match()
+                }
                 _ => {}
             },
             View::Detail => match code {
@@ -1110,8 +1137,8 @@ impl App {
 
     fn handle_confirm_key(&mut self, code: KeyCode) {
         match code {
-            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.confirm_approve(),
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => self.cancel_approve(),
+            KeyCode::Char('y' | 'Y') | KeyCode::Enter => self.confirm_approve(),
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => self.cancel_approve(),
             _ => {}
         }
     }
@@ -1132,8 +1159,8 @@ impl App {
 
     fn handle_merge_key(&mut self, code: KeyCode) {
         match code {
-            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.confirm_merge(),
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => self.cancel_merge(),
+            KeyCode::Char('y' | 'Y') | KeyCode::Enter => self.confirm_merge(),
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => self.cancel_merge(),
             _ => {}
         }
     }
@@ -1260,7 +1287,11 @@ impl App {
         } else {
             // Jump to first match
             self.scroll_offset = self.search_matches[0] as u16;
-            self.set_status(format_search_status(0, self.search_matches.len(), &self.search_query));
+            self.set_status(format_search_status(
+                0,
+                self.search_matches.len(),
+                &self.search_query,
+            ));
         }
     }
 
@@ -1268,7 +1299,8 @@ impl App {
         if self.search_matches.is_empty() {
             return;
         }
-        self.search_match_idx = advance_search_idx(self.search_match_idx, self.search_matches.len());
+        self.search_match_idx =
+            advance_search_idx(self.search_match_idx, self.search_matches.len());
         self.scroll_offset = self.search_matches[self.search_match_idx] as u16;
         self.set_status(format_search_status(
             self.search_match_idx,
@@ -1281,7 +1313,8 @@ impl App {
         if self.search_matches.is_empty() {
             return;
         }
-        self.search_match_idx = retreat_search_idx(self.search_match_idx, self.search_matches.len());
+        self.search_match_idx =
+            retreat_search_idx(self.search_match_idx, self.search_matches.len());
         self.scroll_offset = self.search_matches[self.search_match_idx] as u16;
         self.set_status(format_search_status(
             self.search_match_idx,
@@ -1325,7 +1358,11 @@ impl App {
         } else {
             // Jump to first match
             self.list_state.select(Some(self.search_matches[0]));
-            self.set_status(format_search_status(0, self.search_matches.len(), &self.search_query));
+            self.set_status(format_search_status(
+                0,
+                self.search_matches.len(),
+                &self.search_query,
+            ));
         }
     }
 
@@ -1333,8 +1370,10 @@ impl App {
         if self.search_matches.is_empty() {
             return;
         }
-        self.search_match_idx = advance_search_idx(self.search_match_idx, self.search_matches.len());
-        self.list_state.select(Some(self.search_matches[self.search_match_idx]));
+        self.search_match_idx =
+            advance_search_idx(self.search_match_idx, self.search_matches.len());
+        self.list_state
+            .select(Some(self.search_matches[self.search_match_idx]));
         self.set_status(format_search_status(
             self.search_match_idx,
             self.search_matches.len(),
@@ -1346,8 +1385,10 @@ impl App {
         if self.search_matches.is_empty() {
             return;
         }
-        self.search_match_idx = retreat_search_idx(self.search_match_idx, self.search_matches.len());
-        self.list_state.select(Some(self.search_matches[self.search_match_idx]));
+        self.search_match_idx =
+            retreat_search_idx(self.search_match_idx, self.search_matches.len());
+        self.list_state
+            .select(Some(self.search_matches[self.search_match_idx]));
         self.set_status(format_search_status(
             self.search_match_idx,
             self.search_matches.len(),
@@ -1363,9 +1404,11 @@ impl App {
     fn execute_goto_line(&mut self) {
         if let Ok(line_num) = self.input_buffer.parse::<u16>() {
             // Find the diff line that corresponds to this line number
-            if let Some(idx) = self.diff_lines.iter().position(|dl| {
-                dl.line_number.map(|n| n as u16) == Some(line_num)
-            }) {
+            if let Some(idx) = self
+                .diff_lines
+                .iter()
+                .position(|dl| dl.line_number.map(|n| n as u16) == Some(line_num))
+            {
                 self.scroll_offset = idx as u16;
                 self.set_status(format!("Jumped to line {}", line_num));
             } else {
@@ -1922,13 +1965,12 @@ fn draw_search_input(frame: &mut Frame, app: &App) {
         height: 3,
     };
 
-    let input = Paragraph::new(format!("/{}", app.input_buffer))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Search (Enter to find, Esc to cancel) ")
-                .style(Style::default().fg(Color::Yellow)),
-        );
+    let input = Paragraph::new(format!("/{}", app.input_buffer)).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Search (Enter to find, Esc to cancel) ")
+            .style(Style::default().fg(Color::Yellow)),
+    );
 
     frame.render_widget(Clear, popup_area);
     frame.render_widget(input, popup_area);
@@ -1944,13 +1986,12 @@ fn draw_goto_input(frame: &mut Frame, app: &App) {
         height: 3,
     };
 
-    let input = Paragraph::new(format!(":{}", app.input_buffer))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Go to line (Enter to jump, Esc to cancel) ")
-                .style(Style::default().fg(Color::Cyan)),
-        );
+    let input = Paragraph::new(format!(":{}", app.input_buffer)).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Go to line (Enter to jump, Esc to cancel) ")
+            .style(Style::default().fg(Color::Cyan)),
+    );
 
     frame.render_widget(Clear, popup_area);
     frame.render_widget(input, popup_area);
@@ -1968,8 +2009,7 @@ pub fn run(
     let mut stdout = io::stdout();
     crossterm::execute!(
         stdout,
-        crossterm::terminal::EnterAlternateScreen
-        // Mouse capture disabled to allow text selection in terminal
+        crossterm::terminal::EnterAlternateScreen // Mouse capture disabled to allow text selection in terminal
     )?;
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::new(backend)?;
@@ -2214,16 +2254,16 @@ file2.rs
         let result = parse_delta_output(delta_output, raw_diff);
 
         // Find first file's code line
-        let file1_line = result.iter().find(|r| {
-            r.file_path.as_deref() == Some("file1.rs") && r.new_line_number.is_some()
-        });
+        let file1_line = result
+            .iter()
+            .find(|r| r.file_path.as_deref() == Some("file1.rs") && r.new_line_number.is_some());
         assert!(file1_line.is_some());
         assert_eq!(file1_line.unwrap().new_line_number, Some(1));
 
         // Find second file's code line - should switch to file2.rs
-        let file2_line = result.iter().find(|r| {
-            r.file_path.as_deref() == Some("file2.rs") && r.new_line_number.is_some()
-        });
+        let file2_line = result
+            .iter()
+            .find(|r| r.file_path.as_deref() == Some("file2.rs") && r.new_line_number.is_some());
         assert!(file2_line.is_some());
         assert_eq!(file2_line.unwrap().new_line_number, Some(1));
     }
@@ -2463,13 +2503,7 @@ diff --git a/file2.rs b/file2.rs
 
     #[test]
     fn test_format_search_status() {
-        assert_eq!(
-            format_search_status(0, 5, "test"),
-            "Match 1/5 for 'test'"
-        );
-        assert_eq!(
-            format_search_status(4, 5, "foo"),
-            "Match 5/5 for 'foo'"
-        );
+        assert_eq!(format_search_status(0, 5, "test"), "Match 1/5 for 'test'");
+        assert_eq!(format_search_status(4, 5, "foo"), "Match 5/5 for 'foo'");
     }
 }

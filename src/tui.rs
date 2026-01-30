@@ -58,6 +58,25 @@ fn strip_ansi_codes(s: &str) -> String {
     result
 }
 
+/// Advance search index forward with wrap-around
+fn advance_search_idx(current: usize, total: usize) -> usize {
+    (current + 1) % total
+}
+
+/// Retreat search index backward with wrap-around
+fn retreat_search_idx(current: usize, total: usize) -> usize {
+    if current == 0 {
+        total - 1
+    } else {
+        current - 1
+    }
+}
+
+/// Format search status message
+fn format_search_status(idx: usize, total: usize, query: &str) -> String {
+    format!("Match {}/{} for '{}'", idx + 1, total, query)
+}
+
 /// Represents a line in the parsed diff with its location info
 #[derive(Debug, Clone)]
 pub struct DiffLine {
@@ -1241,11 +1260,7 @@ impl App {
         } else {
             // Jump to first match
             self.scroll_offset = self.search_matches[0] as u16;
-            self.set_status(format!(
-                "Match 1/{} for '{}'",
-                self.search_matches.len(),
-                self.search_query
-            ));
+            self.set_status(format_search_status(0, self.search_matches.len(), &self.search_query));
         }
     }
 
@@ -1253,13 +1268,12 @@ impl App {
         if self.search_matches.is_empty() {
             return;
         }
-        self.search_match_idx = (self.search_match_idx + 1) % self.search_matches.len();
+        self.search_match_idx = advance_search_idx(self.search_match_idx, self.search_matches.len());
         self.scroll_offset = self.search_matches[self.search_match_idx] as u16;
-        self.set_status(format!(
-            "Match {}/{} for '{}'",
-            self.search_match_idx + 1,
+        self.set_status(format_search_status(
+            self.search_match_idx,
             self.search_matches.len(),
-            self.search_query
+            &self.search_query,
         ));
     }
 
@@ -1267,17 +1281,12 @@ impl App {
         if self.search_matches.is_empty() {
             return;
         }
-        self.search_match_idx = if self.search_match_idx == 0 {
-            self.search_matches.len() - 1
-        } else {
-            self.search_match_idx - 1
-        };
+        self.search_match_idx = retreat_search_idx(self.search_match_idx, self.search_matches.len());
         self.scroll_offset = self.search_matches[self.search_match_idx] as u16;
-        self.set_status(format!(
-            "Match {}/{} for '{}'",
-            self.search_match_idx + 1,
+        self.set_status(format_search_status(
+            self.search_match_idx,
             self.search_matches.len(),
-            self.search_query
+            &self.search_query,
         ));
     }
 
@@ -1316,11 +1325,7 @@ impl App {
         } else {
             // Jump to first match
             self.list_state.select(Some(self.search_matches[0]));
-            self.set_status(format!(
-                "Match 1/{} for '{}'",
-                self.search_matches.len(),
-                self.search_query
-            ));
+            self.set_status(format_search_status(0, self.search_matches.len(), &self.search_query));
         }
     }
 
@@ -1328,13 +1333,12 @@ impl App {
         if self.search_matches.is_empty() {
             return;
         }
-        self.search_match_idx = (self.search_match_idx + 1) % self.search_matches.len();
+        self.search_match_idx = advance_search_idx(self.search_match_idx, self.search_matches.len());
         self.list_state.select(Some(self.search_matches[self.search_match_idx]));
-        self.set_status(format!(
-            "Match {}/{} for '{}'",
-            self.search_match_idx + 1,
+        self.set_status(format_search_status(
+            self.search_match_idx,
             self.search_matches.len(),
-            self.search_query
+            &self.search_query,
         ));
     }
 
@@ -1342,17 +1346,12 @@ impl App {
         if self.search_matches.is_empty() {
             return;
         }
-        self.search_match_idx = if self.search_match_idx == 0 {
-            self.search_matches.len() - 1
-        } else {
-            self.search_match_idx - 1
-        };
+        self.search_match_idx = retreat_search_idx(self.search_match_idx, self.search_matches.len());
         self.list_state.select(Some(self.search_matches[self.search_match_idx]));
-        self.set_status(format!(
-            "Match {}/{} for '{}'",
-            self.search_match_idx + 1,
+        self.set_status(format_search_status(
+            self.search_match_idx,
             self.search_matches.len(),
-            self.search_query
+            &self.search_query,
         ));
     }
 
@@ -2442,5 +2441,35 @@ diff --git a/file2.rs b/file2.rs
         for line in &result {
             assert_eq!(line.file_path.as_deref(), Some("path/to/file.rs"));
         }
+    }
+
+    // ==================== Tests for search index helpers ====================
+
+    #[test]
+    fn test_advance_search_idx() {
+        // Test forward cycling through indices
+        assert_eq!(advance_search_idx(0, 5), 1);
+        assert_eq!(advance_search_idx(4, 5), 0); // wrap around
+        assert_eq!(advance_search_idx(0, 1), 0); // single element
+    }
+
+    #[test]
+    fn test_retreat_search_idx() {
+        // Test backward cycling through indices
+        assert_eq!(retreat_search_idx(1, 5), 0);
+        assert_eq!(retreat_search_idx(0, 5), 4); // wrap around
+        assert_eq!(retreat_search_idx(0, 1), 0); // single element
+    }
+
+    #[test]
+    fn test_format_search_status() {
+        assert_eq!(
+            format_search_status(0, 5, "test"),
+            "Match 1/5 for 'test'"
+        );
+        assert_eq!(
+            format_search_status(4, 5, "foo"),
+            "Match 5/5 for 'foo'"
+        );
     }
 }

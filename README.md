@@ -49,6 +49,7 @@ The diff view automatically detects if delta is installed and uses it for render
 
 ```bash
 reviewer                       # Scan configured directory
+reviewer -m                    # Show my PRs (instead of PRs to review)
 reviewer -r ~/dev              # Specify repos directory
 reviewer -d                    # Include draft PRs
 reviewer -e archived -e old    # Exclude directories
@@ -85,6 +86,7 @@ On first run, you'll be prompted to set your repos root directory.
 | `r` | Launch Claude review |
 | `a` | Approve |
 | `x` | Close PR with comment |
+| `m` | Merge PR (squash, `--my` mode only) |
 | `p` | Previous PR |
 | `q` | Back to list |
 

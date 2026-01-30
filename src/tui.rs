@@ -1,5 +1,5 @@
 use crate::diff::{self, SyntaxHighlighter};
-use crate::gh::{self, Comment, PullRequest};
+use crate::gh::{self, Comment, PullRequest, ReviewState};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -282,13 +282,23 @@ pub enum DetailTab {
     Comments,
 }
 
+/// App mode - determines what PRs are shown
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AppMode {
+    /// Review mode: PRs from others needing your review
+    Review,
+    /// My PRs mode: Your own PRs
+    MyPrs,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum InputMode {
     Normal,
     Comment,
-    LineComment, // Comment on a specific line in diff
+    LineComment,  // Comment on a specific line in diff
     ConfirmApprove,
     ConfirmClose, // Confirm close with optional comment
+    ConfirmMerge, // Confirm merge (squash)
     Search,       // Searching in diff
     ListSearch,   // Searching in PR list
     GotoLine,     // Jump to specific line
@@ -314,6 +324,7 @@ pub struct App {
     pub repo_list: Vec<PathBuf>,
     pub username: String,
     pub include_drafts: bool,
+    pub mode: AppMode,
     pub list_state: ListState,
     pub view: View,
     pub detail_tab: DetailTab,
@@ -354,6 +365,7 @@ impl App {
         repo_list: Vec<PathBuf>,
         username: String,
         include_drafts: bool,
+        mode: AppMode,
     ) -> Self {
         let (async_tx, async_rx) = mpsc::channel();
         Self {
@@ -362,6 +374,7 @@ impl App {
             repo_list,
             username,
             include_drafts,
+            mode,
             list_state: ListState::default(),
             view: View::List,
             detail_tab: DetailTab::Description,
@@ -887,6 +900,54 @@ impl App {
         self.input_buffer.clear();
     }
 
+    fn start_merge(&mut self) {
+        // Only allow merge in MyPrs mode
+        if self.mode != AppMode::MyPrs {
+            self.set_status("Merge only available in --my mode".to_string());
+            return;
+        }
+
+        if let Some(pr) = self.selected_pr() {
+            // Check if PR can be merged
+            let status = gh::check_merge_status(pr);
+            if status.can_merge {
+                self.input_mode = InputMode::ConfirmMerge;
+            } else {
+                let reason = status.reason.unwrap_or_else(|| "Unknown reason".to_string());
+                self.set_status(format!("Cannot merge: {}", reason));
+            }
+        }
+    }
+
+    fn confirm_merge(&mut self) {
+        if let Some(pr) = self.selected_pr().cloned() {
+            match gh::merge_pr(&pr, true) {
+                Ok(merge_type) => {
+                    self.set_status(format!("Merged PR #{} ({})", pr.number, merge_type));
+                    // Remove from list
+                    if let Some(idx) = self.list_state.selected() {
+                        self.prs.remove(idx);
+                        if !self.prs.is_empty() {
+                            let new_idx = idx.min(self.prs.len() - 1);
+                            self.list_state.select(Some(new_idx));
+                        } else {
+                            self.list_state.select(None);
+                        }
+                    }
+                    self.exit_detail();
+                }
+                Err(e) => {
+                    self.set_status(format!("Merge failed: {}", e));
+                }
+            }
+        }
+        self.input_mode = InputMode::Normal;
+    }
+
+    fn cancel_merge(&mut self) {
+        self.input_mode = InputMode::Normal;
+    }
+
     fn refresh(&mut self) {
         if self.refreshing {
             return;
@@ -898,9 +959,13 @@ impl App {
         let repo_list = self.repo_list.clone();
         let username = self.username.clone();
         let include_drafts = self.include_drafts;
+        let mode = self.mode;
 
         thread::spawn(move || {
-            let prs = crate::fetch_all_prs(&repo_list, &username, include_drafts);
+            let prs = match mode {
+                AppMode::Review => crate::fetch_all_prs(&repo_list, &username, include_drafts),
+                AppMode::MyPrs => crate::fetch_my_prs(include_drafts),
+            };
             let _ = tx.send(AsyncResult::Refresh(prs));
         });
     }
@@ -946,6 +1011,7 @@ impl App {
                     InputMode::LineComment => self.handle_line_comment_key(key.code),
                     InputMode::ConfirmApprove => self.handle_confirm_key(key.code),
                     InputMode::ConfirmClose => self.handle_close_key(key.code),
+                    InputMode::ConfirmMerge => self.handle_merge_key(key.code),
                     InputMode::Search => self.handle_search_key(key.code),
                     InputMode::ListSearch => self.handle_list_search_key(key.code),
                     InputMode::GotoLine => self.handle_goto_key(key.code),
@@ -997,6 +1063,7 @@ impl App {
                 KeyCode::Char('c') => self.start_line_comment(),
                 KeyCode::Char('a') => self.start_approve(),
                 KeyCode::Char('x') => self.start_close(),
+                KeyCode::Char('m') => self.start_merge(),
                 KeyCode::Char('r') => self.launch_claude_review(),
                 // Search (only in Diff tab)
                 KeyCode::Char('/') if self.detail_tab == DetailTab::Diff => self.start_search(),
@@ -1040,6 +1107,14 @@ impl App {
             KeyCode::Char(c) => {
                 self.input_buffer.push(c);
             }
+            _ => {}
+        }
+    }
+
+    fn handle_merge_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.confirm_merge(),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => self.cancel_merge(),
             _ => {}
         }
     }
@@ -1353,6 +1428,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_close_dialog(frame, app);
     }
 
+    // Draw merge dialog if active
+    if app.input_mode == InputMode::ConfirmMerge {
+        draw_merge_dialog(frame, app);
+    }
+
     // Draw search input if active
     if app.input_mode == InputMode::Search || app.input_mode == InputMode::ListSearch {
         draw_search_input(frame, app);
@@ -1361,6 +1441,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // Draw goto line input if active
     if app.input_mode == InputMode::GotoLine {
         draw_goto_input(frame, app);
+    }
+}
+
+fn review_state_span(state: &ReviewState) -> Span<'static> {
+    match state {
+        ReviewState::Approved => Span::styled("[✓ APPROVED] ", Style::default().fg(Color::Green)),
+        ReviewState::ChangesRequested => {
+            Span::styled("[! CHANGES] ", Style::default().fg(Color::Red))
+        }
+        ReviewState::Pending => Span::styled("[○ PENDING] ", Style::default().fg(Color::Yellow)),
+        ReviewState::Draft => Span::styled("[DRAFT] ", Style::default().fg(Color::Magenta)),
     }
 }
 
@@ -1383,7 +1474,10 @@ fn draw_list(frame: &mut Frame, app: &mut App) {
                 ),
                 Span::raw(format!("#{}: ", pr.number)),
             ];
-            if pr.is_draft {
+            // Show review state in MyPrs mode, draft status in Review mode
+            if app.mode == AppMode::MyPrs {
+                title_spans.push(review_state_span(&pr.review_state));
+            } else if pr.is_draft {
                 title_spans.push(Span::styled(
                     "[DRAFT] ",
                     Style::default().fg(Color::Magenta),
@@ -1409,7 +1503,10 @@ fn draw_list(frame: &mut Frame, app: &mut App) {
         .collect();
 
     let draft_status = if app.include_drafts { " +drafts" } else { "" };
-    let title = format!(" PRs requiring review ({}){} ", app.prs.len(), draft_status);
+    let title = match app.mode {
+        AppMode::Review => format!(" PRs requiring review ({}){} ", app.prs.len(), draft_status),
+        AppMode::MyPrs => format!(" My PRs ({}){} ", app.prs.len(), draft_status),
+    };
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(
@@ -1608,11 +1705,16 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
         }
     }
 
-    // Help - context-aware based on tab
-    let help_text = if app.detail_tab == DetailTab::Diff {
-        " j/k: scroll | /: search | :: goto | c: comment | D: toggle delta | a: approve | x: close | q: back"
-    } else {
-        " Tab: tabs | j/k: scroll | a: approve | x: close | n/p: PR | q: back"
+    // Help - context-aware based on tab and mode
+    let help_text = match (app.detail_tab, app.mode) {
+        (DetailTab::Diff, AppMode::MyPrs) => {
+            " j/k: scroll | /: search | :: goto | D: toggle delta | m: merge | x: close | q: back"
+        }
+        (DetailTab::Diff, AppMode::Review) => {
+            " j/k: scroll | /: search | :: goto | c: comment | D: toggle delta | a: approve | x: close | q: back"
+        }
+        (_, AppMode::MyPrs) => " Tab: tabs | j/k: scroll | m: merge | x: close | n/p: PR | q: back",
+        (_, AppMode::Review) => " Tab: tabs | j/k: scroll | a: approve | x: close | n/p: PR | q: back",
     };
     let help = Paragraph::new(help_text)
         .style(Style::default().fg(Color::DarkGray))
@@ -1764,6 +1866,53 @@ fn draw_close_dialog(frame: &mut Frame, app: &App) {
     frame.render_widget(dialog, popup_area);
 }
 
+fn draw_merge_dialog(frame: &mut Frame, app: &App) {
+    let pr = match app.selected_pr() {
+        Some(pr) => pr,
+        None => return,
+    };
+
+    let area = frame.area();
+    let popup_area = Rect {
+        x: area.width / 6,
+        y: area.height / 3,
+        width: area.width * 2 / 3,
+        height: 9,
+    };
+
+    let text = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  Merge "),
+            Span::styled(
+                format!("[{}] #{}", pr.repo_name, pr.number),
+                Style::default().fg(Color::Cyan).bold(),
+            ),
+            Span::raw("?"),
+        ]),
+        Line::from(""),
+        Line::from("  Will squash if allowed, otherwise regular merge."),
+        Line::from("  Branch will be deleted after merge."),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  [y/Enter]", Style::default().fg(Color::Green).bold()),
+            Span::raw(" Merge    "),
+            Span::styled("[n/Esc]", Style::default().fg(Color::Yellow).bold()),
+            Span::raw(" Cancel"),
+        ]),
+    ];
+
+    let dialog = Paragraph::new(text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Merge PR ")
+            .style(Style::default().fg(Color::Green)),
+    );
+
+    frame.render_widget(Clear, popup_area);
+    frame.render_widget(dialog, popup_area);
+}
+
 fn draw_search_input(frame: &mut Frame, app: &App) {
     let area = frame.area();
     // Draw at bottom of screen like vim
@@ -1813,6 +1962,7 @@ pub fn run(
     repo_list: Vec<PathBuf>,
     username: String,
     include_drafts: bool,
+    mode: AppMode,
 ) -> Result<()> {
     // Setup terminal
     crossterm::terminal::enable_raw_mode()?;
@@ -1825,7 +1975,7 @@ pub fn run(
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::new(backend)?;
 
-    let mut app = App::new(repos_root, repo_list, username, include_drafts);
+    let mut app = App::new(repos_root, repo_list, username, include_drafts, mode);
 
     // Start fetching PRs immediately in background
     app.refresh();

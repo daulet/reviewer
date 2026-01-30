@@ -43,6 +43,42 @@ struct PrData {
     reviews: Option<Vec<Review>>,
     #[serde(rename = "isDraft")]
     is_draft: Option<bool>,
+    #[serde(rename = "reviewDecision")]
+    review_decision: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchRepository {
+    #[serde(rename = "nameWithOwner")]
+    name_with_owner: String,
+}
+
+/// PR data from gh search prs command (limited fields available)
+#[derive(Debug, Deserialize)]
+struct SearchPrData {
+    number: u64,
+    title: String,
+    author: Option<Author>,
+    body: Option<String>,
+    url: String,
+    #[serde(rename = "updatedAt")]
+    updated_at: DateTime<Utc>,
+    #[serde(rename = "isDraft")]
+    is_draft: Option<bool>,
+    repository: SearchRepository,
+}
+
+/// Review state for user's PRs
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ReviewState {
+    /// Approved and ready to merge
+    Approved,
+    /// Changes requested - needs attention
+    ChangesRequested,
+    /// Pending review - no action yet
+    Pending,
+    /// Draft PR
+    Draft,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +94,7 @@ pub struct PullRequest {
     pub additions: u64,
     pub deletions: u64,
     pub is_draft: bool,
+    pub review_state: ReviewState,
 }
 
 pub fn get_current_user() -> Result<String> {
@@ -93,7 +130,7 @@ fn get_open_prs(repo_path: &PathBuf) -> Vec<PrData> {
             "pr",
             "list",
             "--json",
-            "number,title,author,body,url,updatedAt,additions,deletions,reviews,isDraft",
+            "number,title,author,body,url,updatedAt,additions,deletions,reviews,isDraft,reviewDecision",
             "--limit",
             "100",
         ])
@@ -121,6 +158,17 @@ fn has_user_approved(pr: &PrData, username: &str) -> bool {
             })
         })
         .unwrap_or(false)
+}
+
+fn determine_review_state(pr_data: &PrData) -> ReviewState {
+    if pr_data.is_draft.unwrap_or(false) {
+        return ReviewState::Draft;
+    }
+    match pr_data.review_decision.as_deref() {
+        Some("APPROVED") => ReviewState::Approved,
+        Some("CHANGES_REQUESTED") => ReviewState::ChangesRequested,
+        _ => ReviewState::Pending,
+    }
 }
 
 pub fn fetch_prs_for_repo(
@@ -157,6 +205,8 @@ pub fn fetch_prs_for_repo(
             continue;
         }
 
+        let review_state = determine_review_state(&pr_data);
+
         prs.push(PullRequest {
             number: pr_data.number,
             title: pr_data.title,
@@ -169,10 +219,118 @@ pub fn fetch_prs_for_repo(
             additions: pr_data.additions.unwrap_or(0),
             deletions: pr_data.deletions.unwrap_or(0),
             is_draft: pr_data.is_draft.unwrap_or(false),
+            review_state,
         });
     }
 
     prs
+}
+
+/// Search for all PRs authored by the current user across all repos
+pub fn search_my_prs(include_drafts: bool) -> Vec<PullRequest> {
+    use rayon::prelude::*;
+
+    let output = Command::new("gh")
+        .args([
+            "search",
+            "prs",
+            "--state=open",
+            "--author=@me",
+            "--json",
+            "number,title,author,body,url,updatedAt,isDraft,repository",
+            "--limit",
+            "100",
+        ])
+        .output()
+        .ok();
+
+    let prs_data: Vec<SearchPrData> = match output {
+        Some(o) if o.status.success() => serde_json::from_slice(&o.stdout).unwrap_or_default(),
+        _ => return Vec::new(),
+    };
+
+    // Filter drafts first, then fetch review states in parallel
+    let filtered: Vec<_> = prs_data
+        .into_iter()
+        .filter(|pr| include_drafts || !pr.is_draft.unwrap_or(false))
+        .collect();
+
+    let mut prs: Vec<PullRequest> = filtered
+        .par_iter()
+        .map(|pr_data| {
+            let pr_author = pr_data
+                .author
+                .as_ref()
+                .and_then(|a| a.login.as_ref())
+                .map(|s| s.as_str())
+                .unwrap_or("unknown");
+
+            // Search API doesn't provide reviewDecision, fetch in parallel
+            let review_state = if pr_data.is_draft.unwrap_or(false) {
+                ReviewState::Draft
+            } else {
+                fetch_pr_review_state(&pr_data.repository.name_with_owner, pr_data.number)
+            };
+
+            PullRequest {
+                number: pr_data.number,
+                title: pr_data.title.clone(),
+                author: pr_author.to_string(),
+                body: pr_data.body.clone().unwrap_or_default(),
+                repo_path: PathBuf::new(),
+                repo_name: pr_data.repository.name_with_owner.clone(),
+                url: pr_data.url.clone(),
+                updated_at: pr_data.updated_at,
+                additions: 0,
+                deletions: 0,
+                is_draft: pr_data.is_draft.unwrap_or(false),
+                review_state,
+            }
+        })
+        .collect();
+
+    // Sort by review state priority, then by most recent
+    prs.sort_by(|a, b| match a.review_state.cmp(&b.review_state) {
+        std::cmp::Ordering::Equal => b.updated_at.cmp(&a.updated_at),
+        other => other,
+    });
+
+    prs
+}
+
+/// Fetch the review decision for a specific PR
+fn fetch_pr_review_state(repo: &str, pr_number: u64) -> ReviewState {
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            &pr_number.to_string(),
+            "--repo",
+            repo,
+            "--json",
+            "reviewDecision",
+        ])
+        .output()
+        .ok();
+
+    #[derive(Deserialize)]
+    struct ReviewDecisionResponse {
+        #[serde(rename = "reviewDecision")]
+        review_decision: Option<String>,
+    }
+
+    match output {
+        Some(o) if o.status.success() => {
+            let response: Option<ReviewDecisionResponse> =
+                serde_json::from_slice(&o.stdout).ok();
+            match response.and_then(|r| r.review_decision) {
+                Some(ref s) if s == "APPROVED" => ReviewState::Approved,
+                Some(ref s) if s == "CHANGES_REQUESTED" => ReviewState::ChangesRequested,
+                _ => ReviewState::Pending,
+            }
+        }
+        _ => ReviewState::Pending,
+    }
 }
 
 pub fn get_pr_diff(pr: &PullRequest) -> Result<String> {
@@ -408,6 +566,178 @@ pub fn close_pr(pr: &PullRequest, comment: Option<&str>) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Result of checking if a PR can be merged
+#[derive(Debug)]
+pub struct MergeStatus {
+    pub can_merge: bool,
+    pub reason: Option<String>,
+}
+
+/// Check if a PR can be merged (no unresolved threads, mergeable state)
+pub fn check_merge_status(pr: &PullRequest) -> MergeStatus {
+    // Use GraphQL to check reviewThreads for unresolved comments
+    let query = format!(
+        r#"query {{
+            repository(owner: "{}", name: "{}") {{
+                pullRequest(number: {}) {{
+                    mergeable
+                    reviewThreads(first: 100) {{
+                        nodes {{
+                            isResolved
+                        }}
+                    }}
+                }}
+            }}
+        }}"#,
+        pr.repo_name.split('/').next().unwrap_or(""),
+        pr.repo_name.split('/').nth(1).unwrap_or(""),
+        pr.number
+    );
+
+    let output = Command::new("gh")
+        .args(["api", "graphql", "-f", &format!("query={}", query)])
+        .output()
+        .ok();
+
+    #[derive(Deserialize)]
+    struct ReviewThread {
+        #[serde(rename = "isResolved")]
+        is_resolved: bool,
+    }
+
+    #[derive(Deserialize)]
+    struct ReviewThreadsNodes {
+        nodes: Vec<ReviewThread>,
+    }
+
+    #[derive(Deserialize)]
+    struct PrInfo {
+        mergeable: Option<String>,
+        #[serde(rename = "reviewThreads")]
+        review_threads: Option<ReviewThreadsNodes>,
+    }
+
+    #[derive(Deserialize)]
+    struct RepoData {
+        #[serde(rename = "pullRequest")]
+        pull_request: Option<PrInfo>,
+    }
+
+    #[derive(Deserialize)]
+    struct GraphQLResponse {
+        data: Option<RepositoryWrapper>,
+    }
+
+    #[derive(Deserialize)]
+    struct RepositoryWrapper {
+        repository: Option<RepoData>,
+    }
+
+    let response: Option<GraphQLResponse> = output
+        .filter(|o| o.status.success())
+        .and_then(|o| serde_json::from_slice(&o.stdout).ok());
+
+    let pr_info = response
+        .and_then(|r| r.data)
+        .and_then(|d| d.repository)
+        .and_then(|r| r.pull_request);
+
+    match pr_info {
+        Some(info) => {
+            // Check for unresolved threads
+            if let Some(threads) = info.review_threads {
+                let unresolved_count = threads.nodes.iter().filter(|t| !t.is_resolved).count();
+                if unresolved_count > 0 {
+                    return MergeStatus {
+                        can_merge: false,
+                        reason: Some(format!("{} unresolved review thread(s)", unresolved_count)),
+                    };
+                }
+            }
+
+            // Check mergeable state
+            match info.mergeable.as_deref() {
+                Some("MERGEABLE") => MergeStatus {
+                    can_merge: true,
+                    reason: None,
+                },
+                Some("CONFLICTING") => MergeStatus {
+                    can_merge: false,
+                    reason: Some("PR has merge conflicts".to_string()),
+                },
+                Some("UNKNOWN") => MergeStatus {
+                    can_merge: false,
+                    reason: Some("Merge status unknown, try again".to_string()),
+                },
+                _ => MergeStatus {
+                    can_merge: false,
+                    reason: Some("PR is not mergeable".to_string()),
+                },
+            }
+        }
+        None => MergeStatus {
+            can_merge: false,
+            reason: Some("Failed to check merge status".to_string()),
+        },
+    }
+}
+
+/// Merge a PR using squash merge (preferred), falling back to regular merge
+pub fn merge_pr(pr: &PullRequest, delete_branch: bool) -> Result<String> {
+    let pr_number = pr.number.to_string();
+
+    // Try squash merge first
+    let mut args = vec![
+        "pr",
+        "merge",
+        &pr_number,
+        "--repo",
+        &pr.repo_name,
+        "--squash",
+    ];
+
+    if delete_branch {
+        args.push("--delete-branch");
+    }
+
+    let output = Command::new("gh")
+        .args(&args)
+        .output()
+        .context("Failed to merge PR")?;
+
+    if output.status.success() {
+        return Ok("squash".to_string());
+    }
+
+    // If squash failed, try regular merge
+    let mut args = vec![
+        "pr",
+        "merge",
+        &pr_number,
+        "--repo",
+        &pr.repo_name,
+        "--merge",
+    ];
+
+    if delete_branch {
+        args.push("--delete-branch");
+    }
+
+    let output = Command::new("gh")
+        .args(&args)
+        .output()
+        .context("Failed to merge PR")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to merge PR: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    Ok("merge".to_string())
 }
 
 /// Create a worktree for a PR and return the path

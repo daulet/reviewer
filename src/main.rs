@@ -19,6 +19,10 @@ struct Args {
     #[arg(short, long)]
     drafts: bool,
 
+    /// Show my PRs instead of PRs to review
+    #[arg(short, long)]
+    my: bool,
+
     /// Override the repos root directory
     #[arg(short, long)]
     root: Option<PathBuf>,
@@ -47,6 +51,11 @@ pub fn fetch_all_prs(
     let mut all_prs = all_prs;
     all_prs.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     all_prs
+}
+
+pub fn fetch_my_prs(include_drafts: bool) -> Vec<gh::PullRequest> {
+    // Use gh search prs for a single API call across all repos
+    gh::search_my_prs(include_drafts)
 }
 
 fn prompt_for_repos_root() -> Result<PathBuf> {
@@ -155,7 +164,12 @@ fn main() -> Result<()> {
 
     // Launch TUI immediately - it will fetch PRs in background
     println!("Launching TUI...");
-    tui::run(repos_root, repo_list, username, args.drafts)?;
+    let mode = if args.my {
+        tui::AppMode::MyPrs
+    } else {
+        tui::AppMode::Review
+    };
+    tui::run(repos_root, repo_list, username, args.drafts, mode)?;
 
     Ok(())
 }

@@ -1,4 +1,5 @@
 mod config;
+mod diff;
 mod gh;
 mod repos;
 mod tui;

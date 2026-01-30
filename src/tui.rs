@@ -1,3 +1,4 @@
+use crate::diff::{self, SyntaxHighlighter};
 use crate::gh::{self, Comment, PullRequest};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -171,6 +172,8 @@ pub struct App {
     needs_clear: bool,
     // Claude launch state
     launching_claude: bool,
+    // Syntax highlighter for diff rendering
+    syntax_highlighter: SyntaxHighlighter,
 }
 
 impl App {
@@ -207,6 +210,7 @@ impl App {
             refreshing: false,
             needs_clear: true,
             launching_claude: false,
+            syntax_highlighter: SyntaxHighlighter::new(),
         }
     }
 
@@ -910,28 +914,13 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
             if app.diff_cache.is_none() && !app.loading_diff {
                 app.load_diff();
             }
-            let diff = if app.loading_diff {
-                "Loading diff..."
+            let lines: Vec<Line> = if app.loading_diff {
+                vec![Line::raw("Loading diff...")]
+            } else if let Some(diff_content) = app.diff_cache.as_deref() {
+                diff::render_diff(diff_content, &app.syntax_highlighter)
             } else {
-                app.diff_cache.as_deref().unwrap_or("Loading diff...")
+                vec![Line::raw("Loading diff...")]
             };
-            let lines: Vec<Line> = diff
-                .lines()
-                .map(|line| {
-                    let style = if line.starts_with('+') && !line.starts_with("+++") {
-                        Style::default().fg(Color::Green)
-                    } else if line.starts_with('-') && !line.starts_with("---") {
-                        Style::default().fg(Color::Red)
-                    } else if line.starts_with("@@") {
-                        Style::default().fg(Color::Cyan)
-                    } else if line.starts_with("diff ") {
-                        Style::default().fg(Color::Yellow).bold()
-                    } else {
-                        Style::default()
-                    };
-                    Line::styled(line, style)
-                })
-                .collect();
             let para = Paragraph::new(lines)
                 .block(content_block)
                 .scroll((app.scroll_offset, 0));

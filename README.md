@@ -7,6 +7,7 @@ Automate mundane parts of code review. Speed up your workflow with LLM.
 - List PRs needing your attention;
 - Approve PRs or add comments without leaving the terminal;
 - Launch [Claude Code](https://github.com/anthropics/claude-code) for AI-assisted reviews;
+- Continuously learn from your own feedback to improve AI accuracy on next review;
 
 ## Installation
 

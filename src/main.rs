@@ -9,6 +9,30 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+pub fn fetch_all_prs(repo_list: &[PathBuf], username: &str, include_drafts: bool) -> Vec<gh::PullRequest> {
+    println!("Fetching PRs from {} repositories...", repo_list.len());
+    let completed = AtomicUsize::new(0);
+    let total = repo_list.len();
+
+    let all_prs: Vec<_> = repo_list
+        .par_iter()
+        .flat_map(|repo| {
+            let prs = gh::fetch_prs_for_repo(repo, username, include_drafts);
+            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+            eprint!("\r  Progress: {}/{}          ", done, total);
+            let _ = io::stderr().flush();
+            prs
+        })
+        .collect();
+
+    eprintln!("\r  Checked {} repositories.   ", total);
+
+    // Sort by most recent first
+    let mut all_prs = all_prs;
+    all_prs.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    all_prs
+}
+
 fn prompt_for_repos_root() -> Result<PathBuf> {
     println!("First time setup: Please enter the root directory containing your repos.");
     println!("Example: ~/dev or /Users/you/projects");
@@ -85,27 +109,8 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Fetch PRs from all repos in parallel
-    println!("Fetching PRs from {} repositories...", repo_list.len());
-    let completed = AtomicUsize::new(0);
-    let total = repo_list.len();
-
-    let all_prs: Vec<_> = repo_list
-        .par_iter()
-        .flat_map(|repo| {
-            let prs = gh::fetch_prs_for_repo(repo, &username);
-            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-            eprint!("\r  Progress: {}/{}          ", done, total);
-            let _ = io::stderr().flush();
-            prs
-        })
-        .collect();
-
-    eprintln!("\r  Checked {} repositories.   ", total);
-
-    // Sort by most recent first
-    let mut all_prs = all_prs;
-    all_prs.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    // Fetch PRs from all repos in parallel (exclude drafts by default)
+    let all_prs = fetch_all_prs(&repo_list, &username, false);
 
     println!("\nFound {} PRs requiring review. Launching TUI...", all_prs.len());
 
@@ -114,8 +119,8 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Launch TUI
-    tui::run(all_prs, repos_root)?;
+    // Launch TUI with context for refresh
+    tui::run(all_prs, repos_root, repo_list, username)?;
 
     Ok(())
 }

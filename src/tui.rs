@@ -17,6 +17,7 @@ enum AsyncResult {
     Diff(usize, String),           // (pr_index, diff_content)
     Comments(usize, Vec<Comment>), // (pr_index, comments)
     ClaudeLaunch(Result<String, String>), // worktree path or error
+    Refresh(Vec<PullRequest>),     // refreshed PR list
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -42,6 +43,9 @@ pub enum InputMode {
 pub struct App {
     pub prs: Vec<PullRequest>,
     pub repos_root: PathBuf,
+    pub repo_list: Vec<PathBuf>,
+    pub username: String,
+    pub include_drafts: bool,
     pub list_state: ListState,
     pub view: View,
     pub detail_tab: DetailTab,
@@ -57,6 +61,7 @@ pub struct App {
     async_rx: Receiver<AsyncResult>,
     loading_diff: bool,
     loading_comments: bool,
+    refreshing: bool,
     // Screen state
     needs_clear: bool,
     // Claude launch state
@@ -64,7 +69,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(prs: Vec<PullRequest>, repos_root: PathBuf) -> Self {
+    pub fn new(prs: Vec<PullRequest>, repos_root: PathBuf, repo_list: Vec<PathBuf>, username: String) -> Self {
         let mut list_state = ListState::default();
         if !prs.is_empty() {
             list_state.select(Some(0));
@@ -73,6 +78,9 @@ impl App {
         Self {
             prs,
             repos_root,
+            repo_list,
+            username,
+            include_drafts: false,
             list_state,
             view: View::List,
             detail_tab: DetailTab::Description,
@@ -87,6 +95,7 @@ impl App {
             async_rx,
             loading_diff: false,
             loading_comments: false,
+            refreshing: false,
             needs_clear: true,
             launching_claude: false,
         }
@@ -255,6 +264,20 @@ impl App {
                         }
                     }
                 }
+                AsyncResult::Refresh(prs) => {
+                    self.refreshing = false;
+                    self.needs_clear = true;
+                    let count = prs.len();
+                    self.prs = prs;
+                    // Reset selection
+                    if self.prs.is_empty() {
+                        self.list_state.select(None);
+                    } else {
+                        self.list_state.select(Some(0));
+                    }
+                    let draft_status = if self.include_drafts { " (incl. drafts)" } else { "" };
+                    self.status_message = Some(format!("Refreshed: {} PRs{}", count, draft_status));
+                }
             }
         }
     }
@@ -348,6 +371,35 @@ impl App {
         self.input_mode = InputMode::Normal;
     }
 
+    fn refresh(&mut self) {
+        if self.refreshing {
+            return;
+        }
+        self.refreshing = true;
+        self.status_message = Some("Refreshing PR list...".to_string());
+
+        let tx = self.async_tx.clone();
+        let repo_list = self.repo_list.clone();
+        let username = self.username.clone();
+        let include_drafts = self.include_drafts;
+
+        thread::spawn(move || {
+            let prs = crate::fetch_all_prs(&repo_list, &username, include_drafts);
+            let _ = tx.send(AsyncResult::Refresh(prs));
+        });
+    }
+
+    fn toggle_drafts(&mut self) {
+        self.include_drafts = !self.include_drafts;
+        let status = if self.include_drafts {
+            "Including drafts - refreshing..."
+        } else {
+            "Excluding drafts - refreshing..."
+        };
+        self.status_message = Some(status.to_string());
+        self.refresh();
+    }
+
     pub fn handle_event(&mut self) -> Result<()> {
         // Poll for async results (non-blocking)
         self.poll_async_results();
@@ -379,6 +431,8 @@ impl App {
                 KeyCode::Char('k') | KeyCode::Up => self.previous(),
                 KeyCode::Enter => self.enter_detail(),
                 KeyCode::Char('a') => self.start_approve(),
+                KeyCode::Char('R') => self.refresh(),
+                KeyCode::Char('d') => self.toggle_drafts(),
                 _ => {}
             },
             View::Detail => match code {
@@ -481,14 +535,18 @@ fn draw_list(frame: &mut Frame, app: &mut App) {
         .map(|pr| {
             let stats = format!("+{}/-{}", pr.additions, pr.deletions);
             let date = pr.updated_at.format("%m-%d");
-            let line = Line::from(vec![
+            let mut title_spans = vec![
                 Span::styled(
                     format!("[{}] ", pr.repo_name),
                     Style::default().fg(Color::Cyan),
                 ),
                 Span::raw(format!("#{}: ", pr.number)),
-                Span::styled(&pr.title, Style::default().add_modifier(Modifier::BOLD)),
-            ]);
+            ];
+            if pr.is_draft {
+                title_spans.push(Span::styled("[DRAFT] ", Style::default().fg(Color::Magenta)));
+            }
+            title_spans.push(Span::styled(&pr.title, Style::default().add_modifier(Modifier::BOLD)));
+            let line = Line::from(title_spans);
             let details = Line::from(vec![
                 Span::styled(format!("  @{}", pr.author), Style::default().fg(Color::Green)),
                 Span::raw(" | "),
@@ -500,11 +558,13 @@ fn draw_list(frame: &mut Frame, app: &mut App) {
         })
         .collect();
 
+    let draft_status = if app.include_drafts { " +drafts" } else { "" };
+    let title = format!(" PRs requiring review ({}){} ", app.prs.len(), draft_status);
     let list = List::new(items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(" PRs requiring review ({}) ", app.prs.len())),
+                .title(title),
         )
         .highlight_style(
             Style::default()
@@ -515,7 +575,7 @@ fn draw_list(frame: &mut Frame, app: &mut App) {
 
     frame.render_stateful_widget(list, chunks[0], &mut app.list_state);
 
-    let help = Paragraph::new(" j/k: navigate | Enter: open | a: approve | q: quit")
+    let help = Paragraph::new(" j/k: navigate | Enter: open | R: refresh | d: toggle drafts | a: approve | q: quit")
         .style(Style::default().fg(Color::DarkGray))
         .block(Block::default().borders(Borders::ALL).title(" Help "));
     frame.render_widget(help, chunks[1]);
@@ -735,7 +795,7 @@ fn draw_confirm_dialog(frame: &mut Frame, app: &App) {
     frame.render_widget(dialog, popup_area);
 }
 
-pub fn run(prs: Vec<PullRequest>, repos_root: PathBuf) -> Result<()> {
+pub fn run(prs: Vec<PullRequest>, repos_root: PathBuf, repo_list: Vec<PathBuf>, username: String) -> Result<()> {
     // Setup terminal
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -747,7 +807,7 @@ pub fn run(prs: Vec<PullRequest>, repos_root: PathBuf) -> Result<()> {
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::new(backend)?;
 
-    let mut app = App::new(prs, repos_root);
+    let mut app = App::new(prs, repos_root, repo_list, username);
 
     // Main loop
     loop {

@@ -41,6 +41,8 @@ struct PrData {
     additions: Option<u64>,
     deletions: Option<u64>,
     reviews: Option<Vec<Review>>,
+    #[serde(rename = "isDraft")]
+    is_draft: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +57,7 @@ pub struct PullRequest {
     pub updated_at: DateTime<Utc>,
     pub additions: u64,
     pub deletions: u64,
+    pub is_draft: bool,
 }
 
 pub fn get_current_user() -> Result<String> {
@@ -90,7 +93,7 @@ fn get_open_prs(repo_path: &PathBuf) -> Vec<PrData> {
             "pr",
             "list",
             "--json",
-            "number,title,author,body,url,updatedAt,additions,deletions,reviews",
+            "number,title,author,body,url,updatedAt,additions,deletions,reviews,isDraft",
             "--limit",
             "100",
         ])
@@ -120,7 +123,7 @@ fn has_user_approved(pr: &PrData, username: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub fn fetch_prs_for_repo(repo_path: &PathBuf, username: &str) -> Vec<PullRequest> {
+pub fn fetch_prs_for_repo(repo_path: &PathBuf, username: &str, include_drafts: bool) -> Vec<PullRequest> {
     let repo_info = match get_repo_info(repo_path) {
         Some(info) => info,
         None => return Vec::new(),
@@ -130,6 +133,11 @@ pub fn fetch_prs_for_repo(repo_path: &PathBuf, username: &str) -> Vec<PullReques
     let mut prs = Vec::new();
 
     for pr_data in prs_data {
+        // Skip drafts unless include_drafts is true
+        if !include_drafts && pr_data.is_draft.unwrap_or(false) {
+            continue;
+        }
+
         if has_user_approved(&pr_data, username) {
             continue;
         }
@@ -156,6 +164,7 @@ pub fn fetch_prs_for_repo(repo_path: &PathBuf, username: &str) -> Vec<PullReques
             updated_at: pr_data.updated_at,
             additions: pr_data.additions.unwrap_or(0),
             deletions: pr_data.deletions.unwrap_or(0),
+            is_draft: pr_data.is_draft.unwrap_or(false),
         });
     }
 

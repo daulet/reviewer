@@ -69,6 +69,8 @@ On first run, you'll be prompted to set your repos root directory.
 | `Enter` | Open PR details |
 | `/` | Search PRs |
 | `n/N` | Next/previous search match |
+| `o` | Open in browser |
+| `y` | Copy PR URL |
 | `R` | Refresh |
 | `d` | Toggle drafts |
 | `q` | Quit |
@@ -87,6 +89,8 @@ On first run, you'll be prompted to set your repos root directory.
 | `a` | Approve |
 | `x` | Close PR with comment |
 | `m` | Merge PR (squash, `--my` mode only) |
+| `o` | Open in browser |
+| `y` | Copy PR URL |
 | `p` | Previous PR |
 | `q` | Back to list |
 

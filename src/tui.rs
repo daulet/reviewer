@@ -1,5 +1,5 @@
 use crate::diff::{self, SyntaxHighlighter};
-use crate::gh::{self, Comment, PullRequest, ReviewState};
+use crate::gh::{self, Comment, PullRequest, ReviewComment, ReviewState};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -295,6 +295,8 @@ fn parse_diff(diff: &str) -> Vec<DiffLine> {
 enum AsyncResult {
     Diff(usize, String, Option<String>), // (pr_index, diff_content, delta_output)
     Comments(usize, Vec<Comment>),       // (pr_index, comments)
+    ReviewComments(usize, Vec<ReviewComment>), // (pr_index, review comments with diff context)
+    Checks(usize, Vec<gh::CheckStatus>), // (pr_index, CI checks)
     ClaudeLaunch(Result<String, String>), // worktree path or error
     Refresh(Vec<PullRequest>),           // refreshed PR list
 }
@@ -365,6 +367,8 @@ pub struct App {
     pub diff_lines: Vec<DiffLine>,   // Parsed diff with line info
     pub delta_line_info: Vec<DeltaLineInfo>, // Parsed delta output line info
     pub comments_cache: Option<Vec<Comment>>,
+    pub review_comments_cache: Option<Vec<ReviewComment>>,
+    pub checks_cache: Option<Vec<gh::CheckStatus>>,
     pub input_mode: InputMode,
     pub input_buffer: String,
     pub line_comment_ctx: Option<LineCommentContext>, // For line-level comments
@@ -380,6 +384,8 @@ pub struct App {
     async_rx: Receiver<AsyncResult>,
     loading_diff: bool,
     loading_comments: bool,
+    loading_review_comments: bool,
+    loading_checks: bool,
     refreshing: bool,
     // Screen state
     needs_clear: bool,
@@ -415,6 +421,8 @@ impl App {
             diff_lines: Vec::new(),
             delta_line_info: Vec::new(),
             comments_cache: None,
+            review_comments_cache: None,
+            checks_cache: None,
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             line_comment_ctx: None,
@@ -428,6 +436,8 @@ impl App {
             async_rx,
             loading_diff: false,
             loading_comments: false,
+            loading_review_comments: false,
+            loading_checks: false,
             refreshing: false,
             needs_clear: true,
             launching_claude: false,
@@ -528,9 +538,15 @@ impl App {
             self.diff_lines.clear();
             self.delta_line_info.clear();
             self.comments_cache = None;
+            self.review_comments_cache = None;
+            self.checks_cache = None;
             self.loading_diff = false;
             self.loading_comments = false;
+            self.loading_review_comments = false;
+            self.loading_checks = false;
             self.needs_clear = true;
+            // Load checks asynchronously
+            self.load_checks();
         }
     }
 
@@ -542,8 +558,12 @@ impl App {
         self.diff_lines.clear();
         self.delta_line_info.clear();
         self.comments_cache = None;
+        self.review_comments_cache = None;
+        self.checks_cache = None;
         self.loading_diff = false;
         self.loading_comments = false;
+        self.loading_review_comments = false;
+        self.loading_checks = false;
         self.needs_clear = true;
         self.clear_search();
     }
@@ -574,7 +594,10 @@ impl App {
         match self.detail_tab {
             DetailTab::Description => {}
             DetailTab::Diff => self.load_diff(),
-            DetailTab::Comments => self.load_comments(),
+            DetailTab::Comments => {
+                self.load_comments();
+                self.load_review_comments();
+            }
         }
     }
 
@@ -632,6 +655,40 @@ impl App {
         }
     }
 
+    fn load_review_comments(&mut self) {
+        if self.review_comments_cache.is_some() || self.loading_review_comments {
+            return;
+        }
+        if let Some(idx) = self.list_state.selected() {
+            if let Some(pr) = self.prs.get(idx) {
+                self.loading_review_comments = true;
+                let pr = pr.clone();
+                let tx = self.async_tx.clone();
+                thread::spawn(move || {
+                    let comments = gh::get_review_comments(&pr).unwrap_or_default();
+                    let _ = tx.send(AsyncResult::ReviewComments(idx, comments));
+                });
+            }
+        }
+    }
+
+    fn load_checks(&mut self) {
+        if self.checks_cache.is_some() || self.loading_checks {
+            return;
+        }
+        if let Some(idx) = self.list_state.selected() {
+            if let Some(pr) = self.prs.get(idx) {
+                self.loading_checks = true;
+                let pr = pr.clone();
+                let tx = self.async_tx.clone();
+                thread::spawn(move || {
+                    let checks = gh::get_pr_checks(&pr).unwrap_or_default();
+                    let _ = tx.send(AsyncResult::Checks(idx, checks));
+                });
+            }
+        }
+    }
+
     fn poll_async_results(&mut self) {
         while let Ok(result) = self.async_rx.try_recv() {
             match result {
@@ -655,6 +712,18 @@ impl App {
                         self.comments_cache = Some(comments);
                     }
                     self.loading_comments = false;
+                }
+                AsyncResult::ReviewComments(idx, comments) => {
+                    if self.list_state.selected() == Some(idx) {
+                        self.review_comments_cache = Some(comments);
+                    }
+                    self.loading_review_comments = false;
+                }
+                AsyncResult::Checks(idx, checks) => {
+                    if self.list_state.selected() == Some(idx) {
+                        self.checks_cache = Some(checks);
+                    }
+                    self.loading_checks = false;
                 }
                 AsyncResult::ClaudeLaunch(result) => {
                     self.launching_claude = false;
@@ -845,6 +914,7 @@ impl App {
                 Ok(()) => {
                     self.set_status("Comment added successfully".to_string());
                     self.comments_cache = None; // Force reload
+                    self.review_comments_cache = None;
                 }
                 Err(e) => {
                     self.set_status(format!("Error: {}", e));
@@ -879,6 +949,7 @@ impl App {
                         if self.view == View::Detail && !self.prs.is_empty() {
                             self.diff_cache = None;
                             self.comments_cache = None;
+                            self.review_comments_cache = None;
                         } else if self.prs.is_empty() {
                             self.view = View::List;
                         }
@@ -990,6 +1061,63 @@ impl App {
         self.input_mode = InputMode::Normal;
     }
 
+    fn open_in_browser(&mut self) {
+        if let Some(pr) = self.selected_pr() {
+            match gh::open_pr_in_browser(pr) {
+                Ok(()) => self.set_status(format!("Opened PR #{} in browser", pr.number)),
+                Err(e) => self.set_status(format!("Failed to open: {}", e)),
+            }
+        }
+    }
+
+    fn copy_pr_url(&mut self) {
+        if let Some(pr) = self.selected_pr() {
+            let url = &pr.url;
+            // Use platform-specific clipboard command
+            #[cfg(target_os = "macos")]
+            let result = std::process::Command::new("pbcopy")
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .and_then(|mut child| {
+                    use std::io::Write;
+                    if let Some(stdin) = child.stdin.as_mut() {
+                        stdin.write_all(url.as_bytes())?;
+                    }
+                    child.wait()
+                });
+
+            #[cfg(target_os = "linux")]
+            let result = std::process::Command::new("xclip")
+                .args(["-selection", "clipboard"])
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .and_then(|mut child| {
+                    use std::io::Write;
+                    if let Some(stdin) = child.stdin.as_mut() {
+                        stdin.write_all(url.as_bytes())?;
+                    }
+                    child.wait()
+                });
+
+            #[cfg(target_os = "windows")]
+            let result = std::process::Command::new("clip")
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .and_then(|mut child| {
+                    use std::io::Write;
+                    if let Some(stdin) = child.stdin.as_mut() {
+                        stdin.write_all(url.as_bytes())?;
+                    }
+                    child.wait()
+                });
+
+            match result {
+                Ok(_) => self.set_status("Copied URL to clipboard".to_string()),
+                Err(_) => self.set_status(format!("URL: {}", url)),
+            }
+        }
+    }
+
     fn refresh(&mut self) {
         if self.refreshing {
             return;
@@ -1092,6 +1220,8 @@ impl App {
                 KeyCode::Char('N') if !self.search_query.is_empty() => {
                     self.prev_list_search_match()
                 }
+                KeyCode::Char('o') => self.open_in_browser(),
+                KeyCode::Char('y') => self.copy_pr_url(),
                 _ => {}
             },
             View::Detail => match code {
@@ -1130,6 +1260,8 @@ impl App {
                 }
                 // Toggle delta rendering (only in Diff tab)
                 KeyCode::Char('D') if self.detail_tab == DetailTab::Diff => self.toggle_delta(),
+                KeyCode::Char('o') => self.open_in_browser(),
+                KeyCode::Char('y') => self.copy_pr_url(),
                 _ => {}
             },
         }
@@ -1561,7 +1693,7 @@ fn draw_list(frame: &mut Frame, app: &mut App) {
     frame.render_stateful_widget(list, chunks[0], &mut app.list_state);
 
     let help = Paragraph::new(
-        " j/k: navigate | Ctrl+d/u: page | g/G: first/last | Enter: open | /: search | R: refresh | d: drafts | q: quit",
+        " j/k: navigate | Ctrl+d/u: page | Enter: open | /: search | o: browser | y: copy URL | R: refresh | q: quit",
     )
     .style(Style::default().fg(Color::DarkGray))
     .block(Block::default().borders(Borders::ALL).title(" Help "));
@@ -1584,6 +1716,42 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
         ])
         .split(frame.area());
 
+    // Build CI status indicator
+    let ci_status = if app.loading_checks {
+        Span::styled(" CI: ...", Style::default().fg(Color::DarkGray))
+    } else if let Some(checks) = &app.checks_cache {
+        if checks.is_empty() {
+            Span::raw("")
+        } else {
+            let (passed, failed, pending) = checks.iter().fold((0, 0, 0), |(p, f, pe), c| {
+                match c.status {
+                    gh::CheckState::Success => (p + 1, f, pe),
+                    gh::CheckState::Failure => (p, f + 1, pe),
+                    gh::CheckState::Pending => (p, f, pe + 1),
+                    gh::CheckState::Neutral => (p + 1, f, pe), // Count neutral as passed
+                }
+            });
+            if failed > 0 {
+                Span::styled(
+                    format!(" CI: {}/{} ✗", passed, passed + failed + pending),
+                    Style::default().fg(Color::Red),
+                )
+            } else if pending > 0 {
+                Span::styled(
+                    format!(" CI: {}/{} ○", passed, passed + pending),
+                    Style::default().fg(Color::Yellow),
+                )
+            } else {
+                Span::styled(
+                    format!(" CI: {} ✓", passed),
+                    Style::default().fg(Color::Green),
+                )
+            }
+        }
+    } else {
+        Span::raw("")
+    };
+
     // Header
     let header = Paragraph::new(Line::from(vec![
         Span::styled(
@@ -1594,6 +1762,7 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
         Span::styled(&pr.title, Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(" by "),
         Span::styled(format!("@{}", pr.author), Style::default().fg(Color::Green)),
+        ci_status,
     ]))
     .block(Block::default().borders(Borders::ALL));
     frame.render_widget(header, chunks[0]);
@@ -1710,14 +1879,116 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
             if app.comments_cache.is_none() && !app.loading_comments {
                 app.load_comments();
             }
-            let text = if app.loading_comments {
+            if app.review_comments_cache.is_none() && !app.loading_review_comments {
+                app.load_review_comments();
+            }
+            let loading = app.loading_comments || app.loading_review_comments;
+            let text = if loading {
                 Text::raw("Loading comments...")
             } else {
-                match app.comments_cache.as_ref() {
-                    Some(c) if c.is_empty() => Text::raw("No comments yet."),
-                    Some(c) => {
-                        let mut lines = Vec::new();
-                        for comment in c {
+                let mut lines: Vec<Line> = Vec::new();
+
+                // Show review comments (line-level) with diff context first
+                if let Some(review_comments) = app.review_comments_cache.as_ref() {
+                    // Filter out reply comments (in_reply_to_id is set)
+                    let top_level: Vec<_> = review_comments
+                        .iter()
+                        .filter(|c| c.in_reply_to_id.is_none())
+                        .collect();
+
+                    if !top_level.is_empty() {
+                        lines.push(Line::styled(
+                            "─── Review Comments (on code) ───",
+                            Style::default().fg(Color::Yellow).bold(),
+                        ));
+                        lines.push(Line::raw(""));
+
+                        for comment in top_level {
+                            let author = comment
+                                .user
+                                .as_ref()
+                                .and_then(|a| a.login.as_ref())
+                                .map(|s| s.as_str())
+                                .unwrap_or("unknown");
+                            let date = comment.created_at.format("%Y-%m-%d %H:%M");
+                            let line_info =
+                                comment.line.map(|l| format!(":{}", l)).unwrap_or_default();
+
+                            // File and line header
+                            lines.push(Line::styled(
+                                format!("📁 {}{}", comment.path, line_info),
+                                Style::default().fg(Color::Blue).bold(),
+                            ));
+
+                            // Diff hunk context (show last few lines for context)
+                            let hunk_lines: Vec<&str> = comment.diff_hunk.lines().collect();
+                            let start = hunk_lines.len().saturating_sub(8);
+                            for hunk_line in &hunk_lines[start..] {
+                                let (style, prefix) = if hunk_line.starts_with('+') {
+                                    (Style::default().fg(Color::Green), "")
+                                } else if hunk_line.starts_with('-') {
+                                    (Style::default().fg(Color::Red), "")
+                                } else if hunk_line.starts_with("@@") {
+                                    (Style::default().fg(Color::Magenta), "")
+                                } else {
+                                    (Style::default().fg(Color::DarkGray), "")
+                                };
+                                lines.push(Line::styled(
+                                    format!("  {}{}", prefix, hunk_line),
+                                    style,
+                                ));
+                            }
+
+                            // Comment author and body
+                            lines.push(Line::styled(
+                                format!("  💬 @{} ({})", author, date),
+                                Style::default().fg(Color::Cyan).bold(),
+                            ));
+                            for body_line in comment.body.lines() {
+                                lines.push(Line::raw(format!("     {}", body_line)));
+                            }
+
+                            // Show replies
+                            let replies: Vec<_> = review_comments
+                                .iter()
+                                .filter(|r| {
+                                    r.in_reply_to_id.is_some()
+                                        && r.path == comment.path
+                                        && r.line == comment.line
+                                })
+                                .collect();
+                            for reply in replies {
+                                let reply_author = reply
+                                    .user
+                                    .as_ref()
+                                    .and_then(|a| a.login.as_ref())
+                                    .map(|s| s.as_str())
+                                    .unwrap_or("unknown");
+                                let reply_date = reply.created_at.format("%Y-%m-%d %H:%M");
+                                lines.push(Line::styled(
+                                    format!("     ↳ @{} ({})", reply_author, reply_date),
+                                    Style::default().fg(Color::Cyan),
+                                ));
+                                for body_line in reply.body.lines() {
+                                    lines.push(Line::raw(format!("       {}", body_line)));
+                                }
+                            }
+
+                            lines.push(Line::raw(""));
+                        }
+                    }
+                }
+
+                // Show PR-level comments
+                if let Some(pr_comments) = app.comments_cache.as_ref() {
+                    if !pr_comments.is_empty() {
+                        lines.push(Line::styled(
+                            "─── General Comments ───",
+                            Style::default().fg(Color::Yellow).bold(),
+                        ));
+                        lines.push(Line::raw(""));
+
+                        for comment in pr_comments {
                             let author = comment
                                 .author
                                 .as_ref()
@@ -1734,9 +2005,13 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
                             }
                             lines.push(Line::raw(""));
                         }
-                        Text::from(lines)
                     }
-                    None => Text::raw("Loading comments..."),
+                }
+
+                if lines.is_empty() {
+                    Text::raw("No comments yet.")
+                } else {
+                    Text::from(lines)
                 }
             };
             let para = Paragraph::new(text)
@@ -1750,13 +2025,13 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
     // Help - context-aware based on tab and mode
     let help_text = match (app.detail_tab, app.mode) {
         (DetailTab::Diff, AppMode::MyPrs) => {
-            " j/k: scroll | /: search | :: goto | D: toggle delta | m: merge | x: close | q: back"
+            " j/k: scroll | /: search | D: delta | m: merge | o: browser | y: copy | q: back"
         }
         (DetailTab::Diff, AppMode::Review) => {
-            " j/k: scroll | /: search | :: goto | c: comment | D: toggle delta | a: approve | x: close | q: back"
+            " j/k: scroll | /: search | c: comment | D: delta | a: approve | o: browser | y: copy | q: back"
         }
-        (_, AppMode::MyPrs) => " Tab: tabs | j/k: scroll | m: merge | x: close | n/p: PR | q: back",
-        (_, AppMode::Review) => " Tab: tabs | j/k: scroll | a: approve | x: close | n/p: PR | q: back",
+        (_, AppMode::MyPrs) => " Tab: tabs | j/k: scroll | m: merge | o: browser | y: copy | q: back",
+        (_, AppMode::Review) => " Tab: tabs | j/k: scroll | a: approve | o: browser | y: copy | q: back",
     };
     let help = Paragraph::new(help_text)
         .style(Style::default().fg(Color::DarkGray))

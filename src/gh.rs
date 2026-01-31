@@ -10,7 +10,7 @@ struct RepoInfo {
     name_with_owner: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Author {
     pub login: Option<String>,
 }
@@ -27,6 +27,23 @@ pub struct Comment {
     pub body: String,
     #[serde(rename = "createdAt")]
     pub created_at: DateTime<Utc>,
+}
+
+/// A review comment on a specific line in the diff
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReviewComment {
+    pub user: Option<Author>,
+    pub body: String,
+    pub path: String,
+    pub line: Option<u32>,
+    #[serde(rename = "original_line")]
+    pub original_line: Option<u32>,
+    #[serde(rename = "diff_hunk")]
+    pub diff_hunk: String,
+    #[serde(rename = "created_at")]
+    pub created_at: DateTime<Utc>,
+    #[serde(rename = "in_reply_to_id")]
+    pub in_reply_to_id: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -442,6 +459,22 @@ pub fn get_pr_comments(pr: &PullRequest) -> Result<Vec<Comment>> {
     Ok(comments)
 }
 
+/// Get review comments (line-level comments on the diff) for a PR
+pub fn get_review_comments(pr: &PullRequest) -> Result<Vec<ReviewComment>> {
+    let api_path = format!("repos/{}/pulls/{}/comments", pr.repo_name, pr.number);
+    let output = Command::new("gh")
+        .args(["api", &api_path])
+        .output()
+        .context("Failed to get review comments")?;
+
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+
+    let comments: Vec<ReviewComment> = serde_json::from_slice(&output.stdout).unwrap_or_default();
+    Ok(comments)
+}
+
 pub fn add_pr_comment(pr: &PullRequest, comment: &str) -> Result<()> {
     let output = Command::new("gh")
         .args(["pr", "comment", &pr.number.to_string(), "--body", comment])
@@ -571,6 +604,91 @@ pub fn close_pr(pr: &PullRequest, comment: Option<&str>) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Open PR in web browser
+pub fn open_pr_in_browser(pr: &PullRequest) -> Result<()> {
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            &pr.number.to_string(),
+            "--repo",
+            &pr.repo_name,
+            "--web",
+        ])
+        .output()
+        .context("Failed to open PR in browser")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to open PR: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    Ok(())
+}
+
+/// CI check status
+#[derive(Debug, Clone)]
+pub struct CheckStatus {
+    #[allow(dead_code)] // Kept for potential future detailed CI view
+    pub name: String,
+    pub status: CheckState,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CheckState {
+    Pending,
+    Success,
+    Failure,
+    Neutral,
+}
+
+/// Get CI/status checks for a PR
+pub fn get_pr_checks(pr: &PullRequest) -> Result<Vec<CheckStatus>> {
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "checks",
+            &pr.number.to_string(),
+            "--repo",
+            &pr.repo_name,
+            "--json",
+            "name,state",
+        ])
+        .output()
+        .context("Failed to get PR checks")?;
+
+    if !output.status.success() {
+        // No checks might just mean none configured
+        return Ok(Vec::new());
+    }
+
+    #[derive(Deserialize)]
+    struct CheckData {
+        name: String,
+        state: Option<String>,
+    }
+
+    let checks: Vec<CheckData> = serde_json::from_slice(&output.stdout).unwrap_or_default();
+
+    Ok(checks
+        .into_iter()
+        .map(|c| {
+            let status = match c.state.as_deref() {
+                Some("SUCCESS") => CheckState::Success,
+                Some("FAILURE") | Some("ERROR") => CheckState::Failure,
+                Some("NEUTRAL") | Some("SKIPPED") => CheckState::Neutral,
+                _ => CheckState::Pending,
+            };
+            CheckStatus {
+                name: c.name,
+                status,
+            }
+        })
+        .collect())
 }
 
 /// Result of checking if a PR can be merged

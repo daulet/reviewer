@@ -2,8 +2,9 @@
 
 ## Features
 
+- [ ] Open in default terminal, not "terminal"
 - [ ] Render description in markdown
-- [x] Update skill to update skill when user chooses "skip" to enhance review for the next time
+- [ ] Still not working: update skill to update skill when user chooses "skip" to enhance review for the next time
 - [x] add age to PRs?
 - [x] Add an option to close PRs with comment
 - [x] Review my PRs, ie address comments
@@ -22,6 +23,7 @@
 - [ ] Address comments in my PRs via LLM
 
 ## Bugs
+- [ ] when using builtin diff there are artifacts after scrolling past long lines
 - [x] Add an option to exclude dirs, def exclude worktrees
 - [ ] Repo might not be checked out for PRs found via search, so add cloning when necessary
 - [ ] Double PR approve, the PR in question received the approve comment twice.

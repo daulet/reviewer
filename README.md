@@ -116,6 +116,8 @@ cp .claude/skills/code-review/SKILL.md ~/.codex/skills/code-review/
 
 Restart Codex after adding skills. In a Codex session, run `/skills` to confirm the
 `code-review` skill is available, then invoke it with `$code-review`.
+Note: Reviewer launches the AI tool from the PR worktree, so repo-local `.codex/skills`
+in this repo won't be visible to Codex unless you install the skill globally.
 
 ### 2. Configure provider permissions (optional)
 

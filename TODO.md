@@ -2,7 +2,8 @@
 
 ## Features
 
-- [ ] Open in default terminal, not "terminal"
+- [x] Open in default terminal, not "terminal"
+- [ ] Improve codex code review skill with interactive prompts like in claude 
 - [ ] Render description in markdown
 - [ ] Still not working: update skill to update skill when user chooses "skip" to enhance review for the next time
 - [x] add age to PRs?

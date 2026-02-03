@@ -958,6 +958,39 @@ fn build_windows_command(command: &str, args: &[String], prompt: &str) -> String
     parts.join(" ")
 }
 
+#[cfg(target_os = "macos")]
+fn launch_macos_terminal_applescript(app: &str, command_line: &str) -> Result<()> {
+    let escaped_command = command_line.replace('"', "\\\"");
+    let script = format!(
+        r#"tell application "{app}"
+            activate
+            do script "{command}"
+        end tell"#,
+        app = app,
+        command = escaped_command
+    );
+    Command::new("osascript")
+        .args(["-e", &script])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| format!("Failed to launch {}", app))?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn launch_macos_terminal_open(app: &str, command_line: &str) -> Result<()> {
+    Command::new("open")
+        .args(["-na", app, "--args", "-e", "bash", "-lc", command_line])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| format!("Failed to launch {}", app))?;
+    Ok(())
+}
+
 fn render_prompt(
     template: &str,
     pr: &PullRequest,
@@ -975,7 +1008,6 @@ fn render_prompt(
 /// Launch a code review assistant CLI in a directory with a review prompt
 pub fn launch_ai(working_dir: &std::path::Path, pr: &PullRequest, ai: &AiConfig) -> Result<()> {
     let provider = ai.provider_key();
-    let display_name = ai.display_name();
     let command = ai.command_name();
 
     // Get platform-appropriate config directory for review guide reference
@@ -1012,21 +1044,18 @@ pub fn launch_ai(working_dir: &std::path::Path, pr: &PullRequest, ai: &AiConfig)
         let cmd = build_unix_command(&command, &ai.args, &prompt);
         let command_line = format!("cd {} && {}", workdir, cmd);
 
-        let escaped_command = command_line.replace('"', "\\\"");
-        let script = format!(
-            r#"tell application "Terminal"
-                activate
-                do script "{}"
-            end tell"#,
-            escaped_command
-        );
-        Command::new("osascript")
-            .args(["-e", &script])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .with_context(|| format!("Failed to launch {}", display_name))?;
+        let terminal_app = ai
+            .terminal_app
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("Terminal");
+
+        if terminal_app.eq_ignore_ascii_case("terminal") {
+            launch_macos_terminal_applescript("Terminal", &command_line)?;
+        } else {
+            launch_macos_terminal_open(terminal_app, &command_line)?;
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -1034,7 +1063,16 @@ pub fn launch_ai(working_dir: &std::path::Path, pr: &PullRequest, ai: &AiConfig)
         let workdir = unix_shell_escape(&working_dir.display().to_string());
         let cmd = build_unix_command(&command, &ai.args, &prompt);
         let command_line = format!("cd {} && {}", workdir, cmd);
-        let terminals = ["gnome-terminal", "konsole", "xterm"];
+        let terminal_override = ai
+            .terminal_app
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let mut terminals = Vec::new();
+        if let Some(term) = terminal_override {
+            terminals.push(term);
+        }
+        terminals.extend(["gnome-terminal", "konsole", "xterm"]);
         let mut launched = false;
         for term in terminals {
             let result = match term {
@@ -1044,7 +1082,9 @@ pub fn launch_ai(working_dir: &std::path::Path, pr: &PullRequest, ai: &AiConfig)
                 "konsole" => Command::new(term)
                     .args(["-e", "bash", "-c", &format!("{}; exec bash", command_line)])
                     .spawn(),
-                _ => Command::new(term).args(["-e", &command_line]).spawn(),
+                _ => Command::new(term)
+                    .args(["-e", "bash", "-lc", &command_line])
+                    .spawn(),
             };
             if result.is_ok() {
                 launched = true;
@@ -1058,6 +1098,7 @@ pub fn launch_ai(working_dir: &std::path::Path, pr: &PullRequest, ai: &AiConfig)
 
     #[cfg(target_os = "windows")]
     {
+        let display_name = ai.display_name();
         let workdir = windows_cmd_escape(&working_dir.display().to_string());
         let cmd = build_windows_command(&command, &ai.args, &prompt);
         let command_line = format!("cd /d {} && {}", workdir, cmd);

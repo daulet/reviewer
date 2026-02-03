@@ -196,6 +196,7 @@ Config is stored at:
 
 AI settings are optional. `prompt_template` supports `{pr_number}`, `{repo}`, `{title}`,
 `{review_guide}`, and `{skill}` placeholders.
+On macOS/Linux, `terminal_app` lets you pick which terminal launches AI reviews (default: Terminal on macOS).
 
 ```json
 {
@@ -206,7 +207,8 @@ AI settings are optional. `prompt_template` supports `{pr_number}`, `{repo}`, `{
     "command": "codex",
     "args": [],
     "skill": "code-review",
-    "prompt_template": "Review PR #{pr_number} in {repo}. Title: \"{title}\". Use {skill}. Follow {review_guide}"
+    "prompt_template": "Review PR #{pr_number} in {repo}. Title: \"{title}\". Use {skill}. Follow {review_guide}",
+    "terminal_app": "Ghostty"
   }
 }
 ```

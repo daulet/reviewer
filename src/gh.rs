@@ -37,6 +37,7 @@ pub struct ReviewComment {
     pub body: String,
     pub path: String,
     pub line: Option<u32>,
+    #[allow(dead_code)] // Reserved for future diff context handling
     #[serde(rename = "original_line")]
     pub original_line: Option<u32>,
     #[serde(rename = "diff_hunk")]
@@ -931,6 +932,7 @@ fn unix_shell_escape(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+#[cfg(target_os = "windows")]
 fn windows_cmd_escape(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\\\""))
 }
@@ -945,6 +947,7 @@ fn build_unix_command(command: &str, args: &[String], prompt: &str) -> String {
     parts.join(" ")
 }
 
+#[cfg(target_os = "windows")]
 fn build_windows_command(command: &str, args: &[String], prompt: &str) -> String {
     let mut parts = Vec::with_capacity(args.len() + 2);
     parts.push(windows_cmd_escape(command));
@@ -1008,6 +1011,7 @@ pub fn launch_ai(working_dir: &std::path::Path, pr: &PullRequest, ai: &AiConfig)
         let workdir = unix_shell_escape(&working_dir.display().to_string());
         let cmd = build_unix_command(&command, &ai.args, &prompt);
         let command_line = format!("cd {} && {}", workdir, cmd);
+
         let escaped_command = command_line.replace('"', "\\\"");
         let script = format!(
             r#"tell application "Terminal"

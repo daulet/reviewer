@@ -1,3 +1,4 @@
+use crate::config::AiConfig;
 use crate::diff::{self, SyntaxHighlighter};
 use crate::gh::{self, Comment, PullRequest, ReviewComment, ReviewState};
 use anyhow::Result;
@@ -297,7 +298,7 @@ enum AsyncResult {
     Comments(usize, Vec<Comment>),       // (pr_index, comments)
     ReviewComments(usize, Vec<ReviewComment>), // (pr_index, review comments with diff context)
     Checks(usize, Vec<gh::CheckStatus>), // (pr_index, CI checks)
-    ClaudeLaunch(Result<String, String>), // worktree path or error
+    AiLaunch(Result<String, String>), // worktree path or error
     Refresh(Vec<PullRequest>),           // refreshed PR list
 }
 
@@ -372,6 +373,7 @@ pub struct App {
     pub input_mode: InputMode,
     pub input_buffer: String,
     pub line_comment_ctx: Option<LineCommentContext>, // For line-level comments
+    pub ai: AiConfig,
     // Search state
     pub search_query: String,
     pub search_matches: Vec<usize>, // Line indices that match
@@ -389,8 +391,8 @@ pub struct App {
     refreshing: bool,
     // Screen state
     needs_clear: bool,
-    // Claude launch state
-    launching_claude: bool,
+    // AI launch state
+    launching_ai: bool,
     // Syntax highlighter for diff rendering
     syntax_highlighter: SyntaxHighlighter,
 }
@@ -401,6 +403,7 @@ impl App {
         repo_list: Vec<PathBuf>,
         username: String,
         include_drafts: bool,
+        ai: AiConfig,
         mode: AppMode,
     ) -> Self {
         let (async_tx, async_rx) = mpsc::channel();
@@ -426,6 +429,7 @@ impl App {
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             line_comment_ctx: None,
+            ai,
             search_query: String::new(),
             search_matches: Vec::new(),
             search_match_idx: 0,
@@ -440,7 +444,7 @@ impl App {
             loading_checks: false,
             refreshing: false,
             needs_clear: true,
-            launching_claude: false,
+            launching_ai: false,
             syntax_highlighter: SyntaxHighlighter::new(),
         }
     }
@@ -725,12 +729,12 @@ impl App {
                     }
                     self.loading_checks = false;
                 }
-                AsyncResult::ClaudeLaunch(result) => {
-                    self.launching_claude = false;
+                AsyncResult::AiLaunch(result) => {
+                    self.launching_ai = false;
                     self.needs_clear = true;
                     match result {
                         Ok(path) => {
-                            self.set_status(format!("Launched Claude in {}", path));
+                            self.set_status(format!("Launched {} in {}", self.ai.display_name(), path));
                         }
                         Err(e) => {
                             self.set_status(format!("Failed: {}", e));
@@ -881,24 +885,29 @@ impl App {
         self.input_buffer.clear();
     }
 
-    fn launch_claude_review(&mut self) {
-        if self.launching_claude {
+    fn launch_ai_review(&mut self) {
+        if self.launching_ai {
             return;
         }
         if let Some(pr) = self.selected_pr().cloned() {
-            self.launching_claude = true;
-            self.set_status("Creating worktree and launching Claude...".to_string());
+            let ai_display_name = self.ai.display_name();
+            self.launching_ai = true;
+            self.set_status(format!(
+                "Creating worktree and launching {}...",
+                ai_display_name
+            ));
 
             let tx = self.async_tx.clone();
             let repos_root = self.repos_root.clone();
+            let ai = self.ai.clone();
             thread::spawn(move || {
                 let result = gh::create_pr_worktree(&pr, &repos_root)
                     .and_then(|worktree_path| {
-                        gh::launch_claude(&worktree_path, &pr)?;
+                        gh::launch_ai(&worktree_path, &pr, &ai)?;
                         Ok(worktree_path.display().to_string())
                     })
                     .map_err(|e| e.to_string());
-                let _ = tx.send(AsyncResult::ClaudeLaunch(result));
+                let _ = tx.send(AsyncResult::AiLaunch(result));
             });
         }
     }
@@ -1240,7 +1249,7 @@ impl App {
                 KeyCode::Char('a') => self.start_approve(),
                 KeyCode::Char('x') => self.start_close(),
                 KeyCode::Char('m') => self.start_merge(),
-                KeyCode::Char('r') => self.launch_claude_review(),
+                KeyCode::Char('r') => self.launch_ai_review(),
                 // Search (only in Diff tab)
                 KeyCode::Char('/') if self.detail_tab == DetailTab::Diff => self.start_search(),
                 KeyCode::Char('n') if !self.search_query.is_empty() => self.next_search_match(),
@@ -2277,6 +2286,7 @@ pub fn run(
     repo_list: Vec<PathBuf>,
     username: String,
     include_drafts: bool,
+    ai: AiConfig,
     mode: AppMode,
 ) -> Result<()> {
     // Setup terminal
@@ -2289,7 +2299,7 @@ pub fn run(
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::new(backend)?;
 
-    let mut app = App::new(repos_root, repo_list, username, include_drafts, mode);
+    let mut app = App::new(repos_root, repo_list, username, include_drafts, ai, mode);
 
     // Start fetching PRs immediately in background
     app.refresh();

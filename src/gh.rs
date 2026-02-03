@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use crate::config::{self, AiConfig};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -926,35 +927,94 @@ pub fn create_pr_worktree(
     Ok(worktree_path)
 }
 
-/// Launch Claude Code CLI in a directory with code review prompt
-pub fn launch_claude(working_dir: &std::path::Path, pr: &PullRequest) -> Result<()> {
+fn unix_shell_escape(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn windows_cmd_escape(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\\\""))
+}
+
+fn build_unix_command(command: &str, args: &[String], prompt: &str) -> String {
+    let mut parts = Vec::with_capacity(args.len() + 2);
+    parts.push(unix_shell_escape(command));
+    for arg in args {
+        parts.push(unix_shell_escape(arg));
+    }
+    parts.push(unix_shell_escape(prompt));
+    parts.join(" ")
+}
+
+fn build_windows_command(command: &str, args: &[String], prompt: &str) -> String {
+    let mut parts = Vec::with_capacity(args.len() + 2);
+    parts.push(windows_cmd_escape(command));
+    for arg in args {
+        parts.push(windows_cmd_escape(arg));
+    }
+    parts.push(windows_cmd_escape(prompt));
+    parts.join(" ")
+}
+
+fn render_prompt(
+    template: &str,
+    pr: &PullRequest,
+    review_guide: &std::path::Path,
+    skill_invocation: &str,
+) -> String {
+    template
+        .replace("{pr_number}", &pr.number.to_string())
+        .replace("{repo}", &pr.repo_name)
+        .replace("{title}", &pr.title)
+        .replace("{review_guide}", &review_guide.display().to_string())
+        .replace("{skill}", skill_invocation)
+}
+
+/// Launch a code review assistant CLI in a directory with a review prompt
+pub fn launch_ai(working_dir: &std::path::Path, pr: &PullRequest, ai: &AiConfig) -> Result<()> {
+    let provider = ai.provider_key();
+    let display_name = ai.display_name();
+    let command = ai.command_name();
+
     // Get platform-appropriate config directory for review guide reference
-    let config_dir = dirs::config_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("reviewer");
+    let config_dir = config::config_dir();
     let review_guide = config_dir.join("review_guide.md");
 
-    // Prompt that triggers the code-review skill with PR context
-    let prompt = format!(
+    let skill_name = ai.skill_name();
+    let skill_invocation = if provider == "codex" {
+        format!("${}", skill_name)
+    } else {
+        format!("{} skill", skill_name)
+    };
+
+    let default_prompt = format!(
         "Review PR #{} in repo {}. Title: \"{}\". \
-         Use the code-review skill to analyze changes, present each issue for approval, \
+         Use {} to analyze changes, present each issue for approval, \
          and submit approved comments using gh CLI. Follow guidelines in {}",
         pr.number,
         pr.repo_name,
         pr.title.replace('"', "\\\""),
+        skill_invocation,
         review_guide.display()
     );
 
+    let prompt = ai
+        .prompt_template
+        .as_deref()
+        .map(|template| render_prompt(template, pr, &review_guide, &skill_invocation))
+        .unwrap_or(default_prompt);
+
     #[cfg(target_os = "macos")]
     {
-        let escaped_prompt = prompt.replace('\'', "'\\''").replace('"', "\\\"");
+        let workdir = unix_shell_escape(&working_dir.display().to_string());
+        let cmd = build_unix_command(&command, &ai.args, &prompt);
+        let command_line = format!("cd {} && {}", workdir, cmd);
+        let escaped_command = command_line.replace('"', "\\\"");
         let script = format!(
             r#"tell application "Terminal"
                 activate
-                do script "cd '{}' && claude '{}'"
+                do script "{}"
             end tell"#,
-            working_dir.display(),
-            escaped_prompt
+            escaped_command
         );
         Command::new("osascript")
             .args(["-e", &script])
@@ -962,50 +1022,25 @@ pub fn launch_claude(working_dir: &std::path::Path, pr: &PullRequest) -> Result<
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .context("Failed to launch Terminal")?;
+            .with_context(|| format!("Failed to launch {}", display_name))?;
     }
 
     #[cfg(target_os = "linux")]
     {
-        let escaped_prompt = prompt.replace('\'', "'\\''");
+        let workdir = unix_shell_escape(&working_dir.display().to_string());
+        let cmd = build_unix_command(&command, &ai.args, &prompt);
+        let command_line = format!("cd {} && {}", workdir, cmd);
         let terminals = ["gnome-terminal", "konsole", "xterm"];
         let mut launched = false;
         for term in terminals {
             let result = match term {
                 "gnome-terminal" => Command::new(term)
-                    .args([
-                        "--",
-                        "bash",
-                        "-c",
-                        &format!(
-                            "cd '{}' && claude '{}'; exec bash",
-                            working_dir.display(),
-                            escaped_prompt
-                        ),
-                    ])
+                    .args(["--", "bash", "-c", &format!("{}; exec bash", command_line)])
                     .spawn(),
                 "konsole" => Command::new(term)
-                    .args([
-                        "-e",
-                        "bash",
-                        "-c",
-                        &format!(
-                            "cd '{}' && claude '{}'; exec bash",
-                            working_dir.display(),
-                            escaped_prompt
-                        ),
-                    ])
+                    .args(["-e", "bash", "-c", &format!("{}; exec bash", command_line)])
                     .spawn(),
-                _ => Command::new(term)
-                    .args([
-                        "-e",
-                        &format!(
-                            "cd '{}' && claude '{}'",
-                            working_dir.display(),
-                            escaped_prompt
-                        ),
-                    ])
-                    .spawn(),
+                _ => Command::new(term).args(["-e", &command_line]).spawn(),
             };
             if result.is_ok() {
                 launched = true;
@@ -1019,26 +1054,16 @@ pub fn launch_claude(working_dir: &std::path::Path, pr: &PullRequest) -> Result<
 
     #[cfg(target_os = "windows")]
     {
-        // Escape double quotes for Windows command line
-        let escaped_prompt = prompt.replace('"', "\\\"");
-        // Use 'start' to open a new cmd window, /K keeps it open after command
+        let workdir = windows_cmd_escape(&working_dir.display().to_string());
+        let cmd = build_windows_command(&command, &ai.args, &prompt);
+        let command_line = format!("cd /d {} && {}", workdir, cmd);
         Command::new("cmd")
-            .args([
-                "/C",
-                "start",
-                "cmd",
-                "/K",
-                &format!(
-                    "cd /d \"{}\" && claude \"{}\"",
-                    working_dir.display(),
-                    escaped_prompt
-                ),
-            ])
+            .args(["/C", "start", "cmd", "/K", &command_line])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .context("Failed to launch Command Prompt")?;
+            .with_context(|| format!("Failed to launch {}", display_name))?;
     }
 
     Ok(())

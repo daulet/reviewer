@@ -169,7 +169,7 @@ fn main() -> Result<()> {
     } else {
         tui::AppMode::Review
     };
-    tui::run(repos_root, repo_list, username, args.drafts, mode)?;
+    tui::run(repos_root, repo_list, username, args.drafts, cfg.ai.clone(), mode)?;
 
     Ok(())
 }

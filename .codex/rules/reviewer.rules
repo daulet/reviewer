@@ -1,0 +1,19 @@
+prefix_rule(
+  pattern = ["gh", "pr", ["view", "comment", "review"]],
+  decision = "allow",
+)
+
+prefix_rule(
+  pattern = ["gh", "api"],
+  decision = "allow",
+)
+
+prefix_rule(
+  pattern = ["gh", "repo", "view"],
+  decision = "allow",
+)
+
+prefix_rule(
+  pattern = ["git", ["diff", "merge-base", "rev-parse"]],
+  decision = "allow",
+)

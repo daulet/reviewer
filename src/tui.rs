@@ -391,6 +391,7 @@ pub struct App {
     refreshing: bool,
     // Screen state
     needs_clear: bool,
+    needs_redraw: bool,
     // AI launch state
     launching_ai: bool,
     // Syntax highlighter for diff rendering
@@ -444,6 +445,7 @@ impl App {
             loading_checks: false,
             refreshing: false,
             needs_clear: true,
+            needs_redraw: true,
             launching_ai: false,
             syntax_highlighter: SyntaxHighlighter::new(),
         }
@@ -454,14 +456,16 @@ impl App {
         self.status_time = Some(std::time::Instant::now());
     }
 
-    fn check_status_timeout(&mut self) {
+    fn check_status_timeout(&mut self) -> bool {
         if let (Some(time), Some(_)) = (self.status_time, &self.status_message) {
             // Auto-dismiss after 3 seconds, but not while refreshing
             if !self.refreshing && time.elapsed().as_secs() >= 3 {
                 self.status_message = None;
                 self.status_time = None;
+                return true;
             }
         }
+        false
     }
 
     pub fn selected_pr(&self) -> Option<&PullRequest> {
@@ -693,8 +697,10 @@ impl App {
         }
     }
 
-    fn poll_async_results(&mut self) {
+    fn poll_async_results(&mut self) -> bool {
+        let mut has_updates = false;
         while let Ok(result) = self.async_rx.try_recv() {
+            has_updates = true;
             match result {
                 AsyncResult::Diff(idx, diff, delta_output) => {
                     // Only update if still viewing the same PR
@@ -761,6 +767,7 @@ impl App {
                 }
             }
         }
+        has_updates
     }
 
     fn start_comment(&mut self) {
@@ -1176,27 +1183,41 @@ impl App {
 
     pub fn handle_event(&mut self) -> Result<()> {
         // Poll for async results (non-blocking)
-        self.poll_async_results();
+        let mut needs_redraw = self.poll_async_results();
 
         if event::poll(std::time::Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    return Ok(());
-                }
+            match event::read()? {
+                Event::Key(key) => {
+                    if key.kind != KeyEventKind::Press {
+                        return Ok(());
+                    }
 
-                match self.input_mode {
-                    InputMode::Normal => self.handle_normal_key(key.code, key.modifiers),
-                    InputMode::Comment => self.handle_comment_key(key.code),
-                    InputMode::LineComment => self.handle_line_comment_key(key.code),
-                    InputMode::ConfirmApprove => self.handle_confirm_key(key.code),
-                    InputMode::ConfirmClose => self.handle_close_key(key.code),
-                    InputMode::ConfirmMerge => self.handle_merge_key(key.code),
-                    InputMode::Search => self.handle_search_key(key.code),
-                    InputMode::ListSearch => self.handle_list_search_key(key.code),
-                    InputMode::GotoLine => self.handle_goto_key(key.code),
+                    match self.input_mode {
+                        InputMode::Normal => self.handle_normal_key(key.code, key.modifiers),
+                        InputMode::Comment => self.handle_comment_key(key.code),
+                        InputMode::LineComment => self.handle_line_comment_key(key.code),
+                        InputMode::ConfirmApprove => self.handle_confirm_key(key.code),
+                        InputMode::ConfirmClose => self.handle_close_key(key.code),
+                        InputMode::ConfirmMerge => self.handle_merge_key(key.code),
+                        InputMode::Search => self.handle_search_key(key.code),
+                        InputMode::ListSearch => self.handle_list_search_key(key.code),
+                        InputMode::GotoLine => self.handle_goto_key(key.code),
+                    }
+
+                    needs_redraw = true;
                 }
+                Event::Resize(_, _) => {
+                    self.needs_clear = true;
+                    needs_redraw = true;
+                }
+                _ => {}
             }
         }
+
+        if needs_redraw {
+            self.needs_redraw = true;
+        }
+
         Ok(())
     }
 
@@ -2310,12 +2331,19 @@ pub fn run(
         if app.needs_clear {
             terminal.clear()?;
             app.needs_clear = false;
+            app.needs_redraw = true;
         }
 
         // Auto-dismiss status messages after timeout
-        app.check_status_timeout();
+        if app.check_status_timeout() {
+            app.needs_redraw = true;
+        }
 
-        terminal.draw(|f| draw(f, &mut app))?;
+        if app.needs_redraw {
+            terminal.draw(|f| draw(f, &mut app))?;
+            app.needs_redraw = false;
+        }
+
         app.handle_event()?;
 
         if app.should_quit {

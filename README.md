@@ -1,7 +1,7 @@
 # reviewer
 
 Automate mundane parts of code review. Speed up your workflow with LLM.
-
+![alt text](./docs/image.png)
 ## Features
 
 - List PRs needing your attention across multiple repositories
@@ -50,7 +50,7 @@ The diff view automatically detects if delta is installed and uses it for render
 
 ```bash
 reviewer                       # Scan configured directory
-reviewer -m                    # Show my PRs (instead of PRs to review)
+reviewer --my                  # Show PRs you authored (same as -m)
 reviewer -r ~/dev              # Specify repos directory
 reviewer -d                    # Include draft PRs
 reviewer -e archived -e old    # Exclude directories
@@ -58,6 +58,10 @@ reviewer -e vendor --save-exclude  # Save exclusions to config
 ```
 
 On first run, you'll be prompted to set your repos root directory.
+
+Use `--my` (or `-m`) to switch to "my PRs" mode. In this mode, reviewer
+shows PRs authored by your GitHub account and enables `m` in detail view to
+merge mergeable PRs with squash.
 
 ### Keybindings
 

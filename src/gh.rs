@@ -928,6 +928,7 @@ pub fn create_pr_worktree(
     Ok(worktree_path)
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn unix_shell_escape(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -937,6 +938,7 @@ fn windows_cmd_escape(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\\\""))
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn build_unix_command(command: &str, args: &[String], prompt: &str) -> String {
     let mut parts = Vec::with_capacity(args.len() + 2);
     parts.push(unix_shell_escape(command));

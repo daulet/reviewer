@@ -298,7 +298,7 @@ enum AsyncResult {
     Comments(usize, Vec<Comment>),       // (pr_index, comments)
     ReviewComments(usize, Vec<ReviewComment>), // (pr_index, review comments with diff context)
     Checks(usize, Vec<gh::CheckStatus>), // (pr_index, CI checks)
-    AiLaunch(Result<String, String>), // worktree path or error
+    AiLaunch(Result<String, String>),    // worktree path or error
     Refresh(Vec<PullRequest>),           // refreshed PR list
 }
 
@@ -740,7 +740,11 @@ impl App {
                     self.needs_clear = true;
                     match result {
                         Ok(path) => {
-                            self.set_status(format!("Launched {} in {}", self.ai.display_name(), path));
+                            self.set_status(format!(
+                                "Launched {} in {}",
+                                self.ai.display_name(),
+                                path
+                            ));
                         }
                         Err(e) => {
                             self.set_status(format!("Failed: {}", e));

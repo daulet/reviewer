@@ -41,7 +41,6 @@ impl AiConfig {
             .clone()
             .unwrap_or_else(|| "code-review".to_string())
     }
-
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]

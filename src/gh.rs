@@ -1,5 +1,5 @@
-use anyhow::{Context, Result};
 use crate::config::{self, AiConfig};
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::path::PathBuf;

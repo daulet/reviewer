@@ -78,6 +78,19 @@ fn format_search_status(idx: usize, total: usize, query: &str) -> String {
     format!("Match {}/{} for '{}'", idx + 1, total, query)
 }
 
+/// Match list-search query against PR metadata (title/repo/author/number).
+fn pr_matches_list_query(pr: &PullRequest, query_lower: &str) -> bool {
+    if query_lower.is_empty() {
+        return false;
+    }
+
+    pr.title.to_lowercase().contains(query_lower)
+        || pr.repo_name.to_lowercase().contains(query_lower)
+        || pr.author.to_lowercase().contains(query_lower)
+        || pr.number.to_string().contains(query_lower)
+        || format!("#{}", pr.number).contains(query_lower)
+}
+
 /// Represents a line in the parsed diff with its location info
 #[derive(Debug, Clone)]
 pub struct DiffLine {
@@ -1496,22 +1509,20 @@ impl App {
     }
 
     fn execute_list_search(&mut self) {
-        if self.input_buffer.is_empty() {
+        let query = self.input_buffer.trim();
+        if query.is_empty() {
             self.input_mode = InputMode::Normal;
             return;
         }
 
-        self.search_query = self.input_buffer.clone();
+        self.search_query = query.to_string();
         self.search_matches.clear();
         self.search_match_idx = 0;
 
-        // Search in PR titles and repo names
+        // Search in PR title/repo/author/number
         let query_lower = self.search_query.to_lowercase();
         for (idx, pr) in self.prs.iter().enumerate() {
-            if pr.title.to_lowercase().contains(&query_lower)
-                || pr.repo_name.to_lowercase().contains(&query_lower)
-                || pr.author.to_lowercase().contains(&query_lower)
-            {
+            if pr_matches_list_query(pr, &query_lower) {
                 self.search_matches.push(idx);
             }
         }
@@ -2822,5 +2833,45 @@ diff --git a/file2.rs b/file2.rs
     fn test_format_search_status() {
         assert_eq!(format_search_status(0, 5, "test"), "Match 1/5 for 'test'");
         assert_eq!(format_search_status(4, 5, "foo"), "Match 5/5 for 'foo'");
+    }
+
+    fn make_test_pr(number: u64, title: &str, repo: &str, author: &str) -> PullRequest {
+        PullRequest {
+            number,
+            title: title.to_string(),
+            author: author.to_string(),
+            body: String::new(),
+            repo_path: PathBuf::from("/tmp/repo"),
+            repo_name: repo.to_string(),
+            url: String::new(),
+            updated_at: Utc::now(),
+            additions: 0,
+            deletions: 0,
+            is_draft: false,
+            review_state: ReviewState::Pending,
+        }
+    }
+
+    #[test]
+    fn test_pr_matches_list_query_matches_pr_number() {
+        let pr = make_test_pr(
+            12345,
+            "Improve cache invalidation",
+            "org/reviewer",
+            "daulet",
+        );
+
+        assert!(pr_matches_list_query(&pr, "12345"));
+        assert!(pr_matches_list_query(&pr, "#12345"));
+    }
+
+    #[test]
+    fn test_pr_matches_list_query_matches_title_repo_author() {
+        let pr = make_test_pr(777, "Fix daemon startup race", "org/reviewer", "alice");
+
+        assert!(pr_matches_list_query(&pr, "startup"));
+        assert!(pr_matches_list_query(&pr, "org/reviewer"));
+        assert!(pr_matches_list_query(&pr, "alice"));
+        assert!(!pr_matches_list_query(&pr, "nonexistent"));
     }
 }

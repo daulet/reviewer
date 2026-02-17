@@ -2,6 +2,10 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+fn default_poll_interval_sec() -> u64 {
+    60
+}
+
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct AiConfig {
     pub provider: Option<String>,
@@ -43,13 +47,38 @@ impl AiConfig {
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DaemonConfig {
+    #[serde(default = "default_poll_interval_sec")]
+    pub poll_interval_sec: u64,
+    #[serde(default)]
+    pub exclude_repos: Vec<String>,
+    #[serde(default)]
+    pub initialized: bool,
+    #[serde(default)]
+    pub include_drafts: bool,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval_sec: default_poll_interval_sec(),
+            exclude_repos: Vec::new(),
+            initialized: false,
+            include_drafts: false,
+        }
+    }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct Config {
     pub repos_root: Option<String>,
     #[serde(default)]
     pub exclude: Vec<String>,
     #[serde(default)]
     pub ai: AiConfig,
+    #[serde(default)]
+    pub daemon: DaemonConfig,
 }
 
 pub fn config_path() -> PathBuf {

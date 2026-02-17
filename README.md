@@ -9,6 +9,7 @@ Automate mundane parts of code review. Speed up your workflow with LLM.
 - Add line-level comments directly from the diff view
 - Enhanced diff rendering with [delta](https://github.com/dandavison/delta) (side-by-side, syntax highlighting)
 - Launch [Codex CLI](https://github.com/openai/codex) or [Claude Code](https://github.com/anthropics/claude-code) for AI-assisted reviews
+- Background daemon mode that auto-triggers review on newly opened PRs (no retrigger on updates)
 - Continuously learn from your feedback to improve AI accuracy
 
 ## Installation
@@ -55,6 +56,11 @@ reviewer -r ~/dev              # Specify repos directory
 reviewer -d                    # Include draft PRs
 reviewer -e archived -e old    # Exclude directories
 reviewer -e vendor --save-exclude  # Save exclusions to config
+
+reviewer daemon init           # First-time daemon setup (repo checkbox selector)
+reviewer daemon run            # Start daemon polling loop
+reviewer daemon run --once     # Run one poll cycle and exit
+reviewer daemon status         # Show daemon state/counters
 ```
 
 On first run, you'll be prompted to set your repos root directory.
@@ -62,6 +68,11 @@ On first run, you'll be prompted to set your repos root directory.
 Use `--my` (or `-m`) to switch to "my PRs" mode. In this mode, reviewer
 shows PRs authored by your GitHub account and enables `m` in detail view to
 merge mergeable PRs with squash.
+
+Daemon notes:
+- On first daemon setup, reviewer shows an interactive checkbox list of repos and saves exclusions by `owner/repo`.
+- Existing open PRs are seeded as already seen during init, so only newly opened PRs trigger.
+- PR updates do not retrigger review; tracking is persisted in `~/.config/reviewer/daemon_state.json`.
 
 ### Keybindings
 
@@ -203,11 +214,20 @@ Config is stored at:
 AI settings are optional. `prompt_template` supports `{pr_number}`, `{repo}`, `{title}`,
 `{review_guide}`, and `{skill}` placeholders.
 On macOS/Linux, `terminal_app` lets you pick which terminal launches AI reviews (default: Terminal on macOS).
+Daemon state is stored separately in:
+- macOS/Linux: `~/.config/reviewer/daemon_state.json`
+- Windows: `%APPDATA%\reviewer\daemon_state.json`
 
 ```json
 {
   "repos_root": "/path/to/your/repos",
   "exclude": ["archived", "vendor"],
+  "daemon": {
+    "poll_interval_sec": 60,
+    "exclude_repos": ["org/legacy-repo"],
+    "initialized": true,
+    "include_drafts": false
+  },
   "ai": {
     "provider": "codex",
     "command": "codex",

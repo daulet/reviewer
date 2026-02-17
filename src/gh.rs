@@ -143,6 +143,10 @@ fn get_repo_info(repo_path: &PathBuf) -> Option<RepoInfo> {
     serde_json::from_slice(&output.stdout).ok()
 }
 
+pub fn repo_name_with_owner(repo_path: &PathBuf) -> Option<String> {
+    get_repo_info(repo_path).map(|info| info.name_with_owner)
+}
+
 fn get_open_prs(repo_path: &PathBuf) -> Vec<PrData> {
     let output = Command::new("gh")
         .args([

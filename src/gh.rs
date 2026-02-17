@@ -994,6 +994,26 @@ fn launch_macos_terminal_open(app: &str, command_line: &str) -> Result<()> {
         .stderr(std::process::Stdio::null())
         .spawn()
         .with_context(|| format!("Failed to launch {}", app))?;
+
+    // Best-effort activation for third-party terminals (Ghostty, iTerm, etc.).
+    // Some apps start command execution only after the window becomes active.
+    let script_app = app
+        .trim()
+        .trim_end_matches(".app")
+        .trim()
+        .replace('"', "\\\"");
+    let _ = Command::new("osascript")
+        .args([
+            "-e",
+            "delay 0.1",
+            "-e",
+            &format!("tell application \"{}\" to activate", script_app),
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+
     Ok(())
 }
 

@@ -184,8 +184,23 @@ fn run_tui(
     if !exclude.is_empty() {
         println!("Excluding: {}", exclude.join(", "));
     }
-    let repo_list = repos::find_repos(&repos_root, 3, &exclude);
-    println!("Found {} repositories", repo_list.len());
+    let scan = repos::scan_unique_repos(&repos_root, 3, exclude);
+    let discovered_count = scan.discovered_count;
+    let unique_count = scan.unique_repos.len();
+    let duplicate_count = scan.duplicates_skipped();
+    let repo_list: Vec<PathBuf> = scan
+        .unique_repos
+        .into_iter()
+        .map(|repo| repo.path)
+        .collect();
+    if duplicate_count > 0 {
+        println!(
+            "Found {} repositories ({} unique, {} duplicates skipped)",
+            discovered_count, unique_count, duplicate_count
+        );
+    } else {
+        println!("Found {} repositories", unique_count);
+    }
 
     if repo_list.is_empty() {
         println!("No repositories found.");
@@ -284,12 +299,9 @@ fn main() -> Result<()> {
     }
 
     match args.command {
-        Some(Commands::Daemon(daemon_args)) => run_daemon_command(
-            &mut cfg,
-            args.root,
-            effective_exclude,
-            daemon_args,
-        ),
+        Some(Commands::Daemon(daemon_args)) => {
+            run_daemon_command(&mut cfg, args.root, effective_exclude, daemon_args)
+        }
         None => {
             let username = gh::get_current_user()?;
             println!("Authenticated as: {}\n", username);

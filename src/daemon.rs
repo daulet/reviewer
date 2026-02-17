@@ -8,13 +8,13 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use crossterm::ExecutableCommand;
-use rayon::prelude::*;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::{Frame, Terminal};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout};
@@ -109,22 +109,26 @@ fn pr_key(repo: &str, pr_number: u64) -> String {
 }
 
 fn discover_repos(repos_root: &Path, exclude_dirs: &[String]) -> Vec<RepoDescriptor> {
-    let repo_paths = repos::find_repos(repos_root, 3, exclude_dirs);
-    let mut repos: Vec<RepoDescriptor> = repo_paths
-        .par_iter()
-        .filter_map(|path| {
-            gh::repo_name_with_owner(path).map(|name| RepoDescriptor {
-                path: path.clone(),
+    repos::scan_unique_repos(repos_root, 3, exclude_dirs)
+        .unique_repos
+        .into_iter()
+        .filter_map(|repo| {
+            repo.name_with_owner.map(|name| RepoDescriptor {
+                path: repo.path,
                 name,
             })
         })
-        .collect();
-    repos.sort_by(|a, b| a.name.cmp(&b.name));
-    repos
+        .collect()
 }
 
 fn monitored_repo_set(exclude_repos: &[String]) -> HashSet<String> {
     exclude_repos.iter().cloned().collect()
+}
+
+fn normalize_repo_names(mut repos: Vec<String>) -> Vec<String> {
+    repos.sort();
+    repos.dedup();
+    repos
 }
 
 fn collect_open_prs(
@@ -154,10 +158,18 @@ fn build_seed_record(pr: &PullRequest, now: DateTime<Utc>) -> ReviewedPrRecord {
 }
 
 fn trigger_review(pr: &PullRequest, repos_root: &Path, ai: &AiConfig) -> Result<()> {
-    let worktree_path = gh::create_pr_worktree(pr, repos_root)
-        .with_context(|| format!("Failed to create worktree for {}#{}", pr.repo_name, pr.number))?;
-    gh::launch_ai(&worktree_path, pr, ai)
-        .with_context(|| format!("Failed to launch AI review for {}#{}", pr.repo_name, pr.number))?;
+    let worktree_path = gh::create_pr_worktree(pr, repos_root).with_context(|| {
+        format!(
+            "Failed to create worktree for {}#{}",
+            pr.repo_name, pr.number
+        )
+    })?;
+    gh::launch_ai(&worktree_path, pr, ai).with_context(|| {
+        format!(
+            "Failed to launch AI review for {}#{}",
+            pr.repo_name, pr.number
+        )
+    })?;
     Ok(())
 }
 
@@ -197,7 +209,7 @@ pub fn init(cfg: &mut Config, repos_root: &Path, username: &str) -> Result<()> {
     }
 
     let excluded = run_repo_selector(&repos, &cfg.daemon.exclude_repos)?;
-    cfg.daemon.exclude_repos = excluded;
+    cfg.daemon.exclude_repos = normalize_repo_names(excluded);
     cfg.daemon.initialized = true;
     config::save_config(cfg)?;
 
@@ -240,7 +252,10 @@ pub fn poll_once(cfg: &Config, repos_root: &Path, username: &str) -> Result<Poll
         }
 
         new_prs += 1;
-        println!("New PR detected: {}#{} - {}", pr.repo_name, pr.number, pr.title);
+        println!(
+            "New PR detected: {}#{} - {}",
+            pr.repo_name, pr.number, pr.title
+        );
 
         let mut record = build_seed_record(&pr, now);
         match trigger_review(&pr, repos_root, &cfg.ai) {
@@ -330,8 +345,7 @@ pub fn status(cfg: &Config) -> DaemonStatus {
         }
     }
 
-    let mut excluded_repos = cfg.daemon.exclude_repos.clone();
-    excluded_repos.sort();
+    let excluded_repos = normalize_repo_names(cfg.daemon.exclude_repos.clone());
 
     DaemonStatus {
         state_path: state_path(),
@@ -380,7 +394,11 @@ impl RepoSelector {
             return;
         }
         let idx = self.selected().unwrap_or(0);
-        let next = if idx + 1 >= self.repos.len() { 0 } else { idx + 1 };
+        let next = if idx + 1 >= self.repos.len() {
+            0
+        } else {
+            idx + 1
+        };
         self.list_state.select(Some(next));
     }
 

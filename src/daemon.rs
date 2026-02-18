@@ -526,9 +526,6 @@ fn run_repo_selector(repos: &[RepoDescriptor], pre_excluded: &[String]) -> Resul
         }
     })();
 
-    let restore_result = restore_terminal(&mut terminal);
-    if let Err(err) = restore_result {
-        return Err(err);
-    }
+    restore_terminal(&mut terminal)?;
     result
 }

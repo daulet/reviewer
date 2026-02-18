@@ -1,32 +1,23 @@
 # reviewer
 
-Automate mundane parts of code review. Speed up your workflow with LLM.
+How do you keep up with AI generated PRs? Answer: use AI assisted code reviews.
+
 ![alt text](./docs/image.png)
 ## Features
 
-- List PRs needing your attention across multiple repositories
-- Approve PRs or add comments without leaving the terminal
-- Add line-level comments directly from the diff view
-- Enhanced diff rendering with [delta](https://github.com/dandavison/delta) (side-by-side, syntax highlighting)
-- Launch [Codex CLI](https://github.com/openai/codex) or [Claude Code](https://github.com/anthropics/claude-code) for AI-assisted reviews
-- Background daemon mode that auto-triggers review on newly opened PRs (no retrigger on updates)
-- Continuously learn from your feedback to improve AI accuracy
+- List, comment, approve PRs from your cloned repos;
+- Start interactive AI assisted review session, let it learn your code review approach;  
+- Run reviewer as daemon to kick off reviews as they are created;
 
 ## Installation
 
-### Homebrew (macOS)
-
+Homebrew (macOS):
 ```bash
 brew tap daulet/tap
 brew install reviewer
 ```
 
-### From releases
-
-Download the latest binary from [Releases](https://github.com/daulet/reviewer/releases).
-
-### From source
-
+From source:
 ```bash
 cargo install --git https://github.com/daulet/reviewer
 ```
@@ -45,72 +36,9 @@ cargo install --git https://github.com/daulet/reviewer
 | [Codex CLI](https://github.com/openai/codex) | AI-assisted code reviews (OpenAI) | `npm install -g @openai/codex` |
 | [Claude Code](https://github.com/anthropics/claude-code) | AI-assisted code reviews | `npm install -g @anthropic-ai/claude-code` |
 
-The diff view automatically detects if delta is installed and uses it for rendering. Otherwise, falls back to built-in syntax highlighting.
+The diff tries to use `delta` if installed. Choice of code reviewer tool can be configured in `~/.config/reviewer/config.json`.
 
-## Usage
-
-```bash
-reviewer                       # Scan configured directory
-reviewer --my                  # Show PRs you authored (same as -m)
-reviewer -r ~/dev              # Specify repos directory
-reviewer -d                    # Include draft PRs
-reviewer -e archived -e old    # Exclude directories
-reviewer -e vendor --save-exclude  # Save exclusions to config
-
-reviewer daemon init           # First-time daemon setup (repo checkbox selector)
-reviewer daemon run            # Start daemon polling loop
-reviewer daemon run --once     # Run one poll cycle and exit
-reviewer daemon status         # Show daemon state/counters
-```
-
-On first run, you'll be prompted to set your repos root directory.
-
-Use `--my` (or `-m`) to switch to "my PRs" mode. In this mode, reviewer
-shows PRs authored by your GitHub account and enables `m` in detail view to
-merge mergeable PRs with squash.
-
-Daemon notes:
-- On first daemon setup, reviewer shows an interactive checkbox list of repos and saves exclusions by `owner/repo`.
-- Existing open PRs are seeded as already seen during init, so only newly opened PRs trigger.
-- PR updates do not retrigger review; tracking is persisted in `~/.config/reviewer/daemon_state.json`.
-
-### Keybindings
-
-**List view:**
-| Key | Action |
-|-----|--------|
-| `j/k` | Navigate |
-| `Ctrl+d/u` | Page down/up |
-| `g/G` | First/last |
-| `Enter` | Open PR details |
-| `/` | Search PRs |
-| `n/N` | Next/previous search match |
-| `o` | Open in browser |
-| `y` | Copy PR URL |
-| `R` | Refresh |
-| `d` | Toggle drafts |
-| `q` | Quit |
-
-**Detail view:**
-| Key | Action |
-|-----|--------|
-| `Tab` | Switch tabs (Description/Diff/Comments) |
-| `j/k` | Scroll |
-| `Ctrl+d/u` | Page down/up |
-| `/` | Search in diff |
-| `:` | Go to line number |
-| `n/N` | Next/previous search match |
-| `c` | Add line comment (in Diff tab) |
-| `r` | Launch AI review |
-| `a` | Approve |
-| `x` | Close PR with comment |
-| `m` | Merge PR (squash, `--my` mode only) |
-| `o` | Open in browser |
-| `y` | Copy PR URL |
-| `p` | Previous PR |
-| `q` | Back to list |
-
-## AI Code Review Integration
+## AI Code Review Setup
 
 For AI-assisted reviews, set up a code-review skill and pick a provider.
 
@@ -159,13 +87,6 @@ This repo includes `.codex/config.toml` and `.codex/rules/reviewer.rules` with c
 defaults and allowlists for common review commands. If you want global defaults, mirror
 them in `~/.codex/config.toml` and `~/.codex/rules`.
 
-```toml
-approval_policy = "on-request"
-sandbox_mode = "workspace-write"
-```
-
-Create `~/.codex/rules/reviewer.rules`:
-
 ```
 prefix_rule(
   pattern = ["gh", "pr", ["view", "comment", "review"]],
@@ -204,6 +125,32 @@ Create `~/.config/reviewer/review_guide.md` to customize what the AI looks for:
 ```
 
 The AI learns from skipped comments and offers to update this file automatically.
+
+## Usage
+
+```bash
+reviewer                       # Scan configured directory
+reviewer -d                    # Include draft PRs
+reviewer -r ~/dev              # Specify repos directory
+reviewer -e archived -e old    # Exclude directories
+
+reviewer --my                  # Show PRs you authored (same as -m)
+
+reviewer daemon init           # Pick repos to monitor
+reviewer daemon run            # Start daemon polling loop
+reviewer daemon status         # Show daemon state/counters
+```
+
+On first run, you'll be prompted to set your repos root directory.
+
+Use `--my` (or `-m`) to switch to "my PRs" mode. In this mode, reviewer
+shows PRs authored by your GitHub account and enables `m` in detail view to
+merge mergeable PRs with squash.
+
+Daemon notes:
+- On first daemon setup, reviewer shows an interactive checkbox list of repos and saves exclusions by `owner/repo`.
+- Existing open PRs are seeded as already seen during init, so only newly opened PRs trigger.
+- PR updates do not retrigger review; tracking is persisted in `~/.config/reviewer/daemon_state.json`.
 
 ## Configuration
 

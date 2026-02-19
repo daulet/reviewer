@@ -14,7 +14,11 @@ use std::path::{Path, PathBuf};
 /// TUI for reviewing GitHub PRs across multiple repositories
 #[derive(Parser)]
 #[command(name = "reviewer")]
-#[command(version, about, long_about = None)]
+#[command(
+    version = env!("REVIEWER_VERSION_STRING"),
+    about,
+    long_about = None
+)]
 struct Args {
     #[command(subcommand)]
     command: Option<Commands>,

@@ -30,12 +30,12 @@ If no custom guidelines exist, use these defaults:
 
 1. **Get the PR base commit and diff:**
    ```bash
-   # Get the PR's base branch and find the merge-base (where PR diverged)
-   PR_NUMBER=<from initial prompt>
-   BASE_SHA=$(gh pr view $PR_NUMBER --json baseRefOid --jq '.baseRefOid')
+   # Query base SHA directly with a literal PR number
+   # Avoid shell wrappers like: PR_NUMBER=123; gh pr view $PR_NUMBER ...
+   gh pr view <pr-number-from-initial-prompt> --json baseRefOid --jq '.baseRefOid'
 
-   # Diff from the merge-base to HEAD (the PR's changes only)
-   git diff -U10 $BASE_SHA...HEAD
+   # Diff from that base SHA to HEAD (the PR's changes only)
+   git diff -U10 <base-sha-from-command>...HEAD
    ```
 
    If `gh pr view` fails, fall back to merge-base with origin/main:

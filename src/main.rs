@@ -253,6 +253,17 @@ fn print_daemon_status(cfg: &config::Config) {
             println!("  - {}", repo);
         }
     }
+    if status.repo_subpath_filters.is_empty() {
+        println!("Repo subpath filters: none");
+    } else {
+        println!(
+            "Repo subpath filters ({}):",
+            status.repo_subpath_filters.len()
+        );
+        for filter in status.repo_subpath_filters {
+            println!("  - {}: {}", filter.repo, filter.subpaths.join(", "));
+        }
+    }
 }
 
 fn run_daemon_command(

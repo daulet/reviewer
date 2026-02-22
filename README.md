@@ -149,8 +149,12 @@ merge mergeable PRs with squash.
 
 Daemon notes:
 - On first daemon setup, reviewer shows an interactive checkbox list of repos and saves exclusions by `owner/repo`.
+- In daemon init UI, press `f` on a selected repo to open a subdirectory tree popup.
+  Use `j/k` (or arrows) to move, `Enter` to expand/collapse, and `Space` to mark paths.
 - Existing open PRs are seeded as already seen during init, so only newly opened PRs trigger.
 - PR updates do not retrigger review; tracking is persisted in `~/.config/reviewer/daemon_state.json`.
+- Optional `daemon.repo_subpath_filters` lets you restrict a repo to PRs touching specific subpaths.
+  Omit a repo (or set an empty list) to monitor all PRs in that repo.
 
 ## Configuration
 
@@ -172,6 +176,10 @@ Daemon state is stored separately in:
   "daemon": {
     "poll_interval_sec": 60,
     "exclude_repos": ["org/legacy-repo"],
+    "repo_subpath_filters": {
+      "org/monorepo": ["services/payments", "infra/terraform"],
+      "org/full-repo": []
+    },
     "initialized": true,
     "include_drafts": false
   },

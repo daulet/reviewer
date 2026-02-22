@@ -1,5 +1,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 fn default_poll_interval_sec() -> u64 {
@@ -57,6 +58,8 @@ pub struct DaemonConfig {
     pub initialized: bool,
     #[serde(default)]
     pub include_drafts: bool,
+    #[serde(default)]
+    pub repo_subpath_filters: HashMap<String, Vec<String>>,
 }
 
 impl Default for DaemonConfig {
@@ -66,6 +69,7 @@ impl Default for DaemonConfig {
             exclude_repos: Vec::new(),
             initialized: false,
             include_drafts: false,
+            repo_subpath_filters: HashMap::new(),
         }
     }
 }

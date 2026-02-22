@@ -249,6 +249,40 @@ pub fn fetch_prs_for_repo(
     prs
 }
 
+#[derive(Debug, Deserialize)]
+struct PrFileData {
+    path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PrFilesData {
+    files: Option<Vec<PrFileData>>,
+}
+
+pub fn get_pr_changed_files(pr: &PullRequest) -> Result<Vec<String>> {
+    let output = Command::new("gh")
+        .args(["pr", "view", &pr.number.to_string(), "--json", "files"])
+        .current_dir(&pr.repo_path)
+        .output()
+        .context("Failed to get PR changed files")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to get PR changed files: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let data: PrFilesData = serde_json::from_slice(&output.stdout)
+        .context("Failed to parse PR changed files response")?;
+    Ok(data
+        .files
+        .unwrap_or_default()
+        .into_iter()
+        .map(|file| file.path)
+        .collect())
+}
+
 /// Search for all PRs authored by the current user across all repos
 pub fn search_my_prs(include_drafts: bool) -> Vec<PullRequest> {
     use rayon::prelude::*;

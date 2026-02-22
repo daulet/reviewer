@@ -86,6 +86,9 @@ pub struct RepoSubpathFilterStatus {
     pub subpaths: Vec<String>,
 }
 
+type RepoSubpathFilterMap = HashMap<String, Vec<String>>;
+type RepoSelectionConfig = (Vec<String>, RepoSubpathFilterMap);
+
 pub fn state_path() -> PathBuf {
     config::config_dir().join("daemon_state.json")
 }
@@ -157,8 +160,8 @@ fn normalize_subpaths(paths: &[String]) -> Vec<String> {
 }
 
 fn normalize_repo_subpath_filters(
-    repo_subpath_filters: &HashMap<String, Vec<String>>,
-) -> HashMap<String, Vec<String>> {
+    repo_subpath_filters: &RepoSubpathFilterMap,
+) -> RepoSubpathFilterMap {
     let mut normalized = HashMap::new();
     for (repo, subpaths) in repo_subpath_filters {
         let repo_name = repo.trim();
@@ -171,7 +174,7 @@ fn normalize_repo_subpath_filters(
 }
 
 fn normalize_repo_subpath_filter_status(
-    repo_subpath_filters: &HashMap<String, Vec<String>>,
+    repo_subpath_filters: &RepoSubpathFilterMap,
 ) -> Vec<RepoSubpathFilterStatus> {
     let mut normalized: Vec<RepoSubpathFilterStatus> =
         normalize_repo_subpath_filters(repo_subpath_filters)
@@ -203,7 +206,7 @@ fn pr_touches_any_subpath(changed_files: &[String], subpaths: &[String]) -> bool
 fn apply_repo_subpath_filter(
     repo: &RepoDescriptor,
     prs: Vec<PullRequest>,
-    repo_subpath_filters: &HashMap<String, Vec<String>>,
+    repo_subpath_filters: &RepoSubpathFilterMap,
 ) -> Vec<PullRequest> {
     let subpaths = match repo_subpath_filters.get(&repo.name) {
         Some(subpaths) if !subpaths.is_empty() => subpaths,
@@ -227,7 +230,7 @@ fn apply_repo_subpath_filter(
 fn collect_open_prs(
     repos: &[RepoDescriptor],
     excluded_repos: &HashSet<String>,
-    repo_subpath_filters: &HashMap<String, Vec<String>>,
+    repo_subpath_filters: &RepoSubpathFilterMap,
     username: &str,
     include_drafts: bool,
 ) -> Vec<PullRequest> {
@@ -735,7 +738,7 @@ impl RepoSelector {
     fn new(
         repos: &[RepoDescriptor],
         pre_excluded: &[String],
-        pre_subpath_filters: &HashMap<String, Vec<String>>,
+        pre_subpath_filters: &RepoSubpathFilterMap,
     ) -> Self {
         let excluded: HashSet<String> = pre_excluded.iter().cloned().collect();
         let normalized_pre_filters = normalize_repo_subpath_filters(pre_subpath_filters);
@@ -894,7 +897,7 @@ impl RepoSelector {
         self.mode = RepoSelectorMode::Browse;
     }
 
-    fn into_config(self) -> (Vec<String>, HashMap<String, Vec<String>>) {
+    fn into_config(self) -> RepoSelectionConfig {
         let mut excluded_repos = Vec::new();
         let mut repo_subpath_filters = HashMap::new();
 
@@ -1111,12 +1114,12 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
 fn run_repo_selector(
     repos: &[RepoDescriptor],
     pre_excluded: &[String],
-    pre_subpath_filters: &HashMap<String, Vec<String>>,
-) -> Result<(Vec<String>, HashMap<String, Vec<String>>)> {
+    pre_subpath_filters: &RepoSubpathFilterMap,
+) -> Result<RepoSelectionConfig> {
     let mut app = RepoSelector::new(repos, pre_excluded, pre_subpath_filters);
     let mut terminal = setup_terminal()?;
 
-    let result = (|| -> Result<(Vec<String>, HashMap<String, Vec<String>>)> {
+    let result = (|| -> Result<RepoSelectionConfig> {
         loop {
             terminal.draw(|frame| draw_repo_selector(frame, &mut app))?;
 

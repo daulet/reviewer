@@ -2,6 +2,8 @@
 
 ## Features
 
+- [ ] add a summary in the session, eg not what changed but intent, and if complex, make arch explanation
+- [ ]  add a link to PR?
 - [x] Open in default terminal, not "terminal"
 - [ ] Improve codex code review skill with interactive prompts like in claude 
 - [ ] Render description in markdown

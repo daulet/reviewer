@@ -156,6 +156,15 @@ Daemon notes:
 - Optional `daemon.repo_subpath_filters` lets you restrict a repo to PRs touching specific subpaths.
   Omit a repo (or set an empty list) to monitor all PRs in that repo.
 
+## Terminal Launch Harness (macOS)
+
+Testing-only utility to validate terminal launch behavior (tab/window/session execution).
+
+```bash
+reviewer harness --terminal-app Ghostty --terminal-launch-mode same-space --runs 3
+reviewer harness --terminal-app Ghostty --terminal-launch-mode new-tab --runs 3
+```
+
 ## Configuration
 
 Config is stored at:
@@ -165,6 +174,9 @@ Config is stored at:
 AI settings are optional. `prompt_template` supports `{pr_number}`, `{repo}`, `{title}`,
 `{review_guide}`, and `{skill}` placeholders.
 On macOS/Linux, `terminal_app` lets you pick which terminal launches AI reviews (default: Terminal on macOS).
+On macOS, optional `terminal_launch_mode` values are:
+- `auto`, `new-instance`, `same-space`, `new-tab`, `new-window`
+Note: Ghostty `same-space`/`new-tab` use `System Events` keystroke automation and may require macOS Accessibility/Automation permissions.
 Daemon state is stored separately in:
 - macOS/Linux: `~/.config/reviewer/daemon_state.json`
 - Windows: `%APPDATA%\reviewer\daemon_state.json`
@@ -189,7 +201,8 @@ Daemon state is stored separately in:
     "args": [],
     "skill": "code-review",
     "prompt_template": "Review PR #{pr_number} in {repo}. Title: \"{title}\". Use {skill}. Follow {review_guide}",
-    "terminal_app": "Ghostty"
+    "terminal_app": "Ghostty",
+    "terminal_launch_mode": "new-tab"
   }
 }
 ```

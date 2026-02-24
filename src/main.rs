@@ -2,7 +2,9 @@ mod config;
 mod daemon;
 mod diff;
 mod gh;
+mod harness;
 mod repos;
+mod terminal;
 mod tui;
 
 use anyhow::{bail, Result};
@@ -49,6 +51,8 @@ struct Args {
 enum Commands {
     /// Run or configure the background daemon for auto reviews
     Daemon(DaemonArgs),
+    /// Run terminal launch harness and write process evidence report
+    Harness(harness::HarnessArgs),
 }
 
 #[derive(Parser)]
@@ -317,6 +321,7 @@ fn main() -> Result<()> {
         Some(Commands::Daemon(daemon_args)) => {
             run_daemon_command(&mut cfg, args.root, effective_exclude, daemon_args)
         }
+        Some(Commands::Harness(harness_args)) => harness::run(harness_args),
         None => {
             let username = gh::get_current_user()?;
             println!("Authenticated as: {}\n", username);

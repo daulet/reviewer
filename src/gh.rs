@@ -5,6 +5,9 @@ use serde::Deserialize;
 use std::path::PathBuf;
 use std::process::Command;
 
+#[cfg(target_os = "macos")]
+use crate::terminal::{launch_macos_terminal, parse_terminal_launch_mode, TerminalLaunchMode};
+
 #[derive(Debug, Deserialize)]
 struct RepoInfo {
     #[serde(rename = "nameWithOwner")]
@@ -912,22 +915,8 @@ pub fn create_pr_worktree(
     std::fs::create_dir_all(&worktree_base)?;
 
     let worktree_name = format!("{}-pr-{}", pr.repo_name.replace('/', "-"), pr.number);
-    let worktree_path = worktree_base.join(&worktree_name);
-
-    // Remove existing worktree if it exists
-    if worktree_path.exists() {
-        let _ = Command::new("git")
-            .args([
-                "worktree",
-                "remove",
-                "--force",
-                worktree_path.to_str().unwrap(),
-            ])
-            .current_dir(&pr.repo_path)
-            .output();
-        // Also try removing the directory directly if worktree remove failed
-        let _ = std::fs::remove_dir_all(&worktree_path);
-    }
+    let canonical_path = worktree_base.join(&worktree_name);
+    cleanup_worktree_path(&pr.repo_path, &canonical_path);
 
     // Fetch the PR head ref
     let pr_ref = format!("refs/pull/{}/head", pr.number);
@@ -944,26 +933,64 @@ pub fn create_pr_worktree(
         );
     }
 
-    // Create worktree at FETCH_HEAD
+    // Prefer canonical path, then fall back to timestamp-suffixed paths when a previous
+    // worktree is still active or metadata is stale.
+    let mut candidates = vec![canonical_path];
+    let stamp = Utc::now().format("%Y%m%d%H%M%S");
+    for attempt in 1..=5 {
+        candidates.push(worktree_base.join(format!("{worktree_name}-{stamp}-{attempt}")));
+    }
+
+    let mut errors = Vec::new();
+    for candidate in candidates {
+        if candidate.exists() {
+            cleanup_worktree_path(&pr.repo_path, &candidate);
+        }
+
+        match git_worktree_add(&pr.repo_path, &candidate, "FETCH_HEAD") {
+            Ok(()) => return Ok(candidate),
+            Err(err) => errors.push(format!("{} => {}", candidate.display(), err)),
+        }
+    }
+
+    anyhow::bail!(
+        "Failed to create worktree for {}#{} after trying multiple paths:\n{}",
+        pr.repo_name,
+        pr.number,
+        errors.join("\n")
+    );
+}
+
+fn cleanup_worktree_path(repo_path: &std::path::Path, worktree_path: &std::path::Path) {
+    let _ = Command::new("git")
+        .args(["worktree", "remove", "--force"])
+        .arg(worktree_path)
+        .current_dir(repo_path)
+        .output();
+    let _ = Command::new("git")
+        .args(["worktree", "prune"])
+        .current_dir(repo_path)
+        .output();
+    let _ = std::fs::remove_dir_all(worktree_path);
+}
+
+fn git_worktree_add(
+    repo_path: &std::path::Path,
+    worktree_path: &std::path::Path,
+    revision: &str,
+) -> Result<()> {
     let output = Command::new("git")
-        .args([
-            "worktree",
-            "add",
-            worktree_path.to_str().unwrap(),
-            "FETCH_HEAD",
-        ])
-        .current_dir(&pr.repo_path)
+        .args(["worktree", "add"])
+        .arg(worktree_path)
+        .arg(revision)
+        .current_dir(repo_path)
         .output()
         .context("Failed to create worktree")?;
 
     if !output.status.success() {
-        anyhow::bail!(
-            "Failed to create worktree: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        anyhow::bail!(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
-
-    Ok(worktree_path)
+    Ok(())
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -996,59 +1023,6 @@ fn build_windows_command(command: &str, args: &[String], prompt: &str) -> String
     }
     parts.push(windows_cmd_escape(prompt));
     parts.join(" ")
-}
-
-#[cfg(target_os = "macos")]
-fn launch_macos_terminal_applescript(app: &str, command_line: &str) -> Result<()> {
-    let escaped_command = command_line.replace('"', "\\\"");
-    let script = format!(
-        r#"tell application "{app}"
-            activate
-            do script "{command}"
-        end tell"#,
-        app = app,
-        command = escaped_command
-    );
-    Command::new("osascript")
-        .args(["-e", &script])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .with_context(|| format!("Failed to launch {}", app))?;
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn launch_macos_terminal_open(app: &str, command_line: &str) -> Result<()> {
-    Command::new("open")
-        .args(["-na", app, "--args", "-e", "bash", "-lc", command_line])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .with_context(|| format!("Failed to launch {}", app))?;
-
-    // Best-effort activation for third-party terminals (Ghostty, iTerm, etc.).
-    // Some apps start command execution only after the window becomes active.
-    let script_app = app
-        .trim()
-        .trim_end_matches(".app")
-        .trim()
-        .replace('"', "\\\"");
-    let _ = Command::new("osascript")
-        .args([
-            "-e",
-            "delay 0.1",
-            "-e",
-            &format!("tell application \"{}\" to activate", script_app),
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
-
-    Ok(())
 }
 
 fn render_prompt(
@@ -1110,12 +1084,14 @@ pub fn launch_ai(working_dir: &std::path::Path, pr: &PullRequest, ai: &AiConfig)
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .unwrap_or("Terminal");
+        let launch_mode = ai
+            .terminal_launch_mode
+            .as_deref()
+            .map(parse_terminal_launch_mode)
+            .transpose()?
+            .unwrap_or(TerminalLaunchMode::Auto);
 
-        if terminal_app.eq_ignore_ascii_case("terminal") {
-            launch_macos_terminal_applescript("Terminal", &command_line)?;
-        } else {
-            launch_macos_terminal_open(terminal_app, &command_line)?;
-        }
+        launch_macos_terminal(terminal_app, &command_line, launch_mode)?;
     }
 
     #[cfg(target_os = "linux")]

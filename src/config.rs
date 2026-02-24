@@ -16,6 +16,7 @@ pub struct AiConfig {
     pub skill: Option<String>,
     pub prompt_template: Option<String>,
     pub terminal_app: Option<String>,
+    pub terminal_launch_mode: Option<String>,
 }
 
 impl AiConfig {

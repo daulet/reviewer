@@ -3,6 +3,7 @@
 ## Features
 
 - [ ] add a summary in the session, eg not what changed but intent, and if complex, make arch explanation
+- [ ] disallow posting PR comments (not inline), via perms or stricter skill
 - [ ]  add a link to PR?
 - [x] Open in default terminal, not "terminal"
 - [ ] Improve codex code review skill with interactive prompts like in claude 

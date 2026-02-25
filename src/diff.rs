@@ -52,11 +52,14 @@ fn run_delta(diff: &str, width: u16) -> Option<String> {
         .spawn()
         .ok()?;
 
-    // Write to stdin and close it
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(diff.as_bytes());
-        // stdin is dropped here, closing the pipe
-    }
+    // Write diff input on a separate thread so stdout can be drained concurrently.
+    // Writing before reading can deadlock when both stdin and stdout pipes fill up.
+    let input = diff.to_string();
+    let writer = child.stdin.take().map(|mut stdin| {
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(input.as_bytes());
+        })
+    });
 
     // Wait with timeout using a separate thread
     let timeout = Duration::from_secs(10);
@@ -66,12 +69,16 @@ fn run_delta(diff: &str, width: u16) -> Option<String> {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
         if handle.is_finished() {
-            return handle
+            let output = handle
                 .join()
                 .ok()
                 .and_then(|r| r.ok())
                 .filter(|o| o.status.success())
                 .map(|o| String::from_utf8_lossy(&o.stdout).to_string());
+            if let Some(writer) = writer {
+                let _ = writer.join();
+            }
+            return output;
         }
         std::thread::sleep(Duration::from_millis(100));
     }

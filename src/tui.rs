@@ -11,7 +11,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap},
     Frame,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -455,6 +455,13 @@ pub enum InputMode {
     GotoLine,     // Jump to specific line
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SearchScope {
+    Diff,
+    TreeFileNames,
+    TreeContents,
+}
+
 /// Context for a line-level comment
 #[derive(Debug, Clone)]
 pub struct LineCommentContext {
@@ -504,6 +511,7 @@ pub struct App {
     pub search_query: String,
     pub search_matches: Vec<usize>, // Line indices that match
     pub search_match_idx: usize,    // Current match index
+    search_scope: SearchScope,
     pub status_message: Option<String>,
     pub status_time: Option<std::time::Instant>,
     pub should_quit: bool,
@@ -568,6 +576,7 @@ impl App {
             search_query: String::new(),
             search_matches: Vec::new(),
             search_match_idx: 0,
+            search_scope: SearchScope::Diff,
             status_message: None,
             status_time: None,
             should_quit: false,
@@ -658,6 +667,7 @@ impl App {
         if self.diff_tree_enabled {
             self.diff_tree_enabled = false;
             self.back_to_large_diff_tree();
+            self.clear_search();
             self.needs_clear = true;
             self.set_status("File tree hidden".to_string());
         } else {
@@ -1594,12 +1604,15 @@ impl App {
                 // Search (only in Diff tab)
                 KeyCode::Char('/') if self.detail_tab == DetailTab::Diff => {
                     if self.showing_large_diff_tree() {
-                        self.set_status(
-                            "Select a file first (Enter) to search within diff".to_string(),
-                        );
+                        self.start_tree_name_search();
                     } else {
                         self.start_search();
                     }
+                }
+                KeyCode::Char('?')
+                    if self.detail_tab == DetailTab::Diff && self.showing_large_diff_tree() =>
+                {
+                    self.start_tree_content_search();
                 }
                 KeyCode::Char('n') if !self.search_query.is_empty() => self.next_search_match(),
                 KeyCode::Char('N') if !self.search_query.is_empty() => self.prev_search_match(),
@@ -1749,8 +1762,36 @@ impl App {
     }
 
     fn start_search(&mut self) {
+        self.search_scope = SearchScope::Diff;
         self.input_mode = InputMode::Search;
         self.input_buffer.clear();
+    }
+
+    fn start_tree_name_search(&mut self) {
+        self.search_scope = SearchScope::TreeFileNames;
+        self.input_mode = InputMode::Search;
+        self.input_buffer.clear();
+    }
+
+    fn start_tree_content_search(&mut self) {
+        self.search_scope = SearchScope::TreeContents;
+        self.input_mode = InputMode::Search;
+        self.input_buffer.clear();
+    }
+
+    fn apply_current_search_match(&mut self) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        let idx = self.search_matches[self.search_match_idx];
+        match self.search_scope {
+            SearchScope::Diff => {
+                self.scroll_offset = idx as u16;
+            }
+            SearchScope::TreeFileNames | SearchScope::TreeContents => {
+                self.file_tree_state.select(Some(idx));
+            }
+        }
     }
 
     fn execute_search(&mut self) {
@@ -1762,20 +1803,48 @@ impl App {
         self.search_query = self.input_buffer.clone();
         self.search_matches.clear();
         self.search_match_idx = 0;
+        let query_lower = self.search_query.to_lowercase();
 
-        // Search in displayed content (delta output if available, otherwise raw diff)
-        let search_content = self
-            .filtered_diff_cache
-            .as_ref()
-            .or(self.delta_cache.as_ref())
-            .or(self.diff_cache.as_ref());
-        if let Some(content) = search_content {
-            let query_lower = self.search_query.to_lowercase();
-            for (idx, line) in content.lines().enumerate() {
-                // Strip ANSI codes for searching in delta output
-                let clean_line = strip_ansi_codes(line);
-                if clean_line.to_lowercase().contains(&query_lower) {
-                    self.search_matches.push(idx);
+        match self.search_scope {
+            SearchScope::Diff => {
+                // Search in displayed content (delta output if available, otherwise raw diff)
+                let search_content = self
+                    .filtered_diff_cache
+                    .as_ref()
+                    .or(self.delta_cache.as_ref())
+                    .or(self.diff_cache.as_ref());
+                if let Some(content) = search_content {
+                    for (idx, line) in content.lines().enumerate() {
+                        // Strip ANSI codes for searching in delta output
+                        let clean_line = strip_ansi_codes(line);
+                        if clean_line.to_lowercase().contains(&query_lower) {
+                            self.search_matches.push(idx);
+                        }
+                    }
+                }
+            }
+            SearchScope::TreeFileNames => {
+                for (idx, item) in self.file_tree_items.iter().enumerate() {
+                    if let Some(path) = item.file_path.as_ref() {
+                        if path.to_lowercase().contains(&query_lower) {
+                            self.search_matches.push(idx);
+                        }
+                    }
+                }
+            }
+            SearchScope::TreeContents => {
+                let mut matched_paths = BTreeSet::new();
+                for section in &self.file_diff_sections {
+                    if section.diff.to_lowercase().contains(&query_lower) {
+                        matched_paths.insert(section.path.clone());
+                    }
+                }
+                for (idx, item) in self.file_tree_items.iter().enumerate() {
+                    if let Some(path) = item.file_path.as_ref() {
+                        if matched_paths.contains(path) {
+                            self.search_matches.push(idx);
+                        }
+                    }
                 }
             }
         }
@@ -1784,16 +1853,22 @@ impl App {
         self.input_buffer.clear();
 
         if self.search_matches.is_empty() {
-            self.set_status(format!("No matches for '{}'", self.search_query));
-        } else {
-            // Jump to first match
-            self.scroll_offset = self.search_matches[0] as u16;
-            self.set_status(format_search_status(
-                0,
-                self.search_matches.len(),
-                &self.search_query,
-            ));
+            let scope = match self.search_scope {
+                SearchScope::Diff => "diff",
+                SearchScope::TreeFileNames => "file names",
+                SearchScope::TreeContents => "file contents",
+            };
+            self.set_status(format!("No {} matches for '{}'", scope, self.search_query));
+            return;
         }
+
+        // Jump to first match
+        self.apply_current_search_match();
+        self.set_status(format_search_status(
+            0,
+            self.search_matches.len(),
+            &self.search_query,
+        ));
     }
 
     fn next_search_match(&mut self) {
@@ -1802,7 +1877,7 @@ impl App {
         }
         self.search_match_idx =
             advance_search_idx(self.search_match_idx, self.search_matches.len());
-        self.scroll_offset = self.search_matches[self.search_match_idx] as u16;
+        self.apply_current_search_match();
         self.set_status(format_search_status(
             self.search_match_idx,
             self.search_matches.len(),
@@ -1816,7 +1891,7 @@ impl App {
         }
         self.search_match_idx =
             retreat_search_idx(self.search_match_idx, self.search_matches.len());
-        self.scroll_offset = self.search_matches[self.search_match_idx] as u16;
+        self.apply_current_search_match();
         self.set_status(format_search_status(
             self.search_match_idx,
             self.search_matches.len(),
@@ -1924,6 +1999,7 @@ impl App {
         self.search_query.clear();
         self.search_matches.clear();
         self.search_match_idx = 0;
+        self.search_scope = SearchScope::Diff;
     }
 }
 
@@ -2434,7 +2510,7 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
 
     // Help - context-aware based on tab and mode
     let help_text = if app.detail_tab == DetailTab::Diff && app.showing_large_diff_tree() {
-        " j/k: navigate files | Enter: open file diff | t: hide tree | D: delta | o: browser | y: copy | q: back"
+        " j/k: navigate files | /: name search | ?: content search | Enter: open file diff | t: hide tree | q: back"
     } else if app.detail_tab == DetailTab::Diff && app.showing_single_file_diff() {
         match app.mode {
             AppMode::MyPrs => {
@@ -2667,10 +2743,24 @@ fn draw_search_input(frame: &mut Frame, app: &App) {
         height: 3,
     };
 
-    let input = Paragraph::new(format!("/{}", app.input_buffer)).block(
+    let (prefix, title) = match app.input_mode {
+        InputMode::ListSearch => ("/", " Search PR list (Enter to find, Esc to cancel) "),
+        InputMode::Search => match app.search_scope {
+            SearchScope::Diff => ("/", " Search diff (Enter to find, Esc to cancel) "),
+            SearchScope::TreeFileNames => {
+                ("/", " Search file names (Enter to find, Esc to cancel) ")
+            }
+            SearchScope::TreeContents => {
+                ("?", " Search file contents (Enter to find, Esc to cancel) ")
+            }
+        },
+        _ => ("/", " Search (Enter to find, Esc to cancel) "),
+    };
+
+    let input = Paragraph::new(format!("{}{}", prefix, app.input_buffer)).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Search (Enter to find, Esc to cancel) ")
+            .title(title)
             .style(Style::default().fg(Color::Yellow)),
     );
 

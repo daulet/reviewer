@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -8,6 +8,7 @@ fn default_poll_interval_sec() -> u64 {
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct AiConfig {
     pub provider: Option<String>,
     pub command: Option<String>,
@@ -62,6 +63,7 @@ impl AiConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct DaemonConfig {
     #[serde(default = "default_poll_interval_sec")]
     pub poll_interval_sec: u64,
@@ -88,6 +90,7 @@ impl Default for DaemonConfig {
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub repos_root: Option<String>,
     #[serde(default)]
@@ -127,15 +130,23 @@ pub fn config_dir() -> PathBuf {
         .to_path_buf()
 }
 
-pub fn load_config() -> Config {
+fn parse_config(contents: &str) -> Result<Config> {
+    serde_json::from_str(contents).context("Invalid reviewer config JSON")
+}
+
+pub fn load_config() -> Result<Config> {
     let path = config_path();
     if !path.exists() {
-        return Config::default();
+        return Ok(Config::default());
     }
-    std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    let contents = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read config file: {}", path.display()))?;
+    parse_config(&contents).with_context(|| {
+        format!(
+            "Invalid config file {}. Check for typos/unknown fields and JSON syntax.",
+            path.display()
+        )
+    })
 }
 
 pub fn save_config(config: &Config) -> Result<()> {
@@ -146,4 +157,47 @@ pub fn save_config(config: &Config) -> Result<()> {
     let json = serde_json::to_string_pretty(config)?;
     std::fs::write(&path, json)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_config;
+
+    #[test]
+    fn parse_config_rejects_unknown_top_level_field() {
+        let json = r#"
+        {
+          "repos_root": "/tmp/repos",
+          "typo_field": true
+        }
+        "#;
+
+        let err = parse_config(json).expect_err("expected parse error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unknown field `typo_field`"),
+            "unexpected error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn parse_config_rejects_unknown_nested_field() {
+        let json = r#"
+        {
+          "ai": {
+            "provider": "codex",
+            "launchr": "aoe"
+          }
+        }
+        "#;
+
+        let err = parse_config(json).expect_err("expected parse error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unknown field `launchr`"),
+            "unexpected error: {}",
+            msg
+        );
+    }
 }

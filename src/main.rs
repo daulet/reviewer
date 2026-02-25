@@ -309,7 +309,7 @@ fn run_daemon_command(
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let mut cfg = config::load_config();
+    let mut cfg = config::load_config()?;
     let effective_exclude = merge_excludes(&cfg.exclude, &args.exclude);
     if args.save_exclude && !args.exclude.is_empty() {
         cfg.exclude = effective_exclude.clone();

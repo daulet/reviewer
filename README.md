@@ -171,6 +171,7 @@ reviewer harness --terminal-app Ghostty --terminal-launch-mode new-tab --runs 3
 Config is stored at:
 - macOS/Linux: `~/.config/reviewer/config.json`
 - Windows: `%APPDATA%\reviewer\config.json`
+Unknown fields are rejected on startup (for example, config key typos).
 
 AI settings are optional. `prompt_template` supports `{pr_number}`, `{repo}`, `{title}`,
 `{review_guide}`, and `{skill}` placeholders.

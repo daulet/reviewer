@@ -13,6 +13,8 @@ use syntect::{
     parsing::SyntaxSet,
 };
 
+const DELTA_DIFF_SIZE_LIMIT: usize = 100_000;
+
 /// Check if delta is available on the system (cached)
 fn is_delta_available() -> bool {
     static DELTA_AVAILABLE: OnceLock<bool> = OnceLock::new();
@@ -32,7 +34,7 @@ fn run_delta(diff: &str, width: u16) -> Option<String> {
     use std::time::Duration;
 
     // Skip delta for very large diffs (>100KB) to avoid slow processing
-    if diff.len() > 100_000 {
+    if is_too_large_for_delta(diff) {
         return None;
     }
 
@@ -86,6 +88,11 @@ pub fn process_with_delta(diff: &str, width: u16) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Returns true when diff content exceeds the limit we allow delta to process.
+pub fn is_too_large_for_delta(diff: &str) -> bool {
+    diff.len() > DELTA_DIFF_SIZE_LIMIT
 }
 
 /// Convert a Line with borrowed content to owned content

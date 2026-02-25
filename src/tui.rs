@@ -11,6 +11,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap},
     Frame,
 };
+use std::collections::BTreeMap;
 use std::io;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -306,13 +307,117 @@ fn parse_diff(diff: &str) -> Vec<DiffLine> {
     result
 }
 
+#[derive(Debug, Clone)]
+struct FileDiffSection {
+    path: String,
+    diff: String,
+}
+
+#[derive(Debug, Clone)]
+struct DiffTreeItem {
+    label: String,
+    file_path: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct DiffTreeNode {
+    children: BTreeMap<String, DiffTreeNode>,
+    file_path: Option<String>,
+}
+
+impl DiffTreeNode {
+    fn insert_path(&mut self, path: &str) {
+        let components: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+        self.insert_components(&components, path);
+    }
+
+    fn insert_components(&mut self, components: &[&str], full_path: &str) {
+        if components.is_empty() {
+            self.file_path = Some(full_path.to_string());
+            return;
+        }
+
+        let child = self.children.entry(components[0].to_string()).or_default();
+        child.insert_components(&components[1..], full_path);
+    }
+}
+
+/// Split a unified diff into per-file sections keyed by the target file path.
+fn parse_diff_file_sections(diff: &str) -> Vec<FileDiffSection> {
+    let mut sections = Vec::new();
+    let mut current_path: Option<String> = None;
+    let mut current_diff = String::new();
+
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            if let Some(path) = current_path.take() {
+                sections.push(FileDiffSection {
+                    path,
+                    diff: std::mem::take(&mut current_diff),
+                });
+            }
+            current_path = line.split(" b/").nth(1).map(|path| path.to_string());
+        }
+
+        if current_path.is_some() {
+            current_diff.push_str(line);
+            current_diff.push('\n');
+        }
+    }
+
+    if let Some(path) = current_path {
+        sections.push(FileDiffSection {
+            path,
+            diff: current_diff,
+        });
+    }
+
+    sections
+}
+
+fn flatten_diff_tree(node: &DiffTreeNode, depth: usize, out: &mut Vec<DiffTreeItem>) {
+    let mut entries: Vec<(&String, &DiffTreeNode)> = node.children.iter().collect();
+    entries.sort_by(|(name_a, node_a), (name_b, node_b)| {
+        let a_is_dir = !node_a.children.is_empty();
+        let b_is_dir = !node_b.children.is_empty();
+        b_is_dir.cmp(&a_is_dir).then_with(|| name_a.cmp(name_b))
+    });
+
+    for (name, child) in entries {
+        let indent = "  ".repeat(depth);
+        if child.children.is_empty() {
+            out.push(DiffTreeItem {
+                label: format!("{indent}{name}"),
+                file_path: child.file_path.clone(),
+            });
+        } else {
+            out.push(DiffTreeItem {
+                label: format!("{indent}{name}/"),
+                file_path: None,
+            });
+            flatten_diff_tree(child, depth + 1, out);
+        }
+    }
+}
+
+fn build_diff_tree_items(sections: &[FileDiffSection]) -> Vec<DiffTreeItem> {
+    let mut root = DiffTreeNode::default();
+    for section in sections {
+        root.insert_path(&section.path);
+    }
+
+    let mut items = Vec::new();
+    flatten_diff_tree(&root, 0, &mut items);
+    items
+}
+
 enum AsyncResult {
-    Diff(usize, String, Option<String>), // (pr_index, diff_content, delta_output)
-    Comments(usize, Vec<Comment>),       // (pr_index, comments)
+    Diff(usize, String, Option<String>, bool), // (pr_index, diff_content, delta_output, delta_too_large)
+    Comments(usize, Vec<Comment>),             // (pr_index, comments)
     ReviewComments(usize, Vec<ReviewComment>), // (pr_index, review comments with diff context)
-    Checks(usize, Vec<gh::CheckStatus>), // (pr_index, CI checks)
-    AiLaunch(Result<String, String>),    // worktree path or error
-    Refresh(Vec<PullRequest>),           // refreshed PR list
+    Checks(usize, Vec<gh::CheckStatus>),       // (pr_index, CI checks)
+    AiLaunch(Result<String, String>),          // worktree path or error
+    Refresh(Vec<PullRequest>),                 // refreshed PR list
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -380,6 +485,14 @@ pub struct App {
     pub use_delta: bool,             // Whether to use delta for rendering
     pub diff_lines: Vec<DiffLine>,   // Parsed diff with line info
     pub delta_line_info: Vec<DeltaLineInfo>, // Parsed delta output line info
+    diff_tree_enabled: bool,         // Whether tree mode is enabled in Diff tab
+    delta_too_large: bool,           // Delta fallback happened because diff is too large
+    file_diff_sections: Vec<FileDiffSection>, // Per-file sections from unified diff
+    file_tree_items: Vec<DiffTreeItem>, // Hierarchical file tree for navigating diff files
+    file_tree_state: ListState,      // Selection state for file tree
+    selected_file_diff_path: Option<String>, // Currently selected file when viewing a single-file diff
+    filtered_diff_cache: Option<String>, // Current single-file diff content (if selected from tree)
+    filtered_diff_lines: Vec<DiffLine>,  // Parsed line info for current single-file diff
     pub comments_cache: Option<Vec<Comment>>,
     pub review_comments_cache: Option<Vec<ReviewComment>>,
     pub checks_cache: Option<Vec<gh::CheckStatus>>,
@@ -437,6 +550,14 @@ impl App {
             use_delta: true, // Use delta by default if available
             diff_lines: Vec::new(),
             delta_line_info: Vec::new(),
+            diff_tree_enabled: false,
+            delta_too_large: false,
+            file_diff_sections: Vec::new(),
+            file_tree_items: Vec::new(),
+            file_tree_state: ListState::default(),
+            selected_file_diff_path: None,
+            filtered_diff_cache: None,
+            filtered_diff_lines: Vec::new(),
             comments_cache: None,
             review_comments_cache: None,
             checks_cache: None,
@@ -483,6 +604,146 @@ impl App {
 
     pub fn selected_pr(&self) -> Option<&PullRequest> {
         self.list_state.selected().and_then(|i| self.prs.get(i))
+    }
+
+    fn reset_large_diff_state(&mut self) {
+        self.diff_tree_enabled = false;
+        self.delta_too_large = false;
+        self.file_diff_sections.clear();
+        self.file_tree_items.clear();
+        self.file_tree_state = ListState::default();
+        self.selected_file_diff_path = None;
+        self.filtered_diff_cache = None;
+        self.filtered_diff_lines.clear();
+    }
+
+    fn large_diff_file_selector_enabled(&self) -> bool {
+        self.detail_tab == DetailTab::Diff
+            && self.diff_tree_enabled
+            && !self.file_tree_items.is_empty()
+    }
+
+    fn showing_large_diff_tree(&self) -> bool {
+        self.large_diff_file_selector_enabled() && self.selected_file_diff_path.is_none()
+    }
+
+    fn showing_single_file_diff(&self) -> bool {
+        self.large_diff_file_selector_enabled() && self.selected_file_diff_path.is_some()
+    }
+
+    fn active_diff_content(&self) -> Option<&str> {
+        self.filtered_diff_cache
+            .as_deref()
+            .or(self.diff_cache.as_deref())
+    }
+
+    fn active_diff_lines(&self) -> &[DiffLine] {
+        if self.filtered_diff_cache.is_some() {
+            &self.filtered_diff_lines
+        } else {
+            &self.diff_lines
+        }
+    }
+
+    fn toggle_diff_tree(&mut self) {
+        if self.detail_tab != DetailTab::Diff {
+            return;
+        }
+
+        if self.file_tree_items.is_empty() {
+            self.set_status("No files found in diff".to_string());
+            return;
+        }
+
+        if self.diff_tree_enabled {
+            self.diff_tree_enabled = false;
+            self.back_to_large_diff_tree();
+            self.needs_clear = true;
+            self.set_status("File tree hidden".to_string());
+        } else {
+            self.diff_tree_enabled = true;
+            self.back_to_large_diff_tree();
+            self.select_first_file_tree_file();
+            self.scroll_offset = 0;
+            self.clear_search();
+            self.needs_clear = true;
+            self.set_status("File tree shown".to_string());
+        }
+    }
+
+    fn select_first_file_tree_file(&mut self) {
+        let idx = self
+            .file_tree_items
+            .iter()
+            .position(|item| item.file_path.is_some());
+        self.file_tree_state.select(idx);
+    }
+
+    fn move_file_tree_selection(&mut self, forward: bool) {
+        if self.file_tree_items.is_empty() {
+            return;
+        }
+
+        let len = self.file_tree_items.len();
+        let current = self.file_tree_state.selected().unwrap_or(0).min(len - 1);
+        let mut idx = current;
+
+        for _ in 0..len {
+            idx = if forward {
+                (idx + 1) % len
+            } else {
+                (idx + len - 1) % len
+            };
+            if self.file_tree_items[idx].file_path.is_some() {
+                self.file_tree_state.select(Some(idx));
+                break;
+            }
+        }
+    }
+
+    fn open_selected_file_diff(&mut self) {
+        if !self.showing_large_diff_tree() {
+            return;
+        }
+
+        let Some(selected_idx) = self.file_tree_state.selected() else {
+            return;
+        };
+        let Some(item) = self.file_tree_items.get(selected_idx) else {
+            return;
+        };
+        let Some(path) = item.file_path.clone() else {
+            return;
+        };
+
+        if let Some(section_diff) = self
+            .file_diff_sections
+            .iter()
+            .find(|section| section.path == path)
+            .map(|section| section.diff.clone())
+        {
+            self.selected_file_diff_path = Some(path);
+            self.filtered_diff_lines = parse_diff(&section_diff);
+            self.filtered_diff_cache = Some(section_diff);
+            self.scroll_offset = 0;
+            self.clear_search();
+            self.needs_clear = true;
+        } else {
+            self.set_status(format!("Unable to load diff for {}", path));
+        }
+    }
+
+    fn back_to_large_diff_tree(&mut self) {
+        if self.selected_file_diff_path.is_none() {
+            return;
+        }
+
+        self.selected_file_diff_path = None;
+        self.filtered_diff_cache = None;
+        self.filtered_diff_lines.clear();
+        self.scroll_offset = 0;
+        self.clear_search();
+        self.needs_clear = true;
     }
 
     fn next(&mut self) {
@@ -558,6 +819,7 @@ impl App {
             self.delta_cache = None;
             self.diff_lines.clear();
             self.delta_line_info.clear();
+            self.reset_large_diff_state();
             self.comments_cache = None;
             self.review_comments_cache = None;
             self.checks_cache = None;
@@ -578,6 +840,7 @@ impl App {
         self.delta_cache = None;
         self.diff_lines.clear();
         self.delta_line_info.clear();
+        self.reset_large_diff_state();
         self.comments_cache = None;
         self.review_comments_cache = None;
         self.checks_cache = None;
@@ -651,9 +914,10 @@ impl App {
                 let width = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(120);
                 thread::spawn(move || {
                     let diff = gh::get_pr_diff(&pr).unwrap_or_else(|e| e.to_string());
+                    let delta_too_large = diff::is_too_large_for_delta(&diff);
                     // Process with delta in background
                     let delta_output = diff::process_with_delta(&diff, width);
-                    let _ = tx.send(AsyncResult::Diff(idx, diff, delta_output));
+                    let _ = tx.send(AsyncResult::Diff(idx, diff, delta_output, delta_too_large));
                 });
             }
         }
@@ -715,7 +979,7 @@ impl App {
         while let Ok(result) = self.async_rx.try_recv() {
             has_updates = true;
             match result {
-                AsyncResult::Diff(idx, diff, delta_output) => {
+                AsyncResult::Diff(idx, diff, delta_output, delta_too_large) => {
                     // Only update if still viewing the same PR
                     if self.list_state.selected() == Some(idx) {
                         self.diff_lines = parse_diff(&diff);
@@ -724,6 +988,17 @@ impl App {
                             self.delta_line_info = parse_delta_output(delta, &diff);
                         } else {
                             self.delta_line_info.clear();
+                        }
+                        let keep_tree_enabled = self.diff_tree_enabled;
+                        self.reset_large_diff_state();
+                        self.delta_too_large = delta_too_large;
+                        self.file_diff_sections = parse_diff_file_sections(&diff);
+                        self.file_tree_items = build_diff_tree_items(&self.file_diff_sections);
+                        if delta_too_large
+                            || (keep_tree_enabled && !self.file_tree_items.is_empty())
+                        {
+                            self.diff_tree_enabled = true;
+                            self.select_first_file_tree_file();
                         }
                         self.diff_cache = Some(diff);
                         self.delta_cache = delta_output;
@@ -799,7 +1074,13 @@ impl App {
             return;
         }
 
-        let using_delta = self.use_delta && self.delta_cache.is_some();
+        if self.showing_large_diff_tree() {
+            self.set_status("Select a file first (Enter) to comment on a line".to_string());
+            return;
+        }
+
+        let using_delta =
+            self.use_delta && self.delta_cache.is_some() && self.filtered_diff_cache.is_none();
         let line_idx = self.scroll_offset as usize;
 
         if using_delta {
@@ -836,7 +1117,8 @@ impl App {
         }
 
         // Built-in mode: direct index lookup
-        if let Some(diff_line) = self.diff_lines.get(line_idx) {
+        let active_lines = self.active_diff_lines();
+        if let Some(diff_line) = active_lines.get(line_idx) {
             if let Some(file_path) = &diff_line.file_path {
                 // For added/context lines, use new file line number (RIGHT side)
                 if let Some(line_num) = diff_line.line_number {
@@ -1190,6 +1472,7 @@ impl App {
             return;
         }
         self.use_delta = !self.use_delta;
+        self.back_to_large_diff_tree();
         let status = if self.use_delta {
             "Using delta renderer"
         } else {
@@ -1272,28 +1555,62 @@ impl App {
                 _ => {}
             },
             View::Detail => match code {
-                KeyCode::Char('q') | KeyCode::Esc => self.exit_detail(),
+                KeyCode::Char('q') => self.exit_detail(),
+                KeyCode::Esc => {
+                    if self.showing_single_file_diff() {
+                        self.back_to_large_diff_tree();
+                    } else {
+                        self.exit_detail();
+                    }
+                }
                 KeyCode::Tab => self.next_tab(),
                 KeyCode::BackTab => self.prev_tab(),
                 // Page navigation with Ctrl+d/u
                 KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => self.page_down(),
                 KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => self.page_up(),
                 // Regular navigation
-                KeyCode::Char('j') | KeyCode::Down => self.scroll_down(),
-                KeyCode::Char('k') | KeyCode::Up => self.scroll_up(),
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if self.showing_large_diff_tree() {
+                        self.move_file_tree_selection(true);
+                    } else {
+                        self.scroll_down();
+                    }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    if self.showing_large_diff_tree() {
+                        self.move_file_tree_selection(false);
+                    } else {
+                        self.scroll_up();
+                    }
+                }
                 KeyCode::PageDown => self.page_down(),
                 KeyCode::PageUp => self.page_up(),
+                KeyCode::Enter if self.showing_large_diff_tree() => self.open_selected_file_diff(),
                 KeyCode::Char('c') => self.start_line_comment(),
                 KeyCode::Char('a') => self.start_approve(),
                 KeyCode::Char('x') => self.start_close(),
                 KeyCode::Char('m') => self.start_merge(),
                 KeyCode::Char('r') => self.launch_ai_review(),
                 // Search (only in Diff tab)
-                KeyCode::Char('/') if self.detail_tab == DetailTab::Diff => self.start_search(),
+                KeyCode::Char('/') if self.detail_tab == DetailTab::Diff => {
+                    if self.showing_large_diff_tree() {
+                        self.set_status(
+                            "Select a file first (Enter) to search within diff".to_string(),
+                        );
+                    } else {
+                        self.start_search();
+                    }
+                }
                 KeyCode::Char('n') if !self.search_query.is_empty() => self.next_search_match(),
                 KeyCode::Char('N') if !self.search_query.is_empty() => self.prev_search_match(),
                 // Goto line (only in Diff tab)
-                KeyCode::Char(':') if self.detail_tab == DetailTab::Diff => self.start_goto_line(),
+                KeyCode::Char(':') if self.detail_tab == DetailTab::Diff => {
+                    if self.showing_large_diff_tree() {
+                        self.set_status("Select a file first (Enter) to jump to lines".to_string());
+                    } else {
+                        self.start_goto_line();
+                    }
+                }
                 // Next/prev PR (when not searching)
                 KeyCode::Char('n') if self.search_query.is_empty() => {
                     self.exit_detail();
@@ -1306,6 +1623,7 @@ impl App {
                     self.enter_detail();
                 }
                 // Toggle delta rendering (only in Diff tab)
+                KeyCode::Char('t') if self.detail_tab == DetailTab::Diff => self.toggle_diff_tree(),
                 KeyCode::Char('D') if self.detail_tab == DetailTab::Diff => self.toggle_delta(),
                 KeyCode::Char('o') => self.open_in_browser(),
                 KeyCode::Char('y') => self.copy_pr_url(),
@@ -1446,7 +1764,11 @@ impl App {
         self.search_match_idx = 0;
 
         // Search in displayed content (delta output if available, otherwise raw diff)
-        let search_content = self.delta_cache.as_ref().or(self.diff_cache.as_ref());
+        let search_content = self
+            .filtered_diff_cache
+            .as_ref()
+            .or(self.delta_cache.as_ref())
+            .or(self.diff_cache.as_ref());
         if let Some(content) = search_content {
             let query_lower = self.search_query.to_lowercase();
             for (idx, line) in content.lines().enumerate() {
@@ -1582,7 +1904,7 @@ impl App {
         if let Ok(line_num) = self.input_buffer.parse::<u16>() {
             // Find the diff line that corresponds to this line number
             if let Some(idx) = self
-                .diff_lines
+                .active_diff_lines()
                 .iter()
                 .position(|dl| dl.line_number.map(|n| n as u16) == Some(line_num))
             {
@@ -1830,12 +2152,26 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
 
     // Build diff title with current line info
     let diff_title = {
-        let using_delta = app.use_delta && app.delta_cache.is_some();
+        let using_delta =
+            app.use_delta && app.delta_cache.is_some() && app.filtered_diff_cache.is_none();
         let renderer = if using_delta { "delta" } else { "built-in" };
         let line_idx = app.scroll_offset as usize;
-        // Only show line info when using built-in renderer (line indices match)
-        if !using_delta {
-            if let Some(dl) = app.diff_lines.get(line_idx) {
+        if app.showing_large_diff_tree() {
+            if app.delta_too_large {
+                format!(
+                    " Diff ({}) - file tree (large fallback, Enter to open, t to hide) ",
+                    renderer
+                )
+            } else {
+                format!(
+                    " Diff ({}) - file tree (Enter to open, t to hide) ",
+                    renderer
+                )
+            }
+        } else if let Some(file_path) = app.selected_file_diff_path.as_deref() {
+            format!(" Diff ({}) - {} [Esc: tree] ", renderer, file_path)
+        } else if !using_delta {
+            if let Some(dl) = app.active_diff_lines().get(line_idx) {
                 if let Some(file) = &dl.file_path {
                     let line_info = match (dl.line_number, dl.old_line_number) {
                         (Some(new), _) => format!(":{}", new),
@@ -1844,13 +2180,13 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
                     };
                     format!(" Diff ({}) - {}{} ", renderer, file, line_info)
                 } else {
-                    format!(" Diff ({}) [D to toggle] ", renderer)
+                    format!(" Diff ({}) [D to toggle, t: tree] ", renderer)
                 }
             } else {
-                format!(" Diff ({}) [D to toggle] ", renderer)
+                format!(" Diff ({}) [D to toggle, t: tree] ", renderer)
             }
         } else {
-            format!(" Diff ({}) [D to toggle] ", renderer)
+            format!(" Diff ({}) [D to toggle, t: tree] ", renderer)
         }
     };
     let content_block = Block::default()
@@ -1878,47 +2214,76 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
             if app.diff_cache.is_none() && !app.loading_diff {
                 app.load_diff();
             }
-            let mut lines: Vec<Line> = if app.loading_diff {
-                vec![Line::raw("Loading diff...")]
-            } else if app.use_delta {
-                if let Some(delta_output) = app.delta_cache.as_deref() {
-                    // Use pre-processed delta output
-                    diff::render_from_ansi(delta_output)
-                } else if let Some(diff_content) = app.diff_cache.as_deref() {
-                    // Delta not available, fallback to built-in
+            if app.showing_large_diff_tree() {
+                let items: Vec<ListItem> = app
+                    .file_tree_items
+                    .iter()
+                    .map(|item| {
+                        let style = if item.file_path.is_some() {
+                            Style::default().fg(Color::White)
+                        } else {
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::BOLD)
+                        };
+                        ListItem::new(Line::styled(item.label.clone(), style))
+                    })
+                    .collect();
+                let tree_list = List::new(items)
+                    .block(content_block)
+                    .highlight_style(
+                        Style::default()
+                            .bg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .highlight_symbol("▶ ");
+                frame.render_stateful_widget(tree_list, chunks[2], &mut app.file_tree_state);
+            } else {
+                let mut lines: Vec<Line> = if app.loading_diff {
+                    vec![Line::raw("Loading diff...")]
+                } else if let Some(diff_content) = app.filtered_diff_cache.as_deref() {
+                    // Single-file mode from tree view always uses built-in renderer
+                    diff::render_diff(diff_content, &app.syntax_highlighter)
+                } else if app.use_delta {
+                    if let Some(delta_output) = app.delta_cache.as_deref() {
+                        // Use pre-processed delta output
+                        diff::render_from_ansi(delta_output)
+                    } else if let Some(diff_content) = app.active_diff_content() {
+                        // Delta not available, fallback to built-in
+                        diff::render_diff(diff_content, &app.syntax_highlighter)
+                    } else {
+                        vec![Line::raw("Loading diff...")]
+                    }
+                } else if let Some(diff_content) = app.active_diff_content() {
+                    // Built-in rendering (delta disabled)
                     diff::render_diff(diff_content, &app.syntax_highlighter)
                 } else {
                     vec![Line::raw("Loading diff...")]
+                };
+
+                // Add margin prefix to all lines, with indicator on focused line
+                let focus_idx = app.scroll_offset as usize;
+                for (idx, line) in lines.iter_mut().enumerate() {
+                    let old_line = std::mem::take(line);
+                    let prefix = if idx == focus_idx {
+                        Span::styled("▶ ", Style::default().fg(Color::Yellow).bold())
+                    } else {
+                        Span::raw("  ")
+                    };
+                    let mut new_spans = vec![prefix];
+                    new_spans.extend(old_line.spans);
+                    *line = if idx == focus_idx {
+                        Line::from(new_spans).style(Style::default().bg(Color::DarkGray))
+                    } else {
+                        Line::from(new_spans)
+                    };
                 }
-            } else if let Some(diff_content) = app.diff_cache.as_deref() {
-                // Built-in rendering (delta disabled)
-                diff::render_diff(diff_content, &app.syntax_highlighter)
-            } else {
-                vec![Line::raw("Loading diff...")]
-            };
 
-            // Add margin prefix to all lines, with indicator on focused line
-            let focus_idx = app.scroll_offset as usize;
-            for (idx, line) in lines.iter_mut().enumerate() {
-                let old_line = std::mem::take(line);
-                let prefix = if idx == focus_idx {
-                    Span::styled("▶ ", Style::default().fg(Color::Yellow).bold())
-                } else {
-                    Span::raw("  ")
-                };
-                let mut new_spans = vec![prefix];
-                new_spans.extend(old_line.spans);
-                *line = if idx == focus_idx {
-                    Line::from(new_spans).style(Style::default().bg(Color::DarkGray))
-                } else {
-                    Line::from(new_spans)
-                };
+                let para = Paragraph::new(lines)
+                    .block(content_block)
+                    .scroll((app.scroll_offset, 0));
+                frame.render_widget(para, chunks[2]);
             }
-
-            let para = Paragraph::new(lines)
-                .block(content_block)
-                .scroll((app.scroll_offset, 0));
-            frame.render_widget(para, chunks[2]);
         }
         DetailTab::Comments => {
             if app.comments_cache.is_none() && !app.loading_comments {
@@ -2068,15 +2433,32 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
     }
 
     // Help - context-aware based on tab and mode
-    let help_text = match (app.detail_tab, app.mode) {
-        (DetailTab::Diff, AppMode::MyPrs) => {
-            " j/k: scroll | /: search | D: delta | m: merge | o: browser | y: copy | q: back"
+    let help_text = if app.detail_tab == DetailTab::Diff && app.showing_large_diff_tree() {
+        " j/k: navigate files | Enter: open file diff | t: hide tree | D: delta | o: browser | y: copy | q: back"
+    } else if app.detail_tab == DetailTab::Diff && app.showing_single_file_diff() {
+        match app.mode {
+            AppMode::MyPrs => {
+                " j/k: scroll | Esc: file tree | t: full diff | /: search | D: delta | m: merge | o: browser | y: copy | q: back"
+            }
+            AppMode::Review => {
+                " j/k: scroll | Esc: file tree | t: full diff | /: search | c: comment | D: delta | a: approve | o: browser | y: copy | q: back"
+            }
         }
-        (DetailTab::Diff, AppMode::Review) => {
-            " j/k: scroll | /: search | c: comment | D: delta | a: approve | o: browser | y: copy | q: back"
+    } else {
+        match (app.detail_tab, app.mode) {
+            (DetailTab::Diff, AppMode::MyPrs) => {
+                " j/k: scroll | /: search | t: tree | D: delta | m: merge | o: browser | y: copy | q: back"
+            }
+            (DetailTab::Diff, AppMode::Review) => {
+                " j/k: scroll | /: search | t: tree | c: comment | D: delta | a: approve | o: browser | y: copy | q: back"
+            }
+            (_, AppMode::MyPrs) => {
+                " Tab: tabs | j/k: scroll | m: merge | o: browser | y: copy | q: back"
+            }
+            (_, AppMode::Review) => {
+                " Tab: tabs | j/k: scroll | a: approve | o: browser | y: copy | q: back"
+            }
         }
-        (_, AppMode::MyPrs) => " Tab: tabs | j/k: scroll | m: merge | o: browser | y: copy | q: back",
-        (_, AppMode::Review) => " Tab: tabs | j/k: scroll | a: approve | o: browser | y: copy | q: back",
     };
     let help = Paragraph::new(help_text)
         .style(Style::default().fg(Color::DarkGray))
@@ -2809,6 +3191,58 @@ diff --git a/file2.rs b/file2.rs
         for line in &result {
             assert_eq!(line.file_path.as_deref(), Some("path/to/file.rs"));
         }
+    }
+
+    #[test]
+    fn test_parse_diff_file_sections() {
+        let diff = r#"diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1 +1 @@
+-old
++new
+diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1 +1 @@
+-hello
++hello world"#;
+
+        let sections = parse_diff_file_sections(diff);
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].path, "src/main.rs");
+        assert!(sections[0].diff.contains("@@ -1 +1 @@"));
+        assert_eq!(sections[1].path, "README.md");
+        assert!(sections[1].diff.contains("+hello world"));
+    }
+
+    #[test]
+    fn test_build_diff_tree_items_hierarchy() {
+        let sections = vec![
+            FileDiffSection {
+                path: "src/lib.rs".to_string(),
+                diff: String::new(),
+            },
+            FileDiffSection {
+                path: "src/utils/math.rs".to_string(),
+                diff: String::new(),
+            },
+            FileDiffSection {
+                path: "README.md".to_string(),
+                diff: String::new(),
+            },
+        ];
+
+        let items = build_diff_tree_items(&sections);
+        let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+
+        assert_eq!(
+            labels,
+            vec!["src/", "  utils/", "    math.rs", "  lib.rs", "README.md"]
+        );
+        assert_eq!(items[2].file_path.as_deref(), Some("src/utils/math.rs"));
+        assert_eq!(items[3].file_path.as_deref(), Some("src/lib.rs"));
+        assert_eq!(items[4].file_path.as_deref(), Some("README.md"));
     }
 
     // ==================== Tests for search index helpers ====================

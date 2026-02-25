@@ -11,14 +11,12 @@ How do you keep up with AI generated PRs? Answer: use AI assisted code reviews.
 
 ## Installation
 
-Homebrew (macOS):
 ```bash
+# Homebrew (macOS)
 brew tap daulet/tap
 brew install reviewer
-```
 
-From source:
-```bash
+# From source
 cargo install --git https://github.com/daulet/reviewer
 ```
 
@@ -213,7 +211,7 @@ Daemon state is stored separately in:
 }
 ```
 
-AoE launch example:
+[AoE](https://github.com/njbrake/agent-of-empires) launch example:
 
 ```json
 {

@@ -15,8 +15,11 @@ pub struct AiConfig {
     pub args: Vec<String>,
     pub skill: Option<String>,
     pub prompt_template: Option<String>,
+    pub launcher: Option<String>,
     pub terminal_app: Option<String>,
     pub terminal_launch_mode: Option<String>,
+    pub aoe_profile: Option<String>,
+    pub aoe_group: Option<String>,
 }
 
 impl AiConfig {
@@ -46,6 +49,15 @@ impl AiConfig {
         self.skill
             .clone()
             .unwrap_or_else(|| "code-review".to_string())
+    }
+
+    pub fn launcher_key(&self) -> String {
+        self.launcher
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("terminal")
+            .to_ascii_lowercase()
     }
 }
 

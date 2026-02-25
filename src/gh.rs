@@ -1025,6 +1025,123 @@ fn build_windows_command(command: &str, args: &[String], prompt: &str) -> String
     parts.join(" ")
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn command_error_message(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return stderr;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !stdout.is_empty() {
+        return stdout;
+    }
+    format!("exit status {}", output.status)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn aoe_double_quote_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '$' => escaped.push_str("\\$"),
+            '`' => escaped.push_str("\\`"),
+            '\n' | '\r' => escaped.push(' '),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn escape_for_single_quoted_shell(value: &str) -> String {
+    value.replace('\'', "'\"'\"'")
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn build_aoe_unix_command(command: &str, args: &[String], prompt: &str) -> String {
+    let mut parts = Vec::with_capacity(args.len() + 2);
+    parts.push(format!("\"{}\"", aoe_double_quote_escape(command)));
+    for arg in args {
+        parts.push(format!("\"{}\"", aoe_double_quote_escape(arg)));
+    }
+    parts.push(format!("\"{}\"", aoe_double_quote_escape(prompt)));
+    escape_for_single_quoted_shell(&parts.join(" "))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn aoe_session_title(pr: &PullRequest) -> String {
+    let repo = pr.repo_name.replace('/', "-");
+    format!(
+        "review-{}-pr-{}-{}",
+        repo,
+        pr.number,
+        Utc::now().timestamp_millis()
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn launch_in_aoe(
+    working_dir: &std::path::Path,
+    pr: &PullRequest,
+    ai: &AiConfig,
+    command: &str,
+    prompt: &str,
+) -> Result<()> {
+    let aoe_cmd = build_aoe_unix_command(command, &ai.args, prompt);
+    let session_title = aoe_session_title(pr);
+    let profile = ai
+        .aoe_profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let group = ai
+        .aoe_group
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let mut add_cmd = Command::new("aoe");
+    if let Some(profile) = profile {
+        add_cmd.args(["--profile", profile]);
+    }
+    add_cmd
+        .arg("add")
+        .arg("--title")
+        .arg(&session_title)
+        .arg("--cmd")
+        .arg(&aoe_cmd);
+    if let Some(group) = group {
+        add_cmd.arg("--group").arg(group);
+    }
+    add_cmd.arg(working_dir);
+
+    let add_output = add_cmd
+        .output()
+        .context("Failed to run aoe. Is `aoe` installed?")?;
+    if !add_output.status.success() {
+        anyhow::bail!("aoe add failed: {}", command_error_message(&add_output));
+    }
+
+    let mut start_cmd = Command::new("aoe");
+    if let Some(profile) = profile {
+        start_cmd.args(["--profile", profile]);
+    }
+    let start_output = start_cmd
+        .args(["session", "start", &session_title])
+        .output()
+        .context("Failed to run aoe session start")?;
+    if !start_output.status.success() {
+        anyhow::bail!(
+            "aoe session start failed: {}",
+            command_error_message(&start_output)
+        );
+    }
+
+    Ok(())
+}
+
 fn render_prompt(
     template: &str,
     pr: &PullRequest,
@@ -1071,6 +1188,26 @@ pub fn launch_ai(working_dir: &std::path::Path, pr: &PullRequest, ai: &AiConfig)
         .as_deref()
         .map(|template| render_prompt(template, pr, &review_guide, &skill_invocation))
         .unwrap_or(default_prompt);
+
+    let launcher = ai.launcher_key();
+    if launcher == "aoe" {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            launch_in_aoe(working_dir, pr, ai, &command, &prompt)?;
+            return Ok(());
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            anyhow::bail!("ai.launcher='aoe' is not supported on Windows");
+        }
+    }
+    if launcher != "terminal" {
+        anyhow::bail!(
+            "Invalid ai.launcher '{}'. Expected 'terminal' or 'aoe'",
+            launcher
+        );
+    }
 
     #[cfg(target_os = "macos")]
     {
@@ -1148,4 +1285,46 @@ pub fn launch_ai(working_dir: &std::path::Path, pr: &PullRequest, ai: &AiConfig)
     }
 
     Ok(())
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod tests {
+    use super::build_aoe_unix_command;
+    use std::process::Command;
+
+    #[test]
+    fn build_aoe_unix_command_handles_single_quotes() {
+        let cmd = build_aoe_unix_command("printf", &[String::from("%s")], "it's \"working\"");
+        let wrapped = format!("bash -c ':; exec {}'", cmd);
+
+        let output = Command::new("sh")
+            .args(["-c", &wrapped])
+            .output()
+            .expect("command should execute");
+
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "it's \"working\"");
+    }
+
+    #[test]
+    fn build_aoe_unix_command_escapes_dollar_expansion() {
+        let cmd = build_aoe_unix_command("printf", &[String::from("%s")], "$HOME");
+        let wrapped = format!("bash -c ':; exec {}'", cmd);
+
+        let output = Command::new("sh")
+            .args(["-c", &wrapped])
+            .output()
+            .expect("command should execute");
+
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "$HOME");
+    }
 }

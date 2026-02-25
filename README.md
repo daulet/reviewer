@@ -35,6 +35,7 @@ cargo install --git https://github.com/daulet/reviewer
 | [delta](https://github.com/dandavison/delta) | Enhanced diff rendering (side-by-side, syntax highlighting) | `brew install git-delta` |
 | [Codex CLI](https://github.com/openai/codex) | AI-assisted code reviews (OpenAI) | `npm install -g @openai/codex` |
 | [Claude Code](https://github.com/anthropics/claude-code) | AI-assisted code reviews | `npm install -g @anthropic-ai/claude-code` |
+| [Agent of Empires](https://github.com/njbrake/agent-of-empires) | Start review sessions in AoE instead of opening a terminal app | `brew install aoe` |
 
 The diff tries to use `delta` if installed. Choice of code reviewer tool can be configured in `~/.config/reviewer/config.json`.
 
@@ -173,7 +174,10 @@ Config is stored at:
 
 AI settings are optional. `prompt_template` supports `{pr_number}`, `{repo}`, `{title}`,
 `{review_guide}`, and `{skill}` placeholders.
+`launcher` controls where reviews start: `terminal` (default) or `aoe`.
+When `launcher` is `aoe`, optional `aoe_profile` and `aoe_group` are passed to AoE.
 On macOS/Linux, `terminal_app` lets you pick which terminal launches AI reviews (default: Terminal on macOS).
+`terminal_app` and `terminal_launch_mode` are used only when `launcher` is `terminal`.
 On macOS, optional `terminal_launch_mode` values are:
 - `auto`, `new-instance`, `same-space`, `new-tab`, `new-window`
 Note: Ghostty `same-space`/`new-tab` use `System Events` keystroke automation and may require macOS Accessibility/Automation permissions.
@@ -201,8 +205,23 @@ Daemon state is stored separately in:
     "args": [],
     "skill": "code-review",
     "prompt_template": "Review PR #{pr_number} in {repo}. Title: \"{title}\". Use {skill}. Follow {review_guide}",
+    "launcher": "terminal",
     "terminal_app": "Ghostty",
     "terminal_launch_mode": "new-tab"
+  }
+}
+```
+
+AoE launch example:
+
+```json
+{
+  "ai": {
+    "provider": "codex",
+    "command": "codex",
+    "launcher": "aoe",
+    "aoe_profile": "default",
+    "aoe_group": "reviews"
   }
 }
 ```

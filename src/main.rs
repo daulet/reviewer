@@ -18,10 +18,21 @@ use std::path::{Path, PathBuf};
 #[command(name = "reviewer")]
 #[command(
     version = env!("REVIEWER_VERSION_STRING"),
+    disable_version_flag = true,
     about,
     long_about = None
 )]
 struct Args {
+    /// Print version
+    #[arg(
+        short = 'v',
+        short_alias = 'V',
+        long = "version",
+        action = clap::ArgAction::Version,
+        global = true
+    )]
+    version: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 

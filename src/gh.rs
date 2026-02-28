@@ -1187,6 +1187,8 @@ fn launch_in_maestro(
         .arg(working_dir)
         .arg("--title")
         .arg(format!("review {}#{}", pr.repo_name, pr.number))
+        .arg("--tag")
+        .arg("review")
         .arg("--prompt")
         .arg(prompt);
 

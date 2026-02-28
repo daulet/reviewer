@@ -28,7 +28,7 @@ struct Args {
         short = 'v',
         short_alias = 'V',
         long = "version",
-        action = clap::ArgAction::Version,
+        action = clap::ArgAction::SetTrue,
         global = true
     )]
     version: bool,
@@ -319,6 +319,10 @@ fn run_daemon_command(
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    if args.version {
+        println!("{}", env!("REVIEWER_VERSION_STRING"));
+        return Ok(());
+    }
 
     let mut cfg = config::load_config()?;
     let effective_exclude = merge_excludes(&cfg.exclude, &args.exclude);
@@ -346,5 +350,17 @@ fn main() -> Result<()> {
                 &effective_exclude,
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Args;
+    use clap::Parser;
+
+    #[test]
+    fn daemon_run_parses_without_version_flag() {
+        let parsed = Args::try_parse_from(["reviewer", "daemon", "run", "--interval", "300"]);
+        assert!(parsed.is_ok());
     }
 }

@@ -1071,6 +1071,36 @@ fn build_aoe_unix_command(command: &str, args: &[String], prompt: &str) -> Strin
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+fn build_maestro_custom_command(command: &str, args: &[String]) -> String {
+    let mut parts = Vec::with_capacity(args.len() + 1);
+    parts.push(unix_shell_escape(command));
+    for arg in args {
+        parts.push(unix_shell_escape(arg));
+    }
+    parts.join(" ")
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn maestro_builtin_tool(ai: &AiConfig) -> Option<&'static str> {
+    if !ai.args.is_empty() {
+        return None;
+    }
+    if ai
+        .command
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+    {
+        return None;
+    }
+    match ai.provider_key() {
+        "codex" => Some("codex"),
+        "claude" => Some("claude"),
+        _ => None,
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn aoe_session_title(pr: &PullRequest) -> String {
     let repo = pr.repo_name.replace('/', "-");
     format!(
@@ -1142,6 +1172,45 @@ fn launch_in_aoe(
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn launch_in_maestro(
+    working_dir: &std::path::Path,
+    pr: &PullRequest,
+    ai: &AiConfig,
+    command: &str,
+    prompt: &str,
+) -> Result<()> {
+    let mut launch_cmd = Command::new("maestro");
+    launch_cmd
+        .arg("start")
+        .arg("--cwd")
+        .arg(working_dir)
+        .arg("--title")
+        .arg(format!("review {}#{}", pr.repo_name, pr.number))
+        .arg("--prompt")
+        .arg(prompt);
+
+    if let Some(tool) = maestro_builtin_tool(ai) {
+        launch_cmd.arg("--tool").arg(tool);
+    } else {
+        let custom_cmd = build_maestro_custom_command(command, &ai.args);
+        launch_cmd
+            .arg("--tool")
+            .arg("custom")
+            .arg("--cmd")
+            .arg(custom_cmd);
+    }
+
+    let output = launch_cmd
+        .output()
+        .context("Failed to run maestro. Is `maestro` installed?")?;
+    if !output.status.success() {
+        anyhow::bail!("maestro start failed: {}", command_error_message(&output));
+    }
+
+    Ok(())
+}
+
 fn render_prompt(
     template: &str,
     pr: &PullRequest,
@@ -1190,6 +1259,18 @@ pub fn launch_ai(working_dir: &std::path::Path, pr: &PullRequest, ai: &AiConfig)
         .unwrap_or(default_prompt);
 
     let launcher = ai.launcher_key();
+    if launcher == "maestro" {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            launch_in_maestro(working_dir, pr, ai, &command, &prompt)?;
+            return Ok(());
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            anyhow::bail!("ai.launcher='maestro' is not supported on Windows");
+        }
+    }
     if launcher == "aoe" {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
@@ -1204,7 +1285,7 @@ pub fn launch_ai(working_dir: &std::path::Path, pr: &PullRequest, ai: &AiConfig)
     }
     if launcher != "terminal" {
         anyhow::bail!(
-            "Invalid ai.launcher '{}'. Expected 'terminal' or 'aoe'",
+            "Invalid ai.launcher '{}'. Expected 'terminal', 'maestro', or 'aoe'",
             launcher
         );
     }
@@ -1289,7 +1370,8 @@ pub fn launch_ai(working_dir: &std::path::Path, pr: &PullRequest, ai: &AiConfig)
 
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
-    use super::build_aoe_unix_command;
+    use super::{build_aoe_unix_command, maestro_builtin_tool};
+    use crate::config::AiConfig;
     use std::process::Command;
 
     #[test]
@@ -1326,5 +1408,31 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(String::from_utf8_lossy(&output.stdout), "$HOME");
+    }
+
+    #[test]
+    fn maestro_builtin_tool_uses_provider_default_when_no_override_or_args() {
+        let ai = AiConfig {
+            provider: Some("codex".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(maestro_builtin_tool(&ai), Some("codex"));
+    }
+
+    #[test]
+    fn maestro_builtin_tool_disables_builtin_mode_when_command_or_args_present() {
+        let ai_with_args = AiConfig {
+            provider: Some("claude".to_string()),
+            args: vec!["--model".to_string(), "sonnet".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(maestro_builtin_tool(&ai_with_args), None);
+
+        let ai_with_command = AiConfig {
+            provider: Some("claude".to_string()),
+            command: Some("claude-nightly".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(maestro_builtin_tool(&ai_with_command), None);
     }
 }

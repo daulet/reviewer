@@ -367,6 +367,33 @@ pub fn poll_once(cfg: &Config, repos_root: &Path, username: &str) -> Result<Poll
         if let Some(existing) = state.prs.get_mut(&key) {
             existing.last_seen_at = now;
             existing.latest_updated_at = pr.updated_at;
+
+            if existing.trigger_status != TriggerStatus::Failed {
+                continue;
+            }
+
+            println!(
+                "Retrying failed review trigger for {}#{}",
+                pr.repo_name, pr.number
+            );
+            match trigger_review(&pr, repos_root, &cfg.ai) {
+                Ok(()) => {
+                    existing.triggered_at = Some(Utc::now());
+                    existing.trigger_status = TriggerStatus::Success;
+                    existing.last_error = None;
+                    triggered += 1;
+                    println!("Triggered review for {}#{}", pr.repo_name, pr.number);
+                }
+                Err(err) => {
+                    existing.trigger_status = TriggerStatus::Failed;
+                    existing.last_error = Some(format!("{:#}", err));
+                    failed += 1;
+                    eprintln!(
+                        "Failed to retry review trigger for {}#{}: {:#}",
+                        pr.repo_name, pr.number, err
+                    );
+                }
+            }
             continue;
         }
 
@@ -386,10 +413,10 @@ pub fn poll_once(cfg: &Config, repos_root: &Path, username: &str) -> Result<Poll
             }
             Err(err) => {
                 record.trigger_status = TriggerStatus::Failed;
-                record.last_error = Some(err.to_string());
+                record.last_error = Some(format!("{:#}", err));
                 failed += 1;
                 eprintln!(
-                    "Failed to trigger review for {}#{}: {}",
+                    "Failed to trigger review for {}#{}: {:#}",
                     pr.repo_name, pr.number, err
                 );
             }

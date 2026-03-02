@@ -1222,7 +1222,7 @@ impl App {
                         gh::launch_ai(&worktree_path, &pr, &ai)?;
                         Ok(worktree_path.display().to_string())
                     })
-                    .map_err(|e| e.to_string());
+                    .map_err(|e| format!("{:#}", e));
                 let _ = tx.send(AsyncResult::AiLaunch(result));
             });
         }

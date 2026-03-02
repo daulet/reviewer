@@ -176,7 +176,8 @@ Unknown fields are rejected on startup (for example, config key typos).
 AI settings are optional. `prompt_template` supports `{pr_number}`, `{repo}`, `{title}`,
 `{review_guide}`, and `{skill}` placeholders.
 `launcher` controls where reviews start: `terminal` (default), `maestro`, or `aoe`.
-When `launcher` is `maestro`, reviewer runs `maestro start` with repo/PR title, prompt, and the selected tool.
+When `launcher` is `maestro`, reviewer runs `maestro start` with a `review` tag and `--auto-approve`,
+and passes the review prompt as a CLI argument to the selected AI command (`--tool custom --cmd ...`).
 When `launcher` is `aoe`, optional `aoe_profile` and `aoe_group` are passed to AoE.
 On macOS/Linux, `terminal_app` lets you pick which terminal launches AI reviews (default: Terminal on macOS).
 `terminal_app` and `terminal_launch_mode` are used only when `launcher` is `terminal`.

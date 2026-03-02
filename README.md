@@ -33,6 +33,7 @@ cargo install --git https://github.com/daulet/reviewer
 | [delta](https://github.com/dandavison/delta) | Enhanced diff rendering (side-by-side, syntax highlighting) | `brew install git-delta` |
 | [Codex CLI](https://github.com/openai/codex) | AI-assisted code reviews (OpenAI) | `npm install -g @openai/codex` |
 | [Claude Code](https://github.com/anthropics/claude-code) | AI-assisted code reviews | `npm install -g @anthropic-ai/claude-code` |
+| [Maestro](https://github.com/daulet/maestro) | Launch review sessions in managed tmux sessions | `brew install daulet/tap/maestro` |
 | [Agent of Empires](https://github.com/njbrake/agent-of-empires) | Start review sessions in AoE instead of opening a terminal app | `brew install aoe` |
 
 The diff tries to use `delta` if installed. Choice of code reviewer tool can be configured in `~/.config/reviewer/config.json`.
@@ -152,6 +153,7 @@ Daemon notes:
   Use `j/k` (or arrows) to move, `Enter` to expand/collapse, and `Space` to mark paths.
 - Existing open PRs are seeded as already seen during init, so only newly opened PRs trigger.
 - PR updates do not retrigger review; tracking is persisted in `~/.config/reviewer/daemon_state.json`.
+- Failed launches are retried on subsequent polls until they succeed.
 - Optional `daemon.repo_subpath_filters` lets you restrict a repo to PRs touching specific subpaths.
   Omit a repo (or set an empty list) to monitor all PRs in that repo.
 
@@ -173,7 +175,8 @@ Unknown fields are rejected on startup (for example, config key typos).
 
 AI settings are optional. `prompt_template` supports `{pr_number}`, `{repo}`, `{title}`,
 `{review_guide}`, and `{skill}` placeholders.
-`launcher` controls where reviews start: `terminal` (default) or `aoe`.
+`launcher` controls where reviews start: `terminal` (default), `maestro`, or `aoe`.
+When `launcher` is `maestro`, reviewer runs `maestro start` with repo/PR title, prompt, and the selected tool.
 When `launcher` is `aoe`, optional `aoe_profile` and `aoe_group` are passed to AoE.
 On macOS/Linux, `terminal_app` lets you pick which terminal launches AI reviews (default: Terminal on macOS).
 `terminal_app` and `terminal_launch_mode` are used only when `launcher` is `terminal`.

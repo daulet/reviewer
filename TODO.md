@@ -2,6 +2,7 @@
 
 ## Features
 
+- [ ] move launch specific args to config instead of hardcoding them in code, eg review tag for maestro
 - [ ] add a summary in the session, eg not what changed but intent, and if complex, make arch explanation
 - [ ] disallow posting PR comments (not inline), via perms or stricter skill
 - [ ]  add a link to PR?

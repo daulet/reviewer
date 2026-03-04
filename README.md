@@ -34,7 +34,6 @@ cargo install --git https://github.com/daulet/reviewer
 | [Codex CLI](https://github.com/openai/codex) | AI-assisted code reviews (OpenAI) | `npm install -g @openai/codex` |
 | [Claude Code](https://github.com/anthropics/claude-code) | AI-assisted code reviews | `npm install -g @anthropic-ai/claude-code` |
 | [Maestro](https://github.com/daulet/maestro) | Launch review sessions in managed tmux sessions | `brew install daulet/tap/maestro` |
-| [Agent of Empires](https://github.com/njbrake/agent-of-empires) | Start review sessions in AoE instead of opening a terminal app | `brew install aoe` |
 
 The diff tries to use `delta` if installed. Choice of code reviewer tool can be configured in `~/.config/reviewer/config.json`.
 
@@ -175,15 +174,16 @@ Unknown fields are rejected on startup (for example, config key typos).
 
 AI settings are optional. `prompt_template` supports `{pr_number}`, `{repo}`, `{title}`,
 `{review_guide}`, and `{skill}` placeholders.
-`launcher` controls where reviews start: `terminal` (default), `maestro`, or `aoe`.
-When `launcher` is `maestro`, reviewer runs `maestro start` with a `review` tag and `--auto-approve`,
-and passes the review prompt as a CLI argument to the selected AI command (`--tool custom --cmd ...`).
-When `launcher` is `aoe`, optional `aoe_profile` and `aoe_group` are passed to AoE.
-On macOS/Linux, `terminal_app` lets you pick which terminal launches AI reviews (default: Terminal on macOS).
-`terminal_app` and `terminal_launch_mode` are used only when `launcher` is `terminal`.
-On macOS, optional `terminal_launch_mode` values are:
-- `auto`, `new-instance`, `same-space`, `new-tab`, `new-window`
-Note: Ghostty `same-space`/`new-tab` use `System Events` keystroke automation and may require macOS Accessibility/Automation permissions.
+Review launching is configured via `ai.launch.steps`, an ordered list of commands.
+Each step runs with the PR worktree as cwd. Common placeholders:
+- `{workdir}`, `{workdir_shell}`
+- `{repo}`, `{repo_slug}`, `{pr_number}`, `{title}`
+- `{prompt}`, `{review_guide}`
+- `{tool}` (AI CLI binary), `{tool_command}` (shell-escaped full invocation with prompt)
+- `{session_title}`, `{timestamp_ms}`
+- `{provider}`, `{skill_name}`, `{skill_invocation}`
+
+Reviewer no longer has built-in launcher presets; define launcher behavior in config.
 Daemon state is stored separately in:
 - macOS/Linux: `~/.config/reviewer/daemon_state.json`
 - Windows: `%APPDATA%\reviewer\daemon_state.json`
@@ -208,23 +208,102 @@ Daemon state is stored separately in:
     "args": [],
     "skill": "code-review",
     "prompt_template": "Review PR #{pr_number} in {repo}. Title: \"{title}\". Use {skill}. Follow {review_guide}",
-    "launcher": "terminal",
-    "terminal_app": "Ghostty",
-    "terminal_launch_mode": "new-tab"
+    "launch": {
+      "steps": [
+        {
+          "command": "maestro",
+          "args": [
+            "start",
+            "--cwd",
+            "{workdir}",
+            "--title",
+            "review {repo}#{pr_number}",
+            "--tag",
+            "review",
+            "--auto-approve",
+            "--tool",
+            "custom",
+            "--cmd",
+            "{tool_command}"
+          ]
+        }
+      ]
+    }
   }
 }
 ```
 
-[AoE](https://github.com/njbrake/agent-of-empires) launch example:
+Terminal.app (macOS, new window) launch example:
 
 ```json
 {
   "ai": {
     "provider": "codex",
     "command": "codex",
-    "launcher": "aoe",
-    "aoe_profile": "default",
-    "aoe_group": "reviews"
+    "launch": {
+      "steps": [
+        {
+          "command": "osascript",
+          "args": [
+            "-e",
+            "tell application \"Terminal\" to activate",
+            "-e",
+            "tell application \"Terminal\" to do script \"cd {workdir_shell} && exec {tool_command}\""
+          ]
+        }
+      ]
+    }
+  }
+}
+```
+
+Ghostty (macOS, new instance) launch example:
+
+```json
+{
+  "ai": {
+    "provider": "codex",
+    "command": "codex",
+    "launch": {
+      "steps": [
+        {
+          "command": "open",
+          "args": [
+            "-na",
+            "Ghostty",
+            "--args",
+            "-e",
+            "bash",
+            "-lc",
+            "cd {workdir_shell} && exec {tool_command}"
+          ]
+        }
+      ]
+    }
+  }
+}
+```
+
+Linux terminal launch example (`gnome-terminal`):
+
+```json
+{
+  "ai": {
+    "provider": "codex",
+    "command": "codex",
+    "launch": {
+      "steps": [
+        {
+          "command": "gnome-terminal",
+          "args": [
+            "--",
+            "bash",
+            "-lc",
+            "cd {workdir_shell} && {tool_command}; exec bash"
+          ]
+        }
+      ]
+    }
   }
 }
 ```

@@ -5,9 +5,6 @@ use serde::Deserialize;
 use std::path::PathBuf;
 use std::process::Command;
 
-#[cfg(target_os = "macos")]
-use crate::terminal::{launch_macos_terminal, parse_terminal_launch_mode, TerminalLaunchMode};
-
 #[derive(Debug, Deserialize)]
 struct RepoInfo {
     #[serde(rename = "nameWithOwner")]
@@ -1026,6 +1023,15 @@ fn build_windows_command(command: &str, args: &[String], prompt: &str) -> String
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+fn build_shell_command(command: &str, args: &[String], prompt: &str) -> String {
+    build_unix_command(command, args, prompt)
+}
+
+#[cfg(target_os = "windows")]
+fn build_shell_command(command: &str, args: &[String], prompt: &str) -> String {
+    build_windows_command(command, args, prompt)
+}
+
 fn command_error_message(output: &std::process::Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if !stderr.is_empty() {
@@ -1038,45 +1044,7 @@ fn command_error_message(output: &std::process::Output) -> String {
     format!("exit status {}", output.status)
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn aoe_double_quote_escape(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for ch in value.chars() {
-        match ch {
-            '\\' => escaped.push_str("\\\\"),
-            '"' => escaped.push_str("\\\""),
-            '$' => escaped.push_str("\\$"),
-            '`' => escaped.push_str("\\`"),
-            '\n' | '\r' => escaped.push(' '),
-            _ => escaped.push(ch),
-        }
-    }
-    escaped
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn escape_for_single_quoted_shell(value: &str) -> String {
-    value.replace('\'', "'\"'\"'")
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn build_aoe_unix_command(command: &str, args: &[String], prompt: &str) -> String {
-    let mut parts = Vec::with_capacity(args.len() + 2);
-    parts.push(format!("\"{}\"", aoe_double_quote_escape(command)));
-    for arg in args {
-        parts.push(format!("\"{}\"", aoe_double_quote_escape(arg)));
-    }
-    parts.push(format!("\"{}\"", aoe_double_quote_escape(prompt)));
-    escape_for_single_quoted_shell(&parts.join(" "))
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn build_maestro_custom_command(command: &str, args: &[String], prompt: &str) -> String {
-    build_unix_command(command, args, prompt)
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn aoe_session_title(pr: &PullRequest) -> String {
+fn launch_session_title(pr: &PullRequest) -> String {
     let repo = pr.repo_name.replace('/', "-");
     format!(
         "review-{}-pr-{}-{}",
@@ -1086,96 +1054,124 @@ fn aoe_session_title(pr: &PullRequest) -> String {
     )
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn launch_in_aoe(
+struct LaunchTemplateValues {
+    provider: String,
+    repo: String,
+    repo_slug: String,
+    pr_number: String,
+    title: String,
+    prompt: String,
+    review_guide: String,
+    skill_name: String,
+    skill_invocation: String,
+    tool: String,
+    tool_command: String,
+    workdir: String,
+    workdir_shell: String,
+    session_title: String,
+    timestamp_ms: String,
+}
+
+struct LaunchContext<'a> {
+    working_dir: &'a std::path::Path,
+    tool: &'a str,
+    tool_args: &'a [String],
+    prompt: &'a str,
+    review_guide: &'a std::path::Path,
+    pr: &'a PullRequest,
+    provider: &'a str,
+    skill_name: &'a str,
+    skill_invocation: &'a str,
+}
+
+impl LaunchTemplateValues {
+    fn from_context(context: LaunchContext<'_>) -> Self {
+        let workdir = context.working_dir.display().to_string();
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let workdir_shell = unix_shell_escape(&workdir);
+        #[cfg(target_os = "windows")]
+        let workdir_shell = windows_cmd_escape(&workdir);
+
+        Self {
+            provider: context.provider.to_string(),
+            repo: context.pr.repo_name.clone(),
+            repo_slug: context.pr.repo_name.replace('/', "-"),
+            pr_number: context.pr.number.to_string(),
+            title: context.pr.title.clone(),
+            prompt: context.prompt.to_string(),
+            review_guide: context.review_guide.display().to_string(),
+            skill_name: context.skill_name.to_string(),
+            skill_invocation: context.skill_invocation.to_string(),
+            tool: context.tool.to_string(),
+            tool_command: build_shell_command(context.tool, context.tool_args, context.prompt),
+            workdir,
+            workdir_shell,
+            session_title: launch_session_title(context.pr),
+            timestamp_ms: Utc::now().timestamp_millis().to_string(),
+        }
+    }
+}
+
+fn render_launch_template(template: &str, values: &LaunchTemplateValues) -> String {
+    let mut rendered = template.to_string();
+    for (key, value) in [
+        ("{skill_name}", values.skill_name.as_str()),
+        ("{skill_invocation}", values.skill_invocation.as_str()),
+        ("{session_title}", values.session_title.as_str()),
+        ("{timestamp_ms}", values.timestamp_ms.as_str()),
+        ("{workdir_shell}", values.workdir_shell.as_str()),
+        ("{tool_command}", values.tool_command.as_str()),
+        ("{provider}", values.provider.as_str()),
+        ("{repo_slug}", values.repo_slug.as_str()),
+        ("{repo}", values.repo.as_str()),
+        ("{pr_number}", values.pr_number.as_str()),
+        ("{title}", values.title.as_str()),
+        ("{prompt}", values.prompt.as_str()),
+        ("{review_guide}", values.review_guide.as_str()),
+        ("{tool}", values.tool.as_str()),
+        ("{workdir}", values.workdir.as_str()),
+    ] {
+        rendered = rendered.replace(key, value);
+    }
+    rendered
+}
+
+fn launch_with_steps(
     working_dir: &std::path::Path,
-    pr: &PullRequest,
     ai: &AiConfig,
-    command: &str,
-    prompt: &str,
+    values: &LaunchTemplateValues,
 ) -> Result<()> {
-    let aoe_cmd = build_aoe_unix_command(command, &ai.args, prompt);
-    let session_title = aoe_session_title(pr);
-    let profile = ai
-        .aoe_profile
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let group = ai
-        .aoe_group
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-
-    let mut add_cmd = Command::new("aoe");
-    if let Some(profile) = profile {
-        add_cmd.args(["--profile", profile]);
-    }
-    add_cmd
-        .arg("add")
-        .arg("--title")
-        .arg(&session_title)
-        .arg("--cmd")
-        .arg(&aoe_cmd);
-    if let Some(group) = group {
-        add_cmd.arg("--group").arg(group);
-    }
-    add_cmd.arg(working_dir);
-
-    let add_output = add_cmd
-        .output()
-        .context("Failed to run aoe. Is `aoe` installed?")?;
-    if !add_output.status.success() {
-        anyhow::bail!("aoe add failed: {}", command_error_message(&add_output));
-    }
-
-    let mut start_cmd = Command::new("aoe");
-    if let Some(profile) = profile {
-        start_cmd.args(["--profile", profile]);
-    }
-    let start_output = start_cmd
-        .args(["session", "start", &session_title])
-        .output()
-        .context("Failed to run aoe session start")?;
-    if !start_output.status.success() {
+    if ai.launch.steps.is_empty() {
         anyhow::bail!(
-            "aoe session start failed: {}",
-            command_error_message(&start_output)
+            "ai.launch.steps is empty. Configure launcher commands in ~/.config/reviewer/config.json"
         );
     }
 
-    Ok(())
-}
+    let total = ai.launch.steps.len();
+    for (idx, step) in ai.launch.steps.iter().enumerate() {
+        let step_number = idx + 1;
+        let command = render_launch_template(&step.command, values);
+        let command = command.trim();
+        if command.is_empty() {
+            anyhow::bail!("ai.launch.steps[{idx}] command is empty after template rendering");
+        }
+        let args: Vec<String> = step
+            .args
+            .iter()
+            .map(|arg| render_launch_template(arg, values))
+            .collect();
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn launch_in_maestro(
-    working_dir: &std::path::Path,
-    pr: &PullRequest,
-    ai: &AiConfig,
-    command: &str,
-    prompt: &str,
-) -> Result<()> {
-    let mut launch_cmd = Command::new("maestro");
-    let custom_cmd = build_maestro_custom_command(command, &ai.args, prompt);
-    launch_cmd
-        .arg("start")
-        .arg("--cwd")
-        .arg(working_dir)
-        .arg("--title")
-        .arg(format!("review {}#{}", pr.repo_name, pr.number))
-        .arg("--tag")
-        .arg("review")
-        .arg("--auto-approve")
-        .arg("--tool")
-        .arg("custom")
-        .arg("--cmd")
-        .arg(custom_cmd);
-
-    let output = launch_cmd
-        .output()
-        .context("Failed to run maestro. Is `maestro` installed?")?;
-    if !output.status.success() {
-        anyhow::bail!("maestro start failed: {}", command_error_message(&output));
+        let output = Command::new(command)
+            .args(&args)
+            .current_dir(working_dir)
+            .output()
+            .with_context(|| format!("Failed to run ai.launch step {step_number}/{total}"))?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "ai.launch step {step_number}/{total} failed ({command}): {}",
+                command_error_message(&output)
+            );
+        }
     }
 
     Ok(())
@@ -1198,7 +1194,7 @@ fn render_prompt(
 /// Launch a code review assistant CLI in a directory with a review prompt
 pub fn launch_ai(working_dir: &std::path::Path, pr: &PullRequest, ai: &AiConfig) -> Result<()> {
     let provider = ai.provider_key();
-    let command = ai.command_name();
+    let tool = ai.command_name();
 
     // Get platform-appropriate config directory for review guide reference
     let config_dir = config::config_dir();
@@ -1228,176 +1224,34 @@ pub fn launch_ai(working_dir: &std::path::Path, pr: &PullRequest, ai: &AiConfig)
         .map(|template| render_prompt(template, pr, &review_guide, &skill_invocation))
         .unwrap_or(default_prompt);
 
-    let launcher = ai.launcher_key();
-    if launcher == "maestro" {
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        {
-            launch_in_maestro(working_dir, pr, ai, &command, &prompt)?;
-            return Ok(());
-        }
-
-        #[cfg(target_os = "windows")]
-        {
-            anyhow::bail!("ai.launcher='maestro' is not supported on Windows");
-        }
-    }
-    if launcher == "aoe" {
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        {
-            launch_in_aoe(working_dir, pr, ai, &command, &prompt)?;
-            return Ok(());
-        }
-
-        #[cfg(target_os = "windows")]
-        {
-            anyhow::bail!("ai.launcher='aoe' is not supported on Windows");
-        }
-    }
-    if launcher != "terminal" {
-        anyhow::bail!(
-            "Invalid ai.launcher '{}'. Expected 'terminal', 'maestro', or 'aoe'",
-            launcher
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let workdir = unix_shell_escape(&working_dir.display().to_string());
-        let cmd = build_unix_command(&command, &ai.args, &prompt);
-        let command_line = format!("cd {} && {}", workdir, cmd);
-
-        let terminal_app = ai
-            .terminal_app
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("Terminal");
-        let launch_mode = ai
-            .terminal_launch_mode
-            .as_deref()
-            .map(parse_terminal_launch_mode)
-            .transpose()?
-            .unwrap_or(TerminalLaunchMode::Auto);
-
-        launch_macos_terminal(terminal_app, &command_line, launch_mode)?;
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let workdir = unix_shell_escape(&working_dir.display().to_string());
-        let cmd = build_unix_command(&command, &ai.args, &prompt);
-        let command_line = format!("cd {} && {}", workdir, cmd);
-        let terminal_override = ai
-            .terminal_app
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-        let mut terminals = Vec::new();
-        if let Some(term) = terminal_override {
-            terminals.push(term);
-        }
-        terminals.extend(["gnome-terminal", "konsole", "xterm"]);
-        let mut launched = false;
-        for term in terminals {
-            let result = match term {
-                "gnome-terminal" => Command::new(term)
-                    .args(["--", "bash", "-c", &format!("{}; exec bash", command_line)])
-                    .spawn(),
-                "konsole" => Command::new(term)
-                    .args(["-e", "bash", "-c", &format!("{}; exec bash", command_line)])
-                    .spawn(),
-                _ => Command::new(term)
-                    .args(["-e", "bash", "-lc", &command_line])
-                    .spawn(),
-            };
-            if result.is_ok() {
-                launched = true;
-                break;
-            }
-        }
-        if !launched {
-            anyhow::bail!("Could not find a terminal emulator");
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let display_name = ai.display_name();
-        let workdir = windows_cmd_escape(&working_dir.display().to_string());
-        let cmd = build_windows_command(&command, &ai.args, &prompt);
-        let command_line = format!("cd /d {} && {}", workdir, cmd);
-        Command::new("cmd")
-            .args(["/C", "start", "cmd", "/K", &command_line])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .with_context(|| format!("Failed to launch {}", display_name))?;
-    }
-
-    Ok(())
+    let values = LaunchTemplateValues::from_context(LaunchContext {
+        working_dir,
+        tool: &tool,
+        tool_args: &ai.args,
+        prompt: &prompt,
+        review_guide: &review_guide,
+        pr,
+        provider,
+        skill_name: &skill_name,
+        skill_invocation: &skill_invocation,
+    });
+    launch_with_steps(working_dir, ai, &values)
 }
 
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
-    use super::{build_aoe_unix_command, build_maestro_custom_command};
+    use super::{
+        build_shell_command, launch_with_steps, render_launch_template, LaunchContext,
+        LaunchTemplateValues, PullRequest,
+    };
+    use crate::config::AiConfig;
+    use chrono::Utc;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
 
     #[test]
-    fn build_aoe_unix_command_handles_single_quotes() {
-        let cmd = build_aoe_unix_command("printf", &[String::from("%s")], "it's \"working\"");
-        let wrapped = format!("bash -c ':; exec {}'", cmd);
-
-        let output = Command::new("sh")
-            .args(["-c", &wrapped])
-            .output()
-            .expect("command should execute");
-
-        assert!(
-            output.status.success(),
-            "stderr: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(String::from_utf8_lossy(&output.stdout), "it's \"working\"");
-    }
-
-    #[test]
-    fn build_aoe_unix_command_escapes_dollar_expansion() {
-        let cmd = build_aoe_unix_command("printf", &[String::from("%s")], "$HOME");
-        let wrapped = format!("bash -c ':; exec {}'", cmd);
-
-        let output = Command::new("sh")
-            .args(["-c", &wrapped])
-            .output()
-            .expect("command should execute");
-
-        assert!(
-            output.status.success(),
-            "stderr: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(String::from_utf8_lossy(&output.stdout), "$HOME");
-    }
-
-    #[test]
-    fn build_maestro_custom_command_passes_prompt_as_argument() {
-        let cmd = build_maestro_custom_command("printf", &[String::from("%s")], "hello world");
-        let output = Command::new("sh")
-            .args(["-lc", &cmd])
-            .output()
-            .expect("command should execute");
-
-        assert!(
-            output.status.success(),
-            "stderr: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(String::from_utf8_lossy(&output.stdout), "hello world");
-    }
-
-    #[test]
-    fn build_maestro_custom_command_escapes_special_characters() {
-        let cmd = build_maestro_custom_command("printf", &[String::from("%s")], "it's $HOME");
+    fn build_shell_command_escapes_special_characters() {
+        let cmd = build_shell_command("printf", &[String::from("%s")], "it's $HOME");
         let output = Command::new("sh")
             .args(["-lc", &cmd])
             .output()
@@ -1409,5 +1263,67 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(String::from_utf8_lossy(&output.stdout), "it's $HOME");
+    }
+
+    fn make_test_pr(number: u64, title: &str, repo: &str) -> PullRequest {
+        PullRequest {
+            number,
+            title: title.to_string(),
+            author: "alice".to_string(),
+            body: String::new(),
+            repo_path: PathBuf::from("/tmp/repo"),
+            repo_name: repo.to_string(),
+            url: "https://example.com".to_string(),
+            updated_at: Utc::now(),
+            additions: 1,
+            deletions: 1,
+            is_draft: false,
+            review_state: super::ReviewState::Pending,
+        }
+    }
+
+    #[test]
+    fn render_launch_template_replaces_placeholders() {
+        let pr = make_test_pr(42, "Fix launch", "org/reviewer");
+        let values = LaunchTemplateValues::from_context(LaunchContext {
+            working_dir: Path::new("/tmp/repo"),
+            tool: "codex",
+            tool_args: &[],
+            prompt: "Review this",
+            review_guide: Path::new("/tmp/review_guide.md"),
+            pr: &pr,
+            provider: "codex",
+            skill_name: "code-review",
+            skill_invocation: "$code-review",
+        });
+        let rendered = render_launch_template(
+            "{repo}|{pr_number}|{tool}|{prompt}|{skill_invocation}|{session_title}",
+            &values,
+        );
+        assert!(rendered
+            .contains("org/reviewer|42|codex|Review this|$code-review|review-org-reviewer-pr-42-"));
+    }
+
+    #[test]
+    fn launch_with_steps_requires_non_empty_steps() {
+        let pr = make_test_pr(1, "Title", "org/reviewer");
+        let values = LaunchTemplateValues::from_context(LaunchContext {
+            working_dir: Path::new("/tmp/repo"),
+            tool: "codex",
+            tool_args: &[],
+            prompt: "Prompt",
+            review_guide: Path::new("/tmp/review_guide.md"),
+            pr: &pr,
+            provider: "codex",
+            skill_name: "code-review",
+            skill_invocation: "$code-review",
+        });
+        let err = launch_with_steps(Path::new("/tmp/repo"), &AiConfig::default(), &values)
+            .expect_err("expected launch config error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("ai.launch.steps is empty"),
+            "unexpected error: {msg}"
+        );
     }
 }

@@ -10,6 +10,21 @@ fn default_poll_interval_sec() -> u64 {
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
+pub struct AiLaunchStepConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct AiLaunchConfig {
+    #[serde(default)]
+    pub steps: Vec<AiLaunchStepConfig>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct AiConfig {
     pub provider: Option<String>,
     pub command: Option<String>,
@@ -17,11 +32,8 @@ pub struct AiConfig {
     pub args: Vec<String>,
     pub skill: Option<String>,
     pub prompt_template: Option<String>,
-    pub launcher: Option<String>,
-    pub terminal_app: Option<String>,
-    pub terminal_launch_mode: Option<String>,
-    pub aoe_profile: Option<String>,
-    pub aoe_group: Option<String>,
+    #[serde(default)]
+    pub launch: AiLaunchConfig,
 }
 
 impl AiConfig {
@@ -51,15 +63,6 @@ impl AiConfig {
         self.skill
             .clone()
             .unwrap_or_else(|| "code-review".to_string())
-    }
-
-    pub fn launcher_key(&self) -> String {
-        self.launcher
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("terminal")
-            .to_ascii_lowercase()
     }
 }
 
@@ -192,11 +195,7 @@ fn merge_with_existing_config(existing: Value, updated: Value) -> Value {
             "args",
             "skill",
             "prompt_template",
-            "launcher",
-            "terminal_app",
-            "terminal_launch_mode",
-            "aoe_profile",
-            "aoe_group",
+            "launch",
         ],
     );
 
@@ -329,11 +328,9 @@ mod tests {
             "args": [],
             "skill": null,
             "prompt_template": null,
-            "launcher": null,
-            "terminal_app": null,
-            "terminal_launch_mode": null,
-            "aoe_profile": null,
-            "aoe_group": null
+            "launch": {
+              "steps": []
+            }
           },
           "daemon": {
             "poll_interval_sec": 60,
@@ -378,11 +375,9 @@ mod tests {
             "args": [],
             "skill": null,
             "prompt_template": null,
-            "launcher": null,
-            "terminal_app": null,
-            "terminal_launch_mode": null,
-            "aoe_profile": null,
-            "aoe_group": null
+            "launch": {
+              "steps": []
+            }
           },
           "daemon": {
             "poll_interval_sec": 60,

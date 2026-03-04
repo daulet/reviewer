@@ -3,78 +3,286 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing git tag to release (for example: v0.5.1)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
 
 env:
   CARGO_TERM_COLOR: always
+  BINARY_NAME: reviewer
+  TAP_REPO: daulet/homebrew-tap
+  TAP_BRANCH: main
+  FORMULA_PATH: Formula/reviewer.rb
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
+  resolve_tag:
+    name: Resolve Tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - name: Resolve release tag
+        id: resolve
+        shell: bash
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+
+          if [[ "${TAG}" != v* ]]; then
+            echo "Tag must start with v (received: ${TAG})" >&2
+            exit 1
+          fi
+
+          VERSION="${TAG#v}"
+          if [[ -z "${VERSION}" ]]; then
+            echo "Could not infer version from tag ${TAG}" >&2
+            exit 1
+          fi
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+  verify:
+    name: Verify Release Candidate
+    needs: resolve_tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve_tag.outputs.tag }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Tests
+        run: cargo test --all-targets --locked
+
   build:
+    name: Build ${{ matrix.target }}
+    needs:
+      - resolve_tag
+      - verify
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            name: reviewer-x86_64-apple-darwin.tar.gz
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
             binary: reviewer
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            name: reviewer-aarch64-apple-darwin.tar.gz
+          - os: macos-14
+            target: aarch64-apple-darwin
             binary: reviewer
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            name: reviewer-x86_64-pc-windows-msvc.zip
+          - os: macos-14
+            target: x86_64-apple-darwin
+            binary: reviewer
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
             binary: reviewer.exe
-
     runs-on: ${{ matrix.os }}
-
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve_tag.outputs.tag }}
 
-      - name: Install Rust
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Package (Unix)
+      - name: Build release binary (Unix)
         if: runner.os != 'Windows'
-        run: |
-          cd target/${{ matrix.target }}/release
-          tar czvf ../../../${{ matrix.name }} ${{ matrix.binary }}
-          cd -
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --release --locked --target "${TARGET}"
 
-      - name: Package (Windows)
+      - name: Build release binary (Windows)
         if: runner.os == 'Windows'
-        run: |
-          cd target/${{ matrix.target }}/release
-          7z a ../../../${{ matrix.name }} ${{ matrix.binary }}
-          cd -
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --release --locked --target "$env:TARGET"
 
-      - name: Upload artifact
+      - name: Package archive and checksum (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          TARGET_BINARY: ${{ matrix.binary }}
+        run: |
+          mkdir -p dist
+          cp "target/${TARGET}/release/${TARGET_BINARY}" "dist/${BINARY_NAME}"
+          tar -C dist -czf "dist/${BINARY_NAME}-${TARGET}.tar.gz" "${BINARY_NAME}"
+          rm -f "dist/${BINARY_NAME}"
+
+          python3 - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+
+          target = os.environ["TARGET"]
+          binary = os.environ["BINARY_NAME"]
+          archive = Path("dist") / f"{binary}-{target}.tar.gz"
+          digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+          checksum_path = Path("dist") / f"checksums-{target}.txt"
+          checksum_path.write_text(f"{digest}  {archive.name}\n", encoding="utf-8")
+          PY
+
+      - name: Package archive and checksum (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+          TARGET_BINARY: ${{ matrix.binary }}
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target/$env:TARGET/release/$env:TARGET_BINARY" "dist/$env:TARGET_BINARY"
+          Compress-Archive -Path "dist/$env:TARGET_BINARY" -DestinationPath "dist/$env:BINARY_NAME-$env:TARGET.zip" -Force
+          Remove-Item "dist/$env:TARGET_BINARY"
+
+          $digest = (Get-FileHash -Path "dist/$env:BINARY_NAME-$env:TARGET.zip" -Algorithm SHA256).Hash.ToLower()
+          "$digest  $env:BINARY_NAME-$env:TARGET.zip" | Out-File -FilePath "dist/checksums-$env:TARGET.txt" -Encoding ascii
+
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.name }}
-          path: ${{ matrix.name }}
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
 
-  release:
-    needs: build
+  publish:
+    name: Publish GitHub Release
+    needs:
+      - resolve_tag
+      - build
     runs-on: ubuntu-latest
     permissions:
       contents: write
-
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Download artifacts
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          path: artifacts
+          pattern: release-*
+          merge-multiple: true
+          path: dist
 
-      - name: Create release
+      - name: Combine checksums
+        shell: bash
+        run: |
+          cat dist/checksums-*.txt | sort > dist/checksums.txt
+          ls -lh dist
+
+      - name: Create or update GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/**/*
+          tag_name: ${{ needs.resolve_tag.outputs.tag }}
+          name: ${{ needs.resolve_tag.outputs.tag }}
           generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/checksums.txt
+
+  update_homebrew:
+    name: Update Homebrew Tap
+    needs:
+      - resolve_tag
+      - publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require tap token
+        shell: bash
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [[ -z "${HOMEBREW_TAP_TOKEN}" ]]; then
+            echo "::error::HOMEBREW_TAP_TOKEN is required for release publishing."
+            exit 1
+          fi
+
+      - name: Checkout release repository
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      - name: Resolve macOS checksums
+        id: sha
+        shell: bash
+        run: |
+          cat dist/checksums-*.txt | sort > dist/checksums.txt
+
+          INTEL_SHA="$(awk '$2 ~ /reviewer-x86_64-apple-darwin\.tar\.gz$/ {print $1}' dist/checksums.txt | tail -n1)"
+          ARM_SHA="$(awk '$2 ~ /reviewer-aarch64-apple-darwin\.tar\.gz$/ {print $1}' dist/checksums.txt | tail -n1)"
+
+          if [[ -z "${INTEL_SHA}" || -z "${ARM_SHA}" ]]; then
+            echo "Failed to locate required macOS checksums in dist/checksums.txt" >&2
+            exit 1
+          fi
+
+          echo "intel_sha=${INTEL_SHA}" >> "$GITHUB_OUTPUT"
+          echo "arm_sha=${ARM_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout Homebrew tap
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TAP_REPO }}
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Render formula
+        shell: bash
+        run: |
+          python3 .github/scripts/update_homebrew_formula.py \
+            --formula "homebrew-tap/${FORMULA_PATH}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --tag "${{ needs.resolve_tag.outputs.tag }}" \
+            --version "${{ needs.resolve_tag.outputs.version }}" \
+            --binary "${BINARY_NAME}" \
+            --sha-intel "${{ steps.sha.outputs.intel_sha }}" \
+            --sha-arm "${{ steps.sha.outputs.arm_sha }}"
+
+      - name: Commit and push tap update
+        shell: bash
+        run: |
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if [[ -z "$(git status --porcelain -- "${FORMULA_PATH}")" ]]; then
+            echo "Formula already up to date."
+            exit 0
+          fi
+
+          git add "${FORMULA_PATH}"
+          git commit -m "reviewer ${{ needs.resolve_tag.outputs.version }}"
+          git push origin HEAD:"${TAP_BRANCH}"

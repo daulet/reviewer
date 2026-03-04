@@ -2,12 +2,6 @@
 
 ## Features
 
-- [ ] update the code review skill to pull latest changes before submitting - and check if still relevant
-- [ ] move launch specific args to config instead of hardcoding them in code, eg review tag for maestro
-- [ ] add a summary in the session, eg not what changed but intent, and if complex, make arch explanation
-- [ ] disallow posting PR comments (not inline), via perms or stricter skill
-- [ ]  add a link to PR?
-- [x] Open in default terminal, not "terminal"
 - [ ] Improve codex code review skill with interactive prompts like in claude 
 - [ ] Render description in markdown
 - [ ] Still not working: update skill to update skill when user chooses "skip" to enhance review for the next time

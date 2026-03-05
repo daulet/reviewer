@@ -153,6 +153,7 @@ Daemon notes:
 - Existing open PRs are seeded as already seen during init, so only newly opened PRs trigger.
 - PR updates do not retrigger review; tracking is persisted in `~/.config/reviewer/daemon_state.json`.
 - Failed launches are retried on subsequent polls until they succeed.
+- Long-running daemon processes auto-restart after binary upgrades (detected on poll boundaries).
 - Optional `daemon.repo_subpath_filters` lets you restrict a repo to PRs touching specific subpaths.
   Omit a repo (or set an empty list) to monitor all PRs in that repo.
 

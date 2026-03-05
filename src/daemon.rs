@@ -17,10 +17,13 @@ use ratatui::{Frame, Terminal};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
+use std::fs;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone)]
 struct RepoDescriptor {
@@ -89,8 +92,141 @@ pub struct RepoSubpathFilterStatus {
 type RepoSubpathFilterMap = HashMap<String, Vec<String>>;
 type RepoSelectionConfig = (Vec<String>, RepoSubpathFilterMap);
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BinaryFingerprint {
+    canonical_path: PathBuf,
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+#[derive(Debug)]
+struct DaemonAutoRestartWatcher {
+    restart_bin: PathBuf,
+    restart_args: Vec<OsString>,
+    fingerprint: BinaryFingerprint,
+}
+
+impl DaemonAutoRestartWatcher {
+    fn new() -> Result<Self> {
+        let restart_bin = resolve_restart_binary_path()?;
+        let restart_args = std::env::args_os().skip(1).collect();
+        Self::from_parts(restart_bin, restart_args)
+    }
+
+    fn from_parts(restart_bin: PathBuf, restart_args: Vec<OsString>) -> Result<Self> {
+        let fingerprint = binary_fingerprint(&restart_bin)?;
+        Ok(Self {
+            restart_bin,
+            restart_args,
+            fingerprint,
+        })
+    }
+
+    fn maybe_restart_for_updated_binary_with<F>(&mut self, restart_fn: F) -> Result<bool>
+    where
+        F: FnOnce(&Path, &[OsString]) -> Result<()>,
+    {
+        let current = binary_fingerprint(&self.restart_bin)?;
+        if current == self.fingerprint {
+            return Ok(false);
+        }
+        self.fingerprint = current;
+        restart_fn(&self.restart_bin, &self.restart_args)?;
+        Ok(true)
+    }
+
+    fn maybe_restart_for_updated_binary(&mut self) -> Result<bool> {
+        self.maybe_restart_for_updated_binary_with(restart_daemon_process)
+    }
+}
+
 pub fn state_path() -> PathBuf {
     config::config_dir().join("daemon_state.json")
+}
+
+fn resolve_restart_binary_path() -> Result<PathBuf> {
+    let arg0 = std::env::args_os()
+        .next()
+        .ok_or_else(|| anyhow!("Failed to resolve daemon restart path: argv[0] is missing"))?;
+    let arg0_path = PathBuf::from(&arg0);
+
+    if arg0_path.components().count() > 1 {
+        if arg0_path.is_absolute() {
+            return Ok(arg0_path);
+        }
+        return Ok(std::env::current_dir()?.join(arg0_path));
+    }
+
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join(&arg0_path);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+
+            #[cfg(target_os = "windows")]
+            {
+                let candidate_exe = candidate.with_extension("exe");
+                if candidate_exe.is_file() {
+                    return Ok(candidate_exe);
+                }
+            }
+        }
+    }
+
+    std::env::current_exe().context("Failed to resolve daemon restart path")
+}
+
+fn binary_fingerprint(path: &Path) -> Result<BinaryFingerprint> {
+    let metadata =
+        fs::metadata(path).with_context(|| format!("Failed to stat binary {}", path.display()))?;
+    let canonical_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let modified = metadata.modified().ok();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(BinaryFingerprint {
+            canonical_path,
+            len: metadata.len(),
+            modified,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(BinaryFingerprint {
+            canonical_path,
+            len: metadata.len(),
+            modified,
+        })
+    }
+}
+
+fn restart_daemon_process(executable: &Path, args: &[OsString]) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = Command::new(executable).args(args).exec();
+        Err(anyhow!(
+            "Failed to restart daemon with {}: {}",
+            executable.display(),
+            err
+        ))
+    }
+
+    #[cfg(not(unix))]
+    {
+        Command::new(executable)
+            .args(args)
+            .spawn()
+            .with_context(|| format!("Failed to spawn updated daemon {}", executable.display()))?;
+        std::process::exit(0);
+    }
 }
 
 fn load_state() -> DaemonState {
@@ -459,6 +595,17 @@ pub fn run(
         "Daemon running. Poll interval: {}s. Include drafts: {}. Repo subpath filters: {}.",
         poll_interval_sec, cfg.daemon.include_drafts, subpath_filter_count
     );
+    let mut auto_restart_watcher = if once {
+        None
+    } else {
+        match DaemonAutoRestartWatcher::new() {
+            Ok(watcher) => Some(watcher),
+            Err(err) => {
+                eprintln!("Daemon auto-restart disabled: {:#}", err);
+                None
+            }
+        }
+    };
 
     loop {
         let summary = poll_once(cfg, repos_root, username)?;
@@ -473,6 +620,17 @@ pub fn run(
 
         if once {
             break;
+        }
+
+        if let Some(watcher) = auto_restart_watcher.as_mut() {
+            match watcher.maybe_restart_for_updated_binary() {
+                Ok(false) => {}
+                Ok(true) => {}
+                Err(err) => eprintln!(
+                    "Failed to auto-restart daemon after binary update: {:#}",
+                    err
+                ),
+            }
         }
         thread::sleep(Duration::from_secs(poll_interval_sec));
     }
@@ -1195,6 +1353,26 @@ fn run_repo_selector(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static RESTART_HARNESS_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn restart_harness_temp_path() -> PathBuf {
+        let counter = RESTART_HARNESS_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "reviewer-daemon-restart-harness-{}-{}-{}",
+            std::process::id(),
+            nanos,
+            counter
+        ))
+    }
 
     #[test]
     fn normalize_subpaths_trims_and_dedups() {
@@ -1249,5 +1427,72 @@ mod tests {
         let normalized = normalize_repo_subpath_filters(&filters);
         assert_eq!(normalized.len(), 1);
         assert_eq!(normalized.get("org/repo"), Some(&vec!["src".to_string()]));
+    }
+
+    #[test]
+    fn daemon_restart_harness_skips_restart_when_binary_is_unchanged() {
+        let fake_bin = restart_harness_temp_path();
+        fs::write(&fake_bin, b"binary-v1").expect("should write fake binary");
+        let restart_args = vec![
+            OsString::from("daemon"),
+            OsString::from("run"),
+            OsString::from("--interval"),
+            OsString::from("120"),
+        ];
+        let mut watcher = DaemonAutoRestartWatcher::from_parts(fake_bin.clone(), restart_args)
+            .expect("should build watcher");
+
+        let mut restart_called = false;
+        let restarted = watcher
+            .maybe_restart_for_updated_binary_with(|_, _| {
+                restart_called = true;
+                Ok(())
+            })
+            .expect("watcher check should succeed");
+
+        assert!(!restarted);
+        assert!(!restart_called);
+        let _ = fs::remove_file(&fake_bin);
+    }
+
+    #[test]
+    fn daemon_restart_harness_forwards_params_on_binary_change() {
+        let fake_bin = restart_harness_temp_path();
+        fs::write(&fake_bin, b"binary-v1").expect("should write fake binary");
+        let restart_args = vec![
+            OsString::from("daemon"),
+            OsString::from("run"),
+            OsString::from("--interval"),
+            OsString::from("45"),
+            OsString::from("--root"),
+            OsString::from("/tmp/repos"),
+        ];
+        let mut watcher =
+            DaemonAutoRestartWatcher::from_parts(fake_bin.clone(), restart_args.clone())
+                .expect("should build watcher");
+
+        // Simulate upgraded binary content; file length change guarantees fingerprint change.
+        fs::write(&fake_bin, b"binary-v2-updated-content").expect("should update fake binary");
+
+        let mut captured_path: Option<PathBuf> = None;
+        let mut captured_args: Option<Vec<OsString>> = None;
+        let restarted = watcher
+            .maybe_restart_for_updated_binary_with(|path, args| {
+                captured_path = Some(path.to_path_buf());
+                captured_args = Some(args.to_vec());
+                Ok(())
+            })
+            .expect("watcher check should succeed");
+
+        assert!(restarted);
+        assert_eq!(captured_path.as_ref(), Some(&fake_bin));
+        assert_eq!(captured_args.as_ref(), Some(&restart_args));
+
+        let restarted_again = watcher
+            .maybe_restart_for_updated_binary_with(|_, _| Ok(()))
+            .expect("watcher check should succeed");
+        assert!(!restarted_again);
+
+        let _ = fs::remove_file(&fake_bin);
     }
 }

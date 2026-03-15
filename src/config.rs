@@ -21,6 +21,8 @@ pub struct AiLaunchStepConfig {
 pub struct AiLaunchConfig {
     #[serde(default)]
     pub steps: Vec<AiLaunchStepConfig>,
+    #[serde(default)]
+    pub self_review_steps: Vec<AiLaunchStepConfig>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
@@ -257,7 +259,7 @@ pub fn save_config(config: &Config) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{merge_with_existing_config, parse_config};
+    use super::{merge_with_existing_config, parse_config, Config};
     use serde_json::json;
 
     #[test]
@@ -393,5 +395,11 @@ mod tests {
         assert_eq!(merged["daemon"]["exclude_repos"], json!([]));
         assert_eq!(merged["daemon"]["repo_subpath_filters"], json!({}));
         assert_eq!(merged["daemon"]["future_daemon_field"], json!("keep"));
+    }
+
+    #[test]
+    fn ai_launch_self_review_steps_default_empty() {
+        let cfg = Config::default();
+        assert!(cfg.ai.launch.self_review_steps.is_empty());
     }
 }

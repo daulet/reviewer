@@ -31,6 +31,27 @@ struct RepoDescriptor {
     name: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewTriggerKind {
+    Review,
+    SelfReview,
+}
+
+impl ReviewTriggerKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Review => "review",
+            Self::SelfReview => "self-review",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DaemonReviewCandidate {
+    pr: PullRequest,
+    trigger_kind: ReviewTriggerKind,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TriggerStatus {
@@ -363,19 +384,35 @@ fn apply_repo_subpath_filter(
         .collect()
 }
 
+fn classify_trigger_kind(pr: &PullRequest, username: &str) -> Option<ReviewTriggerKind> {
+    if pr.author == username {
+        if pr.is_draft {
+            return None;
+        }
+        return Some(ReviewTriggerKind::SelfReview);
+    }
+    Some(ReviewTriggerKind::Review)
+}
+
 fn collect_open_prs(
     repos: &[RepoDescriptor],
     excluded_repos: &HashSet<String>,
     repo_subpath_filters: &RepoSubpathFilterMap,
     username: &str,
     include_drafts: bool,
-) -> Vec<PullRequest> {
+) -> Vec<DaemonReviewCandidate> {
     repos
         .par_iter()
         .filter(|repo| !excluded_repos.contains(&repo.name))
         .flat_map(|repo| {
-            let prs = gh::fetch_prs_for_repo(&repo.path, username, include_drafts);
+            let prs = gh::fetch_prs_for_repo_with_authored(&repo.path, username, include_drafts);
             apply_repo_subpath_filter(repo, prs, repo_subpath_filters)
+                .into_iter()
+                .filter_map(|pr| {
+                    classify_trigger_kind(&pr, username)
+                        .map(|trigger_kind| DaemonReviewCandidate { pr, trigger_kind })
+                })
+                .collect::<Vec<_>>()
         })
         .collect()
 }
@@ -393,17 +430,28 @@ fn build_seed_record(pr: &PullRequest, now: DateTime<Utc>) -> ReviewedPrRecord {
     }
 }
 
-fn trigger_review(pr: &PullRequest, repos_root: &Path, ai: &AiConfig) -> Result<()> {
+fn trigger_review(
+    pr: &PullRequest,
+    repos_root: &Path,
+    ai: &AiConfig,
+    trigger_kind: ReviewTriggerKind,
+) -> Result<()> {
+    let mut ai_for_launch = ai.clone();
+    if trigger_kind == ReviewTriggerKind::SelfReview && !ai.launch.self_review_steps.is_empty() {
+        ai_for_launch.launch.steps = ai.launch.self_review_steps.clone();
+    }
     let worktree_path = gh::create_pr_worktree(pr, repos_root).with_context(|| {
         format!(
             "Failed to create worktree for {}#{}",
             pr.repo_name, pr.number
         )
     })?;
-    gh::launch_ai(&worktree_path, pr, ai).with_context(|| {
+    gh::launch_ai(&worktree_path, pr, &ai_for_launch).with_context(|| {
         format!(
-            "Failed to launch AI review for {}#{}",
-            pr.repo_name, pr.number
+            "Failed to launch AI {} for {}#{}",
+            trigger_kind.label(),
+            pr.repo_name,
+            pr.number
         )
     })?;
     Ok(())
@@ -427,7 +475,8 @@ fn seed_existing_open_prs(
     let now = Utc::now();
     let mut seeded = 0usize;
 
-    for pr in prs {
+    for candidate in prs {
+        let pr = candidate.pr;
         let key = pr_key(&pr.repo_name, pr.number);
         if let Some(existing) = state.prs.get_mut(&key) {
             existing.last_seen_at = now;
@@ -498,7 +547,8 @@ pub fn poll_once(cfg: &Config, repos_root: &Path, username: &str) -> Result<Poll
     let mut triggered = 0usize;
     let mut failed = 0usize;
 
-    for pr in open_prs {
+    for candidate in open_prs {
+        let DaemonReviewCandidate { pr, trigger_kind } = candidate;
         let key = pr_key(&pr.repo_name, pr.number);
         if let Some(existing) = state.prs.get_mut(&key) {
             existing.last_seen_at = now;
@@ -509,24 +559,34 @@ pub fn poll_once(cfg: &Config, repos_root: &Path, username: &str) -> Result<Poll
             }
 
             println!(
-                "Retrying failed review trigger for {}#{}",
-                pr.repo_name, pr.number
+                "Retrying failed {} trigger for {}#{}",
+                trigger_kind.label(),
+                pr.repo_name,
+                pr.number
             );
-            match trigger_review(&pr, repos_root, &cfg.ai) {
+            match trigger_review(&pr, repos_root, &cfg.ai, trigger_kind) {
                 Ok(()) => {
                     existing.triggered_at = Some(Utc::now());
                     existing.trigger_status = TriggerStatus::Success;
                     existing.last_error = None;
                     triggered += 1;
-                    println!("Triggered review for {}#{}", pr.repo_name, pr.number);
+                    println!(
+                        "Triggered {} for {}#{}",
+                        trigger_kind.label(),
+                        pr.repo_name,
+                        pr.number
+                    );
                 }
                 Err(err) => {
                     existing.trigger_status = TriggerStatus::Failed;
                     existing.last_error = Some(format!("{:#}", err));
                     failed += 1;
                     eprintln!(
-                        "Failed to retry review trigger for {}#{}: {:#}",
-                        pr.repo_name, pr.number, err
+                        "Failed to retry {} trigger for {}#{}: {:#}",
+                        trigger_kind.label(),
+                        pr.repo_name,
+                        pr.number,
+                        err
                     );
                 }
             }
@@ -535,25 +595,36 @@ pub fn poll_once(cfg: &Config, repos_root: &Path, username: &str) -> Result<Poll
 
         new_prs += 1;
         println!(
-            "New PR detected: {}#{} - {}",
-            pr.repo_name, pr.number, pr.title
+            "New PR detected for {}: {}#{} - {}",
+            trigger_kind.label(),
+            pr.repo_name,
+            pr.number,
+            pr.title
         );
 
         let mut record = build_seed_record(&pr, now);
-        match trigger_review(&pr, repos_root, &cfg.ai) {
+        match trigger_review(&pr, repos_root, &cfg.ai, trigger_kind) {
             Ok(()) => {
                 record.triggered_at = Some(Utc::now());
                 record.trigger_status = TriggerStatus::Success;
                 triggered += 1;
-                println!("Triggered review for {}#{}", pr.repo_name, pr.number);
+                println!(
+                    "Triggered {} for {}#{}",
+                    trigger_kind.label(),
+                    pr.repo_name,
+                    pr.number
+                );
             }
             Err(err) => {
                 record.trigger_status = TriggerStatus::Failed;
                 record.last_error = Some(format!("{:#}", err));
                 failed += 1;
                 eprintln!(
-                    "Failed to trigger review for {}#{}: {:#}",
-                    pr.repo_name, pr.number, err
+                    "Failed to trigger {} for {}#{}: {:#}",
+                    trigger_kind.label(),
+                    pr.repo_name,
+                    pr.number,
+                    err
                 );
             }
         }
@@ -1353,6 +1424,8 @@ fn run_repo_selector(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gh::ReviewState;
+    use chrono::Utc;
     use std::ffi::OsString;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1372,6 +1445,23 @@ mod tests {
             nanos,
             counter
         ))
+    }
+
+    fn make_test_pr(author: &str, is_draft: bool) -> PullRequest {
+        PullRequest {
+            number: 42,
+            title: "Test PR".to_string(),
+            author: author.to_string(),
+            body: String::new(),
+            repo_path: PathBuf::from("/tmp/repo"),
+            repo_name: "org/reviewer".to_string(),
+            url: "https://example.com/pr/42".to_string(),
+            updated_at: Utc::now(),
+            additions: 1,
+            deletions: 1,
+            is_draft,
+            review_state: ReviewState::Pending,
+        }
     }
 
     #[test]
@@ -1427,6 +1517,30 @@ mod tests {
         let normalized = normalize_repo_subpath_filters(&filters);
         assert_eq!(normalized.len(), 1);
         assert_eq!(normalized.get("org/repo"), Some(&vec!["src".to_string()]));
+    }
+
+    #[test]
+    fn classify_trigger_kind_marks_other_authors_as_review() {
+        let pr = make_test_pr("alice", false);
+        assert_eq!(
+            classify_trigger_kind(&pr, "bob"),
+            Some(ReviewTriggerKind::Review)
+        );
+    }
+
+    #[test]
+    fn classify_trigger_kind_marks_authored_prs_as_self_review() {
+        let pr = make_test_pr("alice", false);
+        assert_eq!(
+            classify_trigger_kind(&pr, "alice"),
+            Some(ReviewTriggerKind::SelfReview)
+        );
+    }
+
+    #[test]
+    fn classify_trigger_kind_skips_authored_draft_prs() {
+        let pr = make_test_pr("alice", true);
+        assert_eq!(classify_trigger_kind(&pr, "alice"), None);
     }
 
     #[test]

@@ -100,6 +100,12 @@ pub enum ReviewState {
     Draft,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoPrFetchMode {
+    ReviewCandidates,
+    ReviewAndSelfCandidates,
+}
+
 #[derive(Debug, Clone)]
 pub struct PullRequest {
     pub number: u64,
@@ -194,10 +200,11 @@ fn determine_review_state(pr_data: &PrData) -> ReviewState {
     }
 }
 
-pub fn fetch_prs_for_repo(
+fn fetch_prs_for_repo_with_mode(
     repo_path: &PathBuf,
     username: &str,
     include_drafts: bool,
+    mode: RepoPrFetchMode,
 ) -> Vec<PullRequest> {
     let repo_info = match get_repo_info(repo_path) {
         Some(info) => info,
@@ -224,7 +231,7 @@ pub fn fetch_prs_for_repo(
             .map(|s| s.as_str())
             .unwrap_or("unknown");
 
-        if pr_author == username {
+        if mode == RepoPrFetchMode::ReviewCandidates && pr_author == username {
             continue;
         }
 
@@ -247,6 +254,32 @@ pub fn fetch_prs_for_repo(
     }
 
     prs
+}
+
+pub fn fetch_prs_for_repo(
+    repo_path: &PathBuf,
+    username: &str,
+    include_drafts: bool,
+) -> Vec<PullRequest> {
+    fetch_prs_for_repo_with_mode(
+        repo_path,
+        username,
+        include_drafts,
+        RepoPrFetchMode::ReviewCandidates,
+    )
+}
+
+pub fn fetch_prs_for_repo_with_authored(
+    repo_path: &PathBuf,
+    username: &str,
+    include_drafts: bool,
+) -> Vec<PullRequest> {
+    fetch_prs_for_repo_with_mode(
+        repo_path,
+        username,
+        include_drafts,
+        RepoPrFetchMode::ReviewAndSelfCandidates,
+    )
 }
 
 #[derive(Debug, Deserialize)]

@@ -156,6 +156,8 @@ Daemon notes:
 - Long-running daemon processes auto-restart after binary upgrades (detected on poll boundaries).
 - Optional `daemon.repo_subpath_filters` lets you restrict a repo to PRs touching specific subpaths.
   Omit a repo (or set an empty list) to monitor all PRs in that repo.
+- Daemon also triggers self-reviews for PRs authored by your account (non-drafts only).
+  Set `ai.launch.self_review_steps` to customize launch commands for those sessions.
 
 ## Terminal Launch Harness (macOS)
 
@@ -221,6 +223,25 @@ Daemon state is stored separately in:
             "review {repo}#{pr_number}",
             "--tag",
             "review",
+            "--auto-approve",
+            "--tool",
+            "custom",
+            "--cmd",
+            "{tool_command}"
+          ]
+        }
+      ],
+      "self_review_steps": [
+        {
+          "command": "maestro",
+          "args": [
+            "start",
+            "--cwd",
+            "{workdir}",
+            "--title",
+            "self-review {repo}#{pr_number}",
+            "--tag",
+            "self-review",
             "--auto-approve",
             "--tool",
             "custom",

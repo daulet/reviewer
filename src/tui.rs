@@ -448,11 +448,12 @@ pub enum InputMode {
     Comment,
     LineComment, // Comment on a specific line in diff
     ConfirmApprove,
-    ConfirmClose, // Confirm close with optional comment
-    ConfirmMerge, // Confirm merge (squash)
-    Search,       // Searching in diff
-    ListSearch,   // Searching in PR list
-    GotoLine,     // Jump to specific line
+    ConfirmRequestChanges, // Request changes with required comment
+    ConfirmClose,          // Confirm close with optional comment
+    ConfirmMerge,          // Confirm merge (squash)
+    Search,                // Searching in diff
+    ListSearch,            // Searching in PR list
+    GotoLine,              // Jump to specific line
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1292,6 +1293,61 @@ impl App {
         self.input_mode = InputMode::Normal;
     }
 
+    fn start_request_changes(&mut self) {
+        if self.mode != AppMode::Review {
+            self.set_status("Request changes only available in review mode".to_string());
+            return;
+        }
+
+        if self.selected_pr().is_some() {
+            self.input_mode = InputMode::ConfirmRequestChanges;
+            self.input_buffer.clear();
+        }
+    }
+
+    fn confirm_request_changes(&mut self) {
+        if let Some(pr) = self.selected_pr().cloned() {
+            let body = self.input_buffer.trim().to_string();
+            if body.is_empty() {
+                self.set_status("A comment is required when requesting changes".to_string());
+                self.input_mode = InputMode::Normal;
+                self.input_buffer.clear();
+                return;
+            }
+            match gh::request_changes_pr(&pr, &body) {
+                Ok(()) => {
+                    self.set_status(format!("Requested changes on PR #{}", pr.number));
+                    if let Some(idx) = self.list_state.selected() {
+                        self.prs.remove(idx);
+                        if self.prs.is_empty() {
+                            self.list_state.select(None);
+                            self.view = View::List;
+                        } else if idx >= self.prs.len() {
+                            self.list_state.select(Some(self.prs.len() - 1));
+                        }
+                        if self.view == View::Detail && !self.prs.is_empty() {
+                            self.diff_cache = None;
+                            self.comments_cache = None;
+                            self.review_comments_cache = None;
+                        } else if self.prs.is_empty() {
+                            self.view = View::List;
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.set_status(format!("Error: {}", e));
+                }
+            }
+        }
+        self.input_mode = InputMode::Normal;
+        self.input_buffer.clear();
+    }
+
+    fn cancel_request_changes(&mut self) {
+        self.input_mode = InputMode::Normal;
+        self.input_buffer.clear();
+    }
+
     fn start_close(&mut self) {
         if self.selected_pr().is_some() {
             self.input_mode = InputMode::ConfirmClose;
@@ -1507,6 +1563,9 @@ impl App {
                         InputMode::Comment => self.handle_comment_key(key.code),
                         InputMode::LineComment => self.handle_line_comment_key(key.code),
                         InputMode::ConfirmApprove => self.handle_confirm_key(key.code),
+                        InputMode::ConfirmRequestChanges => {
+                            self.handle_request_changes_key(key.code)
+                        }
                         InputMode::ConfirmClose => self.handle_close_key(key.code),
                         InputMode::ConfirmMerge => self.handle_merge_key(key.code),
                         InputMode::Search => self.handle_search_key(key.code),
@@ -1598,6 +1657,7 @@ impl App {
                 KeyCode::Enter if self.showing_large_diff_tree() => self.open_selected_file_diff(),
                 KeyCode::Char('c') => self.start_line_comment(),
                 KeyCode::Char('a') => self.start_approve(),
+                KeyCode::Char('R') => self.start_request_changes(),
                 KeyCode::Char('x') => self.start_close(),
                 KeyCode::Char('m') => self.start_merge(),
                 KeyCode::Char('r') => self.launch_ai_review(),
@@ -1649,6 +1709,20 @@ impl App {
         match code {
             KeyCode::Char('y' | 'Y') | KeyCode::Enter => self.confirm_approve(),
             KeyCode::Char('n' | 'N') | KeyCode::Esc => self.cancel_approve(),
+            _ => {}
+        }
+    }
+
+    fn handle_request_changes_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Enter => self.confirm_request_changes(),
+            KeyCode::Esc => self.cancel_request_changes(),
+            KeyCode::Backspace => {
+                self.input_buffer.pop();
+            }
+            KeyCode::Char(c) => {
+                self.input_buffer.push(c);
+            }
             _ => {}
         }
     }
@@ -2038,6 +2112,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // Draw confirmation dialog if active
     if app.input_mode == InputMode::ConfirmApprove {
         draw_confirm_dialog(frame, app);
+    }
+
+    // Draw request changes dialog if active
+    if app.input_mode == InputMode::ConfirmRequestChanges {
+        draw_request_changes_dialog(frame, app);
     }
 
     // Draw close dialog if active
@@ -2517,7 +2596,7 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
                 " j/k: scroll | Esc: file tree | t: full diff | /: search | D: delta | m: merge | o: browser | y: copy | q: back"
             }
             AppMode::Review => {
-                " j/k: scroll | Esc: file tree | t: full diff | /: search | c: comment | D: delta | a: approve | o: browser | y: copy | q: back"
+                " j/k: scroll | Esc: file tree | t: full diff | /: search | c: comment | D: delta | a: approve | R: request changes | o: browser | y: copy | q: back"
             }
         }
     } else {
@@ -2526,13 +2605,13 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
                 " j/k: scroll | /: search | t: tree | D: delta | m: merge | o: browser | y: copy | q: back"
             }
             (DetailTab::Diff, AppMode::Review) => {
-                " j/k: scroll | /: search | t: tree | c: comment | D: delta | a: approve | o: browser | y: copy | q: back"
+                " j/k: scroll | /: search | t: tree | c: comment | D: delta | a: approve | R: request changes | o: browser | y: copy | q: back"
             }
             (_, AppMode::MyPrs) => {
                 " Tab: tabs | j/k: scroll | m: merge | o: browser | y: copy | q: back"
             }
             (_, AppMode::Review) => {
-                " Tab: tabs | j/k: scroll | a: approve | o: browser | y: copy | q: back"
+                " Tab: tabs | j/k: scroll | a: approve | R: request changes | o: browser | y: copy | q: back"
             }
         }
     };
@@ -2633,6 +2712,53 @@ fn draw_confirm_dialog(frame: &mut Frame, app: &App) {
             .borders(Borders::ALL)
             .title(" Confirm Approval ")
             .style(Style::default().fg(Color::Yellow)),
+    );
+
+    frame.render_widget(Clear, popup_area);
+    frame.render_widget(dialog, popup_area);
+}
+
+fn draw_request_changes_dialog(frame: &mut Frame, app: &App) {
+    let pr = match app.selected_pr() {
+        Some(pr) => pr,
+        None => return,
+    };
+
+    let area = frame.area();
+    let popup_area = Rect {
+        x: area.width / 6,
+        y: area.height / 3,
+        width: area.width * 2 / 3,
+        height: 9,
+    };
+
+    let text = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  Request changes on "),
+            Span::styled(
+                format!("[{}] #{}", pr.repo_name, pr.number),
+                Style::default().fg(Color::Cyan).bold(),
+            ),
+            Span::raw("?"),
+        ]),
+        Line::from(""),
+        Line::from("  Comment (required):"),
+        Line::from(format!("  > {}", app.input_buffer)),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  [Enter]", Style::default().fg(Color::Red).bold()),
+            Span::raw(" Submit    "),
+            Span::styled("[Esc]", Style::default().fg(Color::Green).bold()),
+            Span::raw(" Cancel"),
+        ]),
+    ];
+
+    let dialog = Paragraph::new(text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Request Changes ")
+            .style(Style::default().fg(Color::Red)),
     );
 
     frame.render_widget(Clear, popup_area);
@@ -2852,6 +2978,7 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AiConfig;
 
     // Tests use output patterns captured from real `delta` CLI output
 
@@ -3376,6 +3503,26 @@ diff --git a/README.md b/README.md
         }
     }
 
+    fn make_test_app(mode: AppMode) -> App {
+        let mut app = App::new(
+            PathBuf::new(),
+            Vec::new(),
+            "reviewer".to_string(),
+            false,
+            AiConfig::default(),
+            mode,
+        );
+        app.prs = vec![make_test_pr(
+            123,
+            "Add request changes",
+            "org/reviewer",
+            "alice",
+        )];
+        app.list_state.select(Some(0));
+        app.view = View::Detail;
+        app
+    }
+
     #[test]
     fn test_pr_matches_list_query_matches_pr_number() {
         let pr = make_test_pr(
@@ -3397,5 +3544,46 @@ diff --git a/README.md b/README.md
         assert!(pr_matches_list_query(&pr, "org/reviewer"));
         assert!(pr_matches_list_query(&pr, "alice"));
         assert!(!pr_matches_list_query(&pr, "nonexistent"));
+    }
+
+    #[test]
+    fn test_start_request_changes_requires_review_mode() {
+        let mut app = make_test_app(AppMode::MyPrs);
+
+        app.start_request_changes();
+
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Request changes only available in review mode")
+        );
+    }
+
+    #[test]
+    fn test_start_request_changes_enters_confirm_mode() {
+        let mut app = make_test_app(AppMode::Review);
+        app.input_buffer = "stale".to_string();
+
+        app.start_request_changes();
+
+        assert_eq!(app.input_mode, InputMode::ConfirmRequestChanges);
+        assert!(app.input_buffer.is_empty());
+    }
+
+    #[test]
+    fn test_confirm_request_changes_requires_comment() {
+        let mut app = make_test_app(AppMode::Review);
+        app.input_mode = InputMode::ConfirmRequestChanges;
+        app.input_buffer = "   ".to_string();
+
+        app.confirm_request_changes();
+
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert!(app.input_buffer.is_empty());
+        assert_eq!(app.prs.len(), 1);
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("A comment is required when requesting changes")
+        );
     }
 }

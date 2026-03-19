@@ -650,6 +650,36 @@ pub fn approve_pr(pr: &PullRequest, comment: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+fn request_changes_review_args<'a>(pr_number: &'a str, body: &'a str) -> [&'a str; 6] {
+    [
+        "pr",
+        "review",
+        pr_number,
+        "--request-changes",
+        "--body",
+        body,
+    ]
+}
+
+/// Request changes on a PR with a required comment
+pub fn request_changes_pr(pr: &PullRequest, body: &str) -> Result<()> {
+    let pr_number = pr.number.to_string();
+    let output = Command::new("gh")
+        .args(request_changes_review_args(&pr_number, body))
+        .current_dir(&pr.repo_path)
+        .output()
+        .context("Failed to request changes on PR")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to request changes: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    Ok(())
+}
+
 /// Close a PR with an optional comment
 pub fn close_pr(pr: &PullRequest, comment: Option<&str>) -> Result<()> {
     // Add comment first if provided (closing comment)
@@ -1269,6 +1299,25 @@ pub fn launch_ai(working_dir: &std::path::Path, pr: &PullRequest, ai: &AiConfig)
         skill_invocation: &skill_invocation,
     });
     launch_with_steps(working_dir, ai, &values)
+}
+
+#[cfg(test)]
+mod request_changes_tests {
+    #[test]
+    fn request_changes_review_args_include_required_flag_and_body() {
+        let args = super::request_changes_review_args("42", "Needs tests");
+        assert_eq!(
+            args,
+            [
+                "pr",
+                "review",
+                "42",
+                "--request-changes",
+                "--body",
+                "Needs tests",
+            ]
+        );
+    }
 }
 
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]

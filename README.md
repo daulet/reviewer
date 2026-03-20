@@ -156,6 +156,9 @@ Daemon notes:
 - Long-running daemon processes auto-restart after binary upgrades (detected on poll boundaries).
 - Optional `daemon.repo_subpath_filters` lets you restrict a repo to PRs touching specific subpaths.
   Omit a repo (or set an empty list) to monitor all PRs in that repo.
+- Optional `daemon.auto_approve` rules auto-approve PRs when both repo and author match.
+  Matching is case-insensitive, supports `*` (any sequence) and `?` (single character),
+  and applies only to non-self-review daemon triggers.
 - Daemon also triggers self-reviews for PRs authored by your account (non-drafts only).
   Set `ai.launch.self_review_steps` to customize launch commands for those sessions.
 
@@ -202,6 +205,11 @@ Daemon state is stored separately in:
       "org/monorepo": ["services/payments", "infra/terraform"],
       "org/full-repo": []
     },
+    "auto_approve": [
+      {"repo": "org/reviewer", "user": "dependabot[bot]"},
+      {"repo": "org/*", "user": "*[bot]"},
+      {"repo": "org/monorepo", "user": "renovate[bo?]"}
+    ],
     "initialized": true,
     "include_drafts": false
   },

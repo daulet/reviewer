@@ -279,6 +279,14 @@ fn print_daemon_status(cfg: &config::Config) {
             println!("  - {}: {}", filter.repo, filter.subpaths.join(", "));
         }
     }
+    if status.auto_approve_rules.is_empty() {
+        println!("Auto-approve rules: none");
+    } else {
+        println!("Auto-approve rules ({}):", status.auto_approve_rules.len());
+        for rule in status.auto_approve_rules {
+            println!("  - {} @{}", rule.repo, rule.user);
+        }
+    }
 }
 
 fn run_daemon_command(

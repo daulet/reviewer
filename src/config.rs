@@ -68,6 +68,13 @@ impl AiConfig {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AutoApproveRule {
+    pub repo: String,
+    pub user: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonConfig {
@@ -81,6 +88,8 @@ pub struct DaemonConfig {
     pub include_drafts: bool,
     #[serde(default)]
     pub repo_subpath_filters: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub auto_approve: Vec<AutoApproveRule>,
 }
 
 impl Default for DaemonConfig {
@@ -91,6 +100,7 @@ impl Default for DaemonConfig {
             initialized: false,
             include_drafts: false,
             repo_subpath_filters: HashMap::new(),
+            auto_approve: Vec::new(),
         }
     }
 }
@@ -211,6 +221,7 @@ fn merge_with_existing_config(existing: Value, updated: Value) -> Value {
             "initialized",
             "include_drafts",
             "repo_subpath_filters",
+            "auto_approve",
         ],
     );
 
@@ -312,6 +323,9 @@ mod tests {
             "repo_subpath_filters": {
               "org/repo": ["services/payments"]
             },
+            "auto_approve": [
+              {"repo": "org/reviewer", "user": "dependabot[bot]"}
+            ],
             "future_daemon_field": {
               "enabled": true
             }
@@ -339,13 +353,15 @@ mod tests {
             "exclude_repos": [],
             "initialized": true,
             "include_drafts": false,
-            "repo_subpath_filters": {}
+            "repo_subpath_filters": {},
+            "auto_approve": []
           }
         });
 
         let merged = merge_with_existing_config(existing, updated);
         assert_eq!(merged["repos_root"], json!("/tmp/repos-new"));
         assert_eq!(merged["daemon"]["initialized"], json!(true));
+        assert_eq!(merged["daemon"]["auto_approve"], json!([]));
         assert_eq!(
             merged["daemon"]["future_daemon_field"],
             json!({"enabled": true})
@@ -364,6 +380,9 @@ mod tests {
             "repo_subpath_filters": {
               "org/repo": ["a/b"]
             },
+            "auto_approve": [
+              {"repo": "org/reviewer", "user": "alice"}
+            ],
             "future_daemon_field": "keep"
           }
         });
@@ -386,7 +405,10 @@ mod tests {
             "exclude_repos": [],
             "initialized": true,
             "include_drafts": false,
-            "repo_subpath_filters": {}
+            "repo_subpath_filters": {},
+            "auto_approve": [
+              {"repo": "org/reviewer", "user": "dependabot[bot]"}
+            ]
           }
         });
 
@@ -394,6 +416,10 @@ mod tests {
         assert_eq!(merged["daemon"]["poll_interval_sec"], json!(60));
         assert_eq!(merged["daemon"]["exclude_repos"], json!([]));
         assert_eq!(merged["daemon"]["repo_subpath_filters"], json!({}));
+        assert_eq!(
+            merged["daemon"]["auto_approve"],
+            json!([{"repo": "org/reviewer", "user": "dependabot[bot]"}])
+        );
         assert_eq!(merged["daemon"]["future_daemon_field"], json!("keep"));
     }
 
@@ -401,5 +427,11 @@ mod tests {
     fn ai_launch_self_review_steps_default_empty() {
         let cfg = Config::default();
         assert!(cfg.ai.launch.self_review_steps.is_empty());
+    }
+
+    #[test]
+    fn daemon_auto_approve_rules_default_empty() {
+        let cfg = Config::default();
+        assert!(cfg.daemon.auto_approve.is_empty());
     }
 }

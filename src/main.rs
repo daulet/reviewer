@@ -250,6 +250,10 @@ fn print_daemon_status(cfg: &config::Config) {
     println!("Daemon initialized: {}", status.initialized);
     println!("Poll interval: {}s", status.poll_interval_sec);
     println!("Include drafts: {}", status.include_drafts);
+    println!(
+        "Only new PRs on first run: {}",
+        status.only_new_prs_on_start
+    );
     println!("State file: {}", status.state_path.display());
     println!("Tracked PRs: {}", status.reviewed_count);
     println!("  Triggered successfully: {}", status.success_count);

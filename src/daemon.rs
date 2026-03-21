@@ -110,6 +110,7 @@ pub struct DaemonStatus {
     pub initialized: bool,
     pub poll_interval_sec: u64,
     pub include_drafts: bool,
+    pub only_new_prs_on_start: bool,
     pub excluded_repos: Vec<String>,
     pub repo_subpath_filters: Vec<RepoSubpathFilterStatus>,
     pub auto_approve_rules: Vec<AutoApproveRule>,
@@ -631,16 +632,24 @@ pub fn init(cfg: &mut Config, repos_root: &Path, username: &str) -> Result<()> {
     cfg.daemon.initialized = true;
     config::save_config(cfg)?;
 
-    let mut state = load_state();
-    let seeded = seed_existing_open_prs(&mut state, &repos, cfg, username);
-    save_state(&state)?;
-
-    println!(
-        "Daemon initialized. Monitoring {} repos ({} excluded). Seeded {} existing PRs as already seen.",
-        repos.len().saturating_sub(cfg.daemon.exclude_repos.len()),
-        cfg.daemon.exclude_repos.len(),
-        seeded
-    );
+    let monitored_count = repos.len().saturating_sub(cfg.daemon.exclude_repos.len());
+    if cfg.daemon.only_new_prs_on_start {
+        let mut state = load_state();
+        let seeded = seed_existing_open_prs(&mut state, &repos, cfg, username);
+        save_state(&state)?;
+        println!(
+            "Daemon initialized. Monitoring {} repos ({} excluded). Seeded {} existing PRs as already seen.",
+            monitored_count,
+            cfg.daemon.exclude_repos.len(),
+            seeded
+        );
+    } else {
+        println!(
+            "Daemon initialized. Monitoring {} repos ({} excluded). Existing open PRs will be processed on next run.",
+            monitored_count,
+            cfg.daemon.exclude_repos.len()
+        );
+    }
 
     Ok(())
 }
@@ -786,8 +795,11 @@ pub fn run(
     let subpath_filter_count =
         normalize_repo_subpath_filter_status(&cfg.daemon.repo_subpath_filters).len();
     println!(
-        "Daemon running. Poll interval: {}s. Include drafts: {}. Repo subpath filters: {}.",
-        poll_interval_sec, cfg.daemon.include_drafts, subpath_filter_count
+        "Daemon running. Poll interval: {}s. Include drafts: {}. Repo subpath filters: {}. Only new PRs on first run: {}.",
+        poll_interval_sec,
+        cfg.daemon.include_drafts,
+        subpath_filter_count,
+        cfg.daemon.only_new_prs_on_start
     );
     let mut auto_restart_watcher = if once {
         None
@@ -855,6 +867,7 @@ pub fn status(cfg: &Config) -> DaemonStatus {
         initialized: cfg.daemon.initialized,
         poll_interval_sec: cfg.daemon.poll_interval_sec,
         include_drafts: cfg.daemon.include_drafts,
+        only_new_prs_on_start: cfg.daemon.only_new_prs_on_start,
         excluded_repos,
         repo_subpath_filters,
         auto_approve_rules,

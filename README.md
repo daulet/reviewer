@@ -159,6 +159,9 @@ Daemon notes:
 - Optional `daemon.auto_approve` rules auto-approve PRs when both repo and author match.
   Matching is case-insensitive, supports `*` (any sequence) and `?` (single character),
   and applies only to non-self-review daemon triggers.
+- Optional `daemon.only_new_prs_on_start` controls first-run behavior:
+  when `true` (default), daemon init seeds currently open PRs as seen so only PRs opened
+  after first launch are processed. Later restarts still process PRs opened while daemon was down.
 - Daemon also triggers self-reviews for PRs authored by your account (non-drafts only).
   Set `ai.launch.self_review_steps` to customize launch commands for those sessions.
 
@@ -210,6 +213,7 @@ Daemon state is stored separately in:
       {"repo": "org/*", "user": "*[bot]"},
       {"repo": "org/monorepo", "user": "renovate[bo?]"}
     ],
+    "only_new_prs_on_start": true,
     "initialized": true,
     "include_drafts": false
   },

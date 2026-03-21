@@ -8,6 +8,10 @@ fn default_poll_interval_sec() -> u64 {
     60
 }
 
+fn default_only_new_prs_on_start() -> bool {
+    true
+}
+
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct AiLaunchStepConfig {
@@ -90,6 +94,8 @@ pub struct DaemonConfig {
     pub repo_subpath_filters: HashMap<String, Vec<String>>,
     #[serde(default)]
     pub auto_approve: Vec<AutoApproveRule>,
+    #[serde(default = "default_only_new_prs_on_start")]
+    pub only_new_prs_on_start: bool,
 }
 
 impl Default for DaemonConfig {
@@ -101,6 +107,7 @@ impl Default for DaemonConfig {
             include_drafts: false,
             repo_subpath_filters: HashMap::new(),
             auto_approve: Vec::new(),
+            only_new_prs_on_start: default_only_new_prs_on_start(),
         }
     }
 }
@@ -222,6 +229,7 @@ fn merge_with_existing_config(existing: Value, updated: Value) -> Value {
             "include_drafts",
             "repo_subpath_filters",
             "auto_approve",
+            "only_new_prs_on_start",
         ],
     );
 
@@ -326,6 +334,7 @@ mod tests {
             "auto_approve": [
               {"repo": "org/reviewer", "user": "dependabot[bot]"}
             ],
+            "only_new_prs_on_start": false,
             "future_daemon_field": {
               "enabled": true
             }
@@ -354,7 +363,8 @@ mod tests {
             "initialized": true,
             "include_drafts": false,
             "repo_subpath_filters": {},
-            "auto_approve": []
+            "auto_approve": [],
+            "only_new_prs_on_start": true
           }
         });
 
@@ -362,6 +372,7 @@ mod tests {
         assert_eq!(merged["repos_root"], json!("/tmp/repos-new"));
         assert_eq!(merged["daemon"]["initialized"], json!(true));
         assert_eq!(merged["daemon"]["auto_approve"], json!([]));
+        assert_eq!(merged["daemon"]["only_new_prs_on_start"], json!(true));
         assert_eq!(
             merged["daemon"]["future_daemon_field"],
             json!({"enabled": true})
@@ -383,6 +394,7 @@ mod tests {
             "auto_approve": [
               {"repo": "org/reviewer", "user": "alice"}
             ],
+            "only_new_prs_on_start": false,
             "future_daemon_field": "keep"
           }
         });
@@ -408,7 +420,8 @@ mod tests {
             "repo_subpath_filters": {},
             "auto_approve": [
               {"repo": "org/reviewer", "user": "dependabot[bot]"}
-            ]
+            ],
+            "only_new_prs_on_start": true
           }
         });
 
@@ -420,6 +433,7 @@ mod tests {
             merged["daemon"]["auto_approve"],
             json!([{"repo": "org/reviewer", "user": "dependabot[bot]"}])
         );
+        assert_eq!(merged["daemon"]["only_new_prs_on_start"], json!(true));
         assert_eq!(merged["daemon"]["future_daemon_field"], json!("keep"));
     }
 
@@ -433,5 +447,11 @@ mod tests {
     fn daemon_auto_approve_rules_default_empty() {
         let cfg = Config::default();
         assert!(cfg.daemon.auto_approve.is_empty());
+    }
+
+    #[test]
+    fn daemon_only_new_prs_on_start_default_true() {
+        let cfg = Config::default();
+        assert!(cfg.daemon.only_new_prs_on_start);
     }
 }

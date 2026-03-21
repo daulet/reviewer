@@ -1169,16 +1169,28 @@ fn render_launch_template(template: &str, values: &LaunchTemplateValues) -> Stri
     rendered
 }
 
-fn launch_with_steps(
-    working_dir: &std::path::Path,
-    ai: &AiConfig,
-    values: &LaunchTemplateValues,
-) -> Result<()> {
+pub fn validate_ai_launch_config(ai: &AiConfig) -> Result<()> {
     if ai.launch.steps.is_empty() {
         anyhow::bail!(
             "ai.launch.steps is empty. Configure launcher commands in ~/.config/reviewer/config.json"
         );
     }
+
+    for (idx, step) in ai.launch.steps.iter().enumerate() {
+        if step.command.trim().is_empty() {
+            anyhow::bail!("ai.launch.steps[{idx}] command is empty");
+        }
+    }
+
+    Ok(())
+}
+
+fn launch_with_steps(
+    working_dir: &std::path::Path,
+    ai: &AiConfig,
+    values: &LaunchTemplateValues,
+) -> Result<()> {
+    validate_ai_launch_config(ai)?;
 
     let total = ai.launch.steps.len();
     for (idx, step) in ai.launch.steps.iter().enumerate() {

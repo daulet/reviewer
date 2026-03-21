@@ -1206,6 +1206,11 @@ impl App {
             return;
         }
         if let Some(pr) = self.selected_pr().cloned() {
+            if let Err(err) = gh::validate_ai_launch_config(&self.ai) {
+                self.set_status(format!("AI launch is not configured: {:#}", err));
+                return;
+            }
+
             let ai_display_name = self.ai.display_name();
             self.launching_ai = true;
             self.set_status(format!(

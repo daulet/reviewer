@@ -560,6 +560,7 @@ fn trigger_review(
     if trigger_kind == ReviewTriggerKind::SelfReview && !ai.launch.self_review_steps.is_empty() {
         ai_for_launch.launch.steps = ai.launch.self_review_steps.clone();
     }
+    gh::validate_ai_launch_config(&ai_for_launch)?;
     let worktree_path = gh::create_pr_worktree(pr, repos_root).with_context(|| {
         format!(
             "Failed to create worktree for {}#{}",

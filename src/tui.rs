@@ -412,12 +412,12 @@ fn build_diff_tree_items(sections: &[FileDiffSection]) -> Vec<DiffTreeItem> {
 }
 
 enum AsyncResult {
-    Diff(usize, String, Option<String>, bool), // (pr_index, diff_content, delta_output, delta_too_large)
-    Comments(usize, Vec<Comment>),             // (pr_index, comments)
-    ReviewComments(usize, Vec<ReviewComment>), // (pr_index, review comments with diff context)
-    Checks(usize, Vec<gh::CheckStatus>),       // (pr_index, CI checks)
-    AiLaunch(Result<String, String>),          // worktree path or error
-    Refresh(Vec<PullRequest>),                 // refreshed PR list
+    Diff(u64, String, Option<String>, bool), // (detail_epoch, diff_content, delta_output, delta_too_large)
+    Comments(u64, Vec<Comment>),             // (detail_epoch, comments)
+    ReviewComments(u64, Vec<ReviewComment>), // (detail_epoch, review comments with diff context)
+    Checks(u64, Vec<gh::CheckStatus>),       // (detail_epoch, CI checks)
+    AiLaunch(Result<String, String>),        // worktree path or error
+    Refresh(Vec<PullRequest>),               // refreshed PR list
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -519,6 +519,7 @@ pub struct App {
     // Async loading
     async_tx: Sender<AsyncResult>,
     async_rx: Receiver<AsyncResult>,
+    detail_epoch: u64, // Incremented on each enter_detail(); guards against stale async results
     loading_diff: bool,
     loading_comments: bool,
     loading_review_comments: bool,
@@ -583,6 +584,7 @@ impl App {
             should_quit: false,
             async_tx,
             async_rx,
+            detail_epoch: 0,
             loading_diff: false,
             loading_comments: false,
             loading_review_comments: false,
@@ -823,6 +825,7 @@ impl App {
 
     fn enter_detail(&mut self) {
         if self.selected_pr().is_some() {
+            self.detail_epoch += 1;
             self.view = View::Detail;
             self.detail_tab = DetailTab::Description;
             self.scroll_offset = 0;
@@ -838,6 +841,7 @@ impl App {
             self.loading_comments = false;
             self.loading_review_comments = false;
             self.loading_checks = false;
+            self.clear_search();
             self.needs_clear = true;
             // Load checks asynchronously
             self.load_checks();
@@ -921,6 +925,7 @@ impl App {
                 self.loading_diff = true;
                 let pr = pr.clone();
                 let tx = self.async_tx.clone();
+                let epoch = self.detail_epoch;
                 // Get terminal width for delta's side-by-side mode
                 let width = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(120);
                 thread::spawn(move || {
@@ -928,7 +933,7 @@ impl App {
                     let delta_too_large = diff::is_too_large_for_delta(&diff);
                     // Process with delta in background
                     let delta_output = diff::process_with_delta(&diff, width);
-                    let _ = tx.send(AsyncResult::Diff(idx, diff, delta_output, delta_too_large));
+                    let _ = tx.send(AsyncResult::Diff(epoch, diff, delta_output, delta_too_large));
                 });
             }
         }
@@ -943,9 +948,10 @@ impl App {
                 self.loading_comments = true;
                 let pr = pr.clone();
                 let tx = self.async_tx.clone();
+                let epoch = self.detail_epoch;
                 thread::spawn(move || {
                     let comments = gh::get_pr_comments(&pr).unwrap_or_default();
-                    let _ = tx.send(AsyncResult::Comments(idx, comments));
+                    let _ = tx.send(AsyncResult::Comments(epoch, comments));
                 });
             }
         }
@@ -960,9 +966,10 @@ impl App {
                 self.loading_review_comments = true;
                 let pr = pr.clone();
                 let tx = self.async_tx.clone();
+                let epoch = self.detail_epoch;
                 thread::spawn(move || {
                     let comments = gh::get_review_comments(&pr).unwrap_or_default();
-                    let _ = tx.send(AsyncResult::ReviewComments(idx, comments));
+                    let _ = tx.send(AsyncResult::ReviewComments(epoch, comments));
                 });
             }
         }
@@ -977,9 +984,10 @@ impl App {
                 self.loading_checks = true;
                 let pr = pr.clone();
                 let tx = self.async_tx.clone();
+                let epoch = self.detail_epoch;
                 thread::spawn(move || {
                     let checks = gh::get_pr_checks(&pr).unwrap_or_default();
-                    let _ = tx.send(AsyncResult::Checks(idx, checks));
+                    let _ = tx.send(AsyncResult::Checks(epoch, checks));
                 });
             }
         }
@@ -990,9 +998,9 @@ impl App {
         while let Ok(result) = self.async_rx.try_recv() {
             has_updates = true;
             match result {
-                AsyncResult::Diff(idx, diff, delta_output, delta_too_large) => {
-                    // Only update if still viewing the same PR
-                    if self.list_state.selected() == Some(idx) {
+                AsyncResult::Diff(epoch, diff, delta_output, delta_too_large) => {
+                    // Only update if this result belongs to the current detail session
+                    if epoch == self.detail_epoch {
                         self.diff_lines = parse_diff(&diff);
                         // Parse delta output for line info if available
                         if let Some(ref delta) = delta_output {
@@ -1013,26 +1021,26 @@ impl App {
                         }
                         self.diff_cache = Some(diff);
                         self.delta_cache = delta_output;
+                        self.loading_diff = false;
                     }
-                    self.loading_diff = false;
                 }
-                AsyncResult::Comments(idx, comments) => {
-                    if self.list_state.selected() == Some(idx) {
+                AsyncResult::Comments(epoch, comments) => {
+                    if epoch == self.detail_epoch {
                         self.comments_cache = Some(comments);
+                        self.loading_comments = false;
                     }
-                    self.loading_comments = false;
                 }
-                AsyncResult::ReviewComments(idx, comments) => {
-                    if self.list_state.selected() == Some(idx) {
+                AsyncResult::ReviewComments(epoch, comments) => {
+                    if epoch == self.detail_epoch {
                         self.review_comments_cache = Some(comments);
+                        self.loading_review_comments = false;
                     }
-                    self.loading_review_comments = false;
                 }
-                AsyncResult::Checks(idx, checks) => {
-                    if self.list_state.selected() == Some(idx) {
+                AsyncResult::Checks(epoch, checks) => {
+                    if epoch == self.detail_epoch {
                         self.checks_cache = Some(checks);
+                        self.loading_checks = false;
                     }
-                    self.loading_checks = false;
                 }
                 AsyncResult::AiLaunch(result) => {
                     self.launching_ai = false;
@@ -1265,19 +1273,22 @@ impl App {
                     self.set_status(format!("Approved PR #{}", pr.number));
                     // Remove from list
                     if let Some(idx) = self.list_state.selected() {
+                        let was_in_detail = self.view == View::Detail;
                         self.prs.remove(idx);
                         if self.prs.is_empty() {
                             self.list_state.select(None);
-                            self.view = View::List;
-                        } else if idx >= self.prs.len() {
-                            self.list_state.select(Some(self.prs.len() - 1));
-                        }
-                        if self.view == View::Detail && !self.prs.is_empty() {
-                            self.diff_cache = None;
-                            self.comments_cache = None;
-                            self.review_comments_cache = None;
-                        } else if self.prs.is_empty() {
-                            self.view = View::List;
+                            if was_in_detail {
+                                self.exit_detail();
+                            } else {
+                                self.view = View::List;
+                            }
+                        } else {
+                            if idx >= self.prs.len() {
+                                self.list_state.select(Some(self.prs.len() - 1));
+                            }
+                            if was_in_detail {
+                                self.enter_detail();
+                            }
                         }
                     }
                 }
@@ -1318,19 +1329,22 @@ impl App {
                 Ok(()) => {
                     self.set_status(format!("Requested changes on PR #{}", pr.number));
                     if let Some(idx) = self.list_state.selected() {
+                        let was_in_detail = self.view == View::Detail;
                         self.prs.remove(idx);
                         if self.prs.is_empty() {
                             self.list_state.select(None);
-                            self.view = View::List;
-                        } else if idx >= self.prs.len() {
-                            self.list_state.select(Some(self.prs.len() - 1));
-                        }
-                        if self.view == View::Detail && !self.prs.is_empty() {
-                            self.diff_cache = None;
-                            self.comments_cache = None;
-                            self.review_comments_cache = None;
-                        } else if self.prs.is_empty() {
-                            self.view = View::List;
+                            if was_in_detail {
+                                self.exit_detail();
+                            } else {
+                                self.view = View::List;
+                            }
+                        } else {
+                            if idx >= self.prs.len() {
+                                self.list_state.select(Some(self.prs.len() - 1));
+                            }
+                            if was_in_detail {
+                                self.enter_detail();
+                            }
                         }
                     }
                 }
@@ -3585,5 +3599,114 @@ diff --git a/README.md b/README.md
             app.status_message.as_deref(),
             Some("A comment is required when requesting changes")
         );
+    }
+
+    // --- Async epoch guard tests ---
+
+    #[test]
+    fn test_stale_async_diff_rejected_after_enter_detail() {
+        // Stale Diff result from a previous detail session (epoch=0) must not
+        // overwrite state that belongs to the current session (epoch=1).
+        let mut app = make_test_app(AppMode::Review);
+        app.detail_epoch = 1;
+        app.loading_diff = true;
+
+        app.async_tx
+            .send(AsyncResult::Diff(0, "stale diff".to_string(), None, false))
+            .unwrap();
+        app.poll_async_results();
+
+        assert!(app.diff_cache.is_none());
+        assert!(app.loading_diff);
+    }
+
+    #[test]
+    fn test_current_async_diff_accepted() {
+        // A Diff result tagged with the current epoch must be applied.
+        let mut app = make_test_app(AppMode::Review);
+        app.detail_epoch = 2;
+        app.loading_diff = true;
+
+        app.async_tx
+            .send(AsyncResult::Diff(2, String::new(), None, false))
+            .unwrap();
+        app.poll_async_results();
+
+        assert!(app.diff_cache.is_some());
+        assert!(!app.loading_diff);
+    }
+
+    #[test]
+    fn test_stale_async_checks_rejected_after_enter_detail() {
+        // Stale Checks result from a previous detail session must be discarded.
+        let mut app = make_test_app(AppMode::Review);
+        app.detail_epoch = 3;
+        app.loading_checks = true;
+
+        app.async_tx
+            .send(AsyncResult::Checks(2, vec![]))
+            .unwrap();
+        app.poll_async_results();
+
+        assert!(app.checks_cache.is_none());
+        assert!(app.loading_checks);
+    }
+
+    #[test]
+    fn test_current_async_checks_accepted() {
+        // A Checks result tagged with the current epoch must be applied.
+        let mut app = make_test_app(AppMode::Review);
+        app.detail_epoch = 3;
+        app.loading_checks = true;
+
+        app.async_tx
+            .send(AsyncResult::Checks(3, vec![]))
+            .unwrap();
+        app.poll_async_results();
+
+        assert!(app.checks_cache.is_some());
+        assert!(!app.loading_checks);
+    }
+
+    #[test]
+    fn test_stale_async_comments_rejected_after_enter_detail() {
+        // Stale Comments result from a previous detail session must be discarded.
+        let mut app = make_test_app(AppMode::Review);
+        app.detail_epoch = 5;
+
+        app.async_tx
+            .send(AsyncResult::Comments(4, vec![]))
+            .unwrap();
+        app.poll_async_results();
+
+        assert!(app.comments_cache.is_none());
+    }
+
+    #[test]
+    fn test_enter_detail_increments_epoch() {
+        // Each call to enter_detail() must bump the epoch so that in-flight
+        // async results from the previous PR are rejected.
+        let mut app = make_test_app(AppMode::Review);
+        let epoch_before = app.detail_epoch;
+
+        app.enter_detail();
+
+        assert_eq!(app.detail_epoch, epoch_before + 1);
+    }
+
+    #[test]
+    fn test_enter_detail_clears_search_state() {
+        // enter_detail() must clear search state so that 'n'/'N' keys route
+        // to next/prev PR navigation rather than stale search match iteration.
+        let mut app = make_test_app(AppMode::Review);
+        app.search_query = "foo".to_string();
+        app.search_matches = vec![1, 5, 10];
+        app.search_match_idx = 2;
+
+        app.enter_detail();
+
+        assert!(app.search_query.is_empty());
+        assert!(app.search_matches.is_empty());
+        assert_eq!(app.search_match_idx, 0);
     }
 }

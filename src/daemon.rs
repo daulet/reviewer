@@ -557,18 +557,13 @@ fn trigger_review(
     ai: &AiConfig,
     trigger_kind: ReviewTriggerKind,
 ) -> Result<()> {
-    let mut ai_for_launch = ai.clone();
-    if trigger_kind == ReviewTriggerKind::SelfReview && !ai.launch.self_review_steps.is_empty() {
-        ai_for_launch.launch.steps = ai.launch.self_review_steps.clone();
-    }
-    gh::validate_ai_launch_config(&ai_for_launch)?;
     let worktree_path = gh::create_pr_worktree(pr, repos_root).with_context(|| {
         format!(
             "Failed to create worktree for {}#{}",
             pr.repo_name, pr.number
         )
     })?;
-    gh::launch_ai(&worktree_path, pr, &ai_for_launch).with_context(|| {
+    gh::launch_ai(&worktree_path, pr, ai).with_context(|| {
         format!(
             "Failed to launch AI {} for {}#{}",
             trigger_kind.label(),
@@ -577,6 +572,42 @@ fn trigger_review(
         )
     })?;
     Ok(())
+}
+
+fn ai_config_for_trigger_kind(ai: &AiConfig, trigger_kind: ReviewTriggerKind) -> Option<AiConfig> {
+    match trigger_kind {
+        ReviewTriggerKind::Review => {
+            if ai.launch.steps.is_empty() {
+                None
+            } else {
+                Some(ai.clone())
+            }
+        }
+        ReviewTriggerKind::SelfReview => {
+            if !ai.launch.self_review_steps.is_empty() {
+                let mut self_review_ai = ai.clone();
+                self_review_ai.launch.steps = ai.launch.self_review_steps.clone();
+                Some(self_review_ai)
+            } else if ai.launch.steps.is_empty() {
+                None
+            } else {
+                Some(ai.clone())
+            }
+        }
+    }
+}
+
+fn ai_config_for_action<'a>(
+    action: TriggerAction,
+    review_ai: &'a Option<AiConfig>,
+    self_review_ai: &'a Option<AiConfig>,
+    default_ai: &'a AiConfig,
+) -> Option<&'a AiConfig> {
+    match action {
+        TriggerAction::AutoApprove => Some(default_ai),
+        TriggerAction::Review(ReviewTriggerKind::Review) => review_ai.as_ref(),
+        TriggerAction::Review(ReviewTriggerKind::SelfReview) => self_review_ai.as_ref(),
+    }
 }
 
 fn seed_existing_open_prs(
@@ -670,6 +701,50 @@ pub fn poll_once(cfg: &Config, repos_root: &Path, username: &str) -> Result<Poll
         cfg.daemon.include_drafts,
     );
     let auto_approve_rules = normalize_auto_approve_rules(&cfg.daemon.auto_approve);
+    let review_actions = open_prs
+        .iter()
+        .map(|candidate| {
+            select_trigger_action(&candidate.pr, candidate.trigger_kind, &auto_approve_rules)
+        })
+        .collect::<Vec<_>>();
+    let mut review_ai = ai_config_for_trigger_kind(&cfg.ai, ReviewTriggerKind::Review);
+    let mut self_review_ai = ai_config_for_trigger_kind(&cfg.ai, ReviewTriggerKind::SelfReview);
+    let has_review_actions = review_actions
+        .iter()
+        .any(|action| *action == TriggerAction::Review(ReviewTriggerKind::Review));
+    let has_self_review_actions = review_actions
+        .iter()
+        .any(|action| *action == TriggerAction::Review(ReviewTriggerKind::SelfReview));
+    if has_review_actions {
+        if let Some(ai_cfg) = review_ai.as_ref() {
+            if let Err(err) = gh::validate_ai_launch_config(ai_cfg) {
+                eprintln!(
+                    "Skipping review triggers this poll: invalid ai.launch.steps config: {:#}",
+                    err
+                );
+                review_ai = None;
+            }
+        } else {
+            eprintln!(
+                "Skipping review triggers this poll: ai.launch.steps is empty. Configure ai.launch.steps to enable review actions."
+            );
+        }
+    }
+    if has_self_review_actions {
+        if let Some(ai_cfg) = self_review_ai.as_ref() {
+            if let Err(err) = gh::validate_ai_launch_config(ai_cfg) {
+                eprintln!(
+                    "Skipping self-review triggers this poll: invalid launcher config: {:#}",
+                    err
+                );
+                self_review_ai = None;
+            }
+        } else {
+            eprintln!(
+                "Skipping self-review triggers this poll: both ai.launch.steps and ai.launch.self_review_steps are empty."
+            );
+        }
+    }
     let open_pr_count = open_prs.len();
 
     let now = Utc::now();
@@ -678,9 +753,9 @@ pub fn poll_once(cfg: &Config, repos_root: &Path, username: &str) -> Result<Poll
     let mut triggered = 0usize;
     let mut failed = 0usize;
 
-    for candidate in open_prs {
-        let DaemonReviewCandidate { pr, trigger_kind } = candidate;
-        let action = select_trigger_action(&pr, trigger_kind, &auto_approve_rules);
+    for (candidate, action) in open_prs.into_iter().zip(review_actions.into_iter()) {
+        let DaemonReviewCandidate { pr, .. } = candidate;
+        let ai_for_action = ai_config_for_action(action, &review_ai, &self_review_ai, &cfg.ai);
         let key = pr_key(&pr.repo_name, pr.number);
         if let Some(existing) = state.prs.get_mut(&key) {
             existing.last_seen_at = now;
@@ -689,6 +764,10 @@ pub fn poll_once(cfg: &Config, repos_root: &Path, username: &str) -> Result<Poll
             if existing.trigger_status != TriggerStatus::Failed {
                 continue;
             }
+            let Some(ai_config) = ai_for_action else {
+                // Missing or invalid launcher config for this action; do not retry yet.
+                continue;
+            };
 
             println!(
                 "Retrying failed {} trigger for {}#{}",
@@ -696,7 +775,7 @@ pub fn poll_once(cfg: &Config, repos_root: &Path, username: &str) -> Result<Poll
                 pr.repo_name,
                 pr.number
             );
-            match trigger_action(&pr, repos_root, &cfg.ai, action) {
+            match trigger_action(&pr, repos_root, ai_config, action) {
                 Ok(()) => {
                     existing.triggered_at = Some(Utc::now());
                     existing.trigger_status = TriggerStatus::Success;
@@ -724,6 +803,10 @@ pub fn poll_once(cfg: &Config, repos_root: &Path, username: &str) -> Result<Poll
             }
             continue;
         }
+        let Some(ai_config) = ai_for_action else {
+            // Missing or invalid launcher config for this action; keep PR unseen for future polls.
+            continue;
+        };
 
         new_prs += 1;
         println!(
@@ -735,7 +818,7 @@ pub fn poll_once(cfg: &Config, repos_root: &Path, username: &str) -> Result<Poll
         );
 
         let mut record = build_seed_record(&pr, now);
-        match trigger_action(&pr, repos_root, &cfg.ai, action) {
+        match trigger_action(&pr, repos_root, ai_config, action) {
             Ok(()) => {
                 record.triggered_at = Some(Utc::now());
                 record.trigger_status = TriggerStatus::Success;
@@ -1727,6 +1810,44 @@ mod tests {
     fn classify_trigger_kind_skips_authored_draft_prs() {
         let pr = make_test_pr("alice", true);
         assert_eq!(classify_trigger_kind(&pr, "alice"), None);
+    }
+
+    #[test]
+    fn ai_config_for_trigger_kind_requires_review_steps_for_review_action() {
+        let ai = AiConfig::default();
+        assert!(ai_config_for_trigger_kind(&ai, ReviewTriggerKind::Review).is_none());
+    }
+
+    #[test]
+    fn ai_config_for_trigger_kind_self_review_falls_back_to_review_steps() {
+        let mut ai = AiConfig::default();
+        ai.launch.steps = vec![crate::config::AiLaunchStepConfig {
+            command: "maestro".to_string(),
+            args: vec!["start".to_string()],
+        }];
+
+        let self_ai = ai_config_for_trigger_kind(&ai, ReviewTriggerKind::SelfReview)
+            .expect("self-review should use review steps when dedicated steps are absent");
+        assert_eq!(self_ai.launch.steps.len(), 1);
+        assert_eq!(self_ai.launch.steps[0].command, "maestro");
+    }
+
+    #[test]
+    fn ai_config_for_trigger_kind_self_review_prefers_self_review_steps() {
+        let mut ai = AiConfig::default();
+        ai.launch.steps = vec![crate::config::AiLaunchStepConfig {
+            command: "maestro".to_string(),
+            args: vec!["start".to_string()],
+        }];
+        ai.launch.self_review_steps = vec![crate::config::AiLaunchStepConfig {
+            command: "custom-self".to_string(),
+            args: vec!["run".to_string()],
+        }];
+
+        let self_ai = ai_config_for_trigger_kind(&ai, ReviewTriggerKind::SelfReview)
+            .expect("self-review should use dedicated self-review steps when configured");
+        assert_eq!(self_ai.launch.steps.len(), 1);
+        assert_eq!(self_ai.launch.steps[0].command, "custom-self");
     }
 
     #[test]

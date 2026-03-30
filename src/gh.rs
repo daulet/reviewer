@@ -200,6 +200,31 @@ fn determine_review_state(pr_data: &PrData) -> ReviewState {
     }
 }
 
+fn pr_data_to_pull_request(pr_data: PrData, repo_path: PathBuf, repo_name: String) -> PullRequest {
+    let pr_author = pr_data
+        .author
+        .as_ref()
+        .and_then(|a| a.login.as_ref())
+        .map(|s| s.as_str())
+        .unwrap_or("unknown");
+    let review_state = determine_review_state(&pr_data);
+
+    PullRequest {
+        number: pr_data.number,
+        title: pr_data.title,
+        author: pr_author.to_string(),
+        body: pr_data.body.unwrap_or_default(),
+        repo_path,
+        repo_name,
+        url: pr_data.url,
+        updated_at: pr_data.updated_at,
+        additions: pr_data.additions.unwrap_or(0),
+        deletions: pr_data.deletions.unwrap_or(0),
+        is_draft: pr_data.is_draft.unwrap_or(false),
+        review_state,
+    }
+}
+
 fn fetch_prs_for_repo_with_mode(
     repo_path: &PathBuf,
     username: &str,
@@ -235,22 +260,11 @@ fn fetch_prs_for_repo_with_mode(
             continue;
         }
 
-        let review_state = determine_review_state(&pr_data);
-
-        prs.push(PullRequest {
-            number: pr_data.number,
-            title: pr_data.title,
-            author: pr_author.to_string(),
-            body: pr_data.body.unwrap_or_default(),
-            repo_path: repo_path.clone(),
-            repo_name: repo_info.name_with_owner.clone(),
-            url: pr_data.url,
-            updated_at: pr_data.updated_at,
-            additions: pr_data.additions.unwrap_or(0),
-            deletions: pr_data.deletions.unwrap_or(0),
-            is_draft: pr_data.is_draft.unwrap_or(false),
-            review_state,
-        });
+        prs.push(pr_data_to_pull_request(
+            pr_data,
+            repo_path.clone(),
+            repo_info.name_with_owner.clone(),
+        ));
     }
 
     prs
@@ -280,6 +294,47 @@ pub fn fetch_prs_for_repo_with_authored(
         include_drafts,
         RepoPrFetchMode::ReviewAndSelfCandidates,
     )
+}
+
+/// Fetch a specific PR directly, bypassing list-mode filtering (draft/approved checks).
+pub fn fetch_pr_for_review(
+    repo_path: &PathBuf,
+    repo_name: &str,
+    pr_number: u64,
+) -> Result<PullRequest> {
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            &pr_number.to_string(),
+            "--repo",
+            repo_name,
+            "--json",
+            "number,title,author,body,url,updatedAt,additions,deletions,isDraft,reviewDecision",
+        ])
+        .current_dir(repo_path)
+        .output()
+        .context("Failed to fetch PR details")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to fetch PR details for {}#{}: {}",
+            repo_name,
+            pr_number,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let pr_data: PrData = serde_json::from_slice(&output.stdout).context(format!(
+        "Failed to parse PR details response for {}#{}",
+        repo_name, pr_number
+    ))?;
+
+    Ok(pr_data_to_pull_request(
+        pr_data,
+        repo_path.clone(),
+        repo_name.to_string(),
+    ))
 }
 
 #[derive(Debug, Deserialize)]

@@ -7,7 +7,7 @@ mod repos;
 mod terminal;
 mod tui;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use rayon::prelude::*;
 use std::io::{self, Write};
@@ -64,6 +64,8 @@ enum Commands {
     Daemon(DaemonArgs),
     /// Run terminal launch harness and write process evidence report
     Harness(harness::HarnessArgs),
+    /// Trigger an AI review session for a specific PR
+    Trigger(TriggerArgs),
 }
 
 #[derive(Parser)]
@@ -87,6 +89,19 @@ enum DaemonCommand {
     },
     /// Show daemon status and counters
     Status,
+}
+
+#[derive(Parser)]
+struct TriggerArgs {
+    /// PR number to trigger
+    #[arg(long, value_name = "NUMBER")]
+    pr: u64,
+    /// Target repository in owner/name format
+    #[arg(long, value_name = "OWNER/REPO", required_unless_present = "repo_path")]
+    repo: Option<String>,
+    /// Local path to the repo clone (skips repo scan)
+    #[arg(long, value_name = "PATH", required_unless_present = "repo")]
+    repo_path: Option<PathBuf>,
 }
 
 pub fn fetch_all_prs(
@@ -329,6 +344,113 @@ fn run_daemon_command(
     }
 }
 
+fn resolve_trigger_repo(
+    repos_root: &Path,
+    effective_exclude: &[String],
+    args: &TriggerArgs,
+) -> Result<(PathBuf, String)> {
+    if let Some(repo_path) = &args.repo_path {
+        if !repo_path.exists() {
+            bail!("Repo path does not exist: {}", repo_path.display());
+        }
+        if !repo_path.is_dir() {
+            bail!("Repo path is not a directory: {}", repo_path.display());
+        }
+
+        let repo_name = gh::repo_name_with_owner(repo_path).with_context(|| {
+            format!(
+                "Failed to resolve owner/name via gh for repo path {}",
+                repo_path.display()
+            )
+        })?;
+
+        if let Some(expected_repo) = &args.repo {
+            if expected_repo != &repo_name {
+                bail!(
+                    "Repo mismatch: --repo={} but --repo-path resolves to {}",
+                    expected_repo,
+                    repo_name
+                );
+            }
+        }
+
+        return Ok((repo_path.clone(), repo_name));
+    }
+
+    let repo_name = args
+        .repo
+        .as_ref()
+        .context("Either --repo or --repo-path must be provided")?;
+
+    let tail = repo_name.rsplit('/').next().unwrap_or(repo_name);
+    let direct_candidate = repos_root.join(tail);
+    if direct_candidate.is_dir() && direct_candidate.join(".git").exists() {
+        match gh::repo_name_with_owner(&direct_candidate) {
+            Some(name_with_owner) if name_with_owner != *repo_name => {}
+            _ => return Ok((direct_candidate, repo_name.clone())),
+        }
+    }
+
+    println!(
+        "Resolving local clone for {} under {}...",
+        repo_name,
+        repos_root.display()
+    );
+
+    let scan = repos::scan_unique_repos(repos_root, 3, effective_exclude);
+    let repo = scan
+        .unique_repos
+        .into_iter()
+        .find(|repo| repo.name_with_owner.as_deref() == Some(repo_name.as_str()));
+
+    if let Some(repo) = repo {
+        return Ok((repo.path, repo_name.clone()));
+    }
+
+    bail!(
+        "Could not find local clone for {} under {}. Use --repo-path to specify it directly.",
+        repo_name,
+        repos_root.display()
+    );
+}
+
+fn run_trigger_command(
+    cfg: &mut config::Config,
+    root_override: Option<PathBuf>,
+    effective_exclude: Vec<String>,
+    trigger_args: TriggerArgs,
+) -> Result<()> {
+    let repos_root = resolve_repos_root(cfg, root_override)?;
+    let (repo_path, repo_name) =
+        resolve_trigger_repo(&repos_root, &effective_exclude, &trigger_args)?;
+
+    println!("Triggering review for {}#{}...", repo_name, trigger_args.pr);
+
+    let pr = gh::fetch_pr_for_review(&repo_path, &repo_name, trigger_args.pr)?;
+    gh::validate_ai_launch_config(&cfg.ai)?;
+
+    let worktree_path = gh::create_pr_worktree(&pr, &repos_root).with_context(|| {
+        format!(
+            "Failed to create worktree for {}#{}",
+            repo_name, trigger_args.pr
+        )
+    })?;
+    gh::launch_ai(&worktree_path, &pr, &cfg.ai).with_context(|| {
+        format!(
+            "Failed to launch review for {}#{}",
+            repo_name, trigger_args.pr
+        )
+    })?;
+
+    println!(
+        "Triggered review for {}#{} (worktree: {})",
+        repo_name,
+        trigger_args.pr,
+        worktree_path.display()
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     if args.version {
@@ -349,6 +471,9 @@ fn main() -> Result<()> {
             run_daemon_command(&mut cfg, args.root, effective_exclude, daemon_args)
         }
         Some(Commands::Harness(harness_args)) => harness::run(harness_args),
+        Some(Commands::Trigger(trigger_args)) => {
+            run_trigger_command(&mut cfg, args.root, effective_exclude, trigger_args)
+        }
         None => {
             let username = gh::get_current_user()?;
             println!("Authenticated as: {}\n", username);
@@ -373,6 +498,26 @@ mod tests {
     #[test]
     fn daemon_run_parses_without_version_flag() {
         let parsed = Args::try_parse_from(["reviewer", "daemon", "run", "--interval", "300"]);
+        assert!(parsed.is_ok());
+    }
+
+    #[test]
+    fn trigger_parses_with_repo_and_pr() {
+        let parsed =
+            Args::try_parse_from(["reviewer", "trigger", "--repo", "org/repo", "--pr", "2398"]);
+        assert!(parsed.is_ok());
+    }
+
+    #[test]
+    fn trigger_parses_with_repo_path_and_pr() {
+        let parsed = Args::try_parse_from([
+            "reviewer",
+            "trigger",
+            "--repo-path",
+            "/tmp/repo",
+            "--pr",
+            "2398",
+        ]);
         assert!(parsed.is_ok());
     }
 }

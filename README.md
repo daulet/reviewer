@@ -134,6 +134,8 @@ reviewer -r ~/dev              # Specify repos directory
 reviewer -e archived -e old    # Exclude directories
 
 reviewer --my                  # Show PRs you authored (same as -m)
+reviewer trigger --repo org/repo --pr 1234
+reviewer trigger --repo-path ~/dev/org-repo --pr 1234
 
 reviewer daemon init           # Pick repos to monitor
 reviewer daemon run            # Start daemon polling loop
@@ -145,6 +147,9 @@ On first run, you'll be prompted to set your repos root directory.
 Use `--my` (or `-m`) to switch to "my PRs" mode. In this mode, reviewer
 shows PRs authored by your GitHub account and enables `m` in detail view to
 merge mergeable PRs with squash.
+
+`reviewer trigger` launches a review session for an explicit PR and bypasses
+the list-mode draft/approved filters.
 
 Daemon notes:
 - On first daemon setup, reviewer shows an interactive checkbox list of repos and saves exclusions by `owner/repo`.

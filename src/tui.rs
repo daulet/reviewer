@@ -933,7 +933,12 @@ impl App {
                     let delta_too_large = diff::is_too_large_for_delta(&diff);
                     // Process with delta in background
                     let delta_output = diff::process_with_delta(&diff, width);
-                    let _ = tx.send(AsyncResult::Diff(epoch, diff, delta_output, delta_too_large));
+                    let _ = tx.send(AsyncResult::Diff(
+                        epoch,
+                        diff,
+                        delta_output,
+                        delta_too_large,
+                    ));
                 });
             }
         }
@@ -3643,9 +3648,7 @@ diff --git a/README.md b/README.md
         app.detail_epoch = 3;
         app.loading_checks = true;
 
-        app.async_tx
-            .send(AsyncResult::Checks(2, vec![]))
-            .unwrap();
+        app.async_tx.send(AsyncResult::Checks(2, vec![])).unwrap();
         app.poll_async_results();
 
         assert!(app.checks_cache.is_none());
@@ -3659,9 +3662,7 @@ diff --git a/README.md b/README.md
         app.detail_epoch = 3;
         app.loading_checks = true;
 
-        app.async_tx
-            .send(AsyncResult::Checks(3, vec![]))
-            .unwrap();
+        app.async_tx.send(AsyncResult::Checks(3, vec![])).unwrap();
         app.poll_async_results();
 
         assert!(app.checks_cache.is_some());
@@ -3674,9 +3675,7 @@ diff --git a/README.md b/README.md
         let mut app = make_test_app(AppMode::Review);
         app.detail_epoch = 5;
 
-        app.async_tx
-            .send(AsyncResult::Comments(4, vec![]))
-            .unwrap();
+        app.async_tx.send(AsyncResult::Comments(4, vec![])).unwrap();
         app.poll_async_results();
 
         assert!(app.comments_cache.is_none());

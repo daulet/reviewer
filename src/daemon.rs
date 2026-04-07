@@ -709,12 +709,10 @@ pub fn poll_once(cfg: &Config, repos_root: &Path, username: &str) -> Result<Poll
         .collect::<Vec<_>>();
     let mut review_ai = ai_config_for_trigger_kind(&cfg.ai, ReviewTriggerKind::Review);
     let mut self_review_ai = ai_config_for_trigger_kind(&cfg.ai, ReviewTriggerKind::SelfReview);
-    let has_review_actions = review_actions
-        .iter()
-        .any(|action| *action == TriggerAction::Review(ReviewTriggerKind::Review));
-    let has_self_review_actions = review_actions
-        .iter()
-        .any(|action| *action == TriggerAction::Review(ReviewTriggerKind::SelfReview));
+    let has_review_actions =
+        review_actions.contains(&TriggerAction::Review(ReviewTriggerKind::Review));
+    let has_self_review_actions =
+        review_actions.contains(&TriggerAction::Review(ReviewTriggerKind::SelfReview));
     if has_review_actions {
         if let Some(ai_cfg) = review_ai.as_ref() {
             if let Err(err) = gh::validate_ai_launch_config(ai_cfg) {

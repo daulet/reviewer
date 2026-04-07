@@ -13,6 +13,8 @@ use rayon::prelude::*;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+const TUI_FIRST_PAGE_LIMIT: usize = 30;
+
 /// TUI for reviewing GitHub PRs across multiple repositories
 #[derive(Parser)]
 #[command(name = "reviewer")]
@@ -117,12 +119,15 @@ pub fn fetch_all_prs(
     // Sort by most recent first
     let mut all_prs = all_prs;
     all_prs.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    all_prs.truncate(TUI_FIRST_PAGE_LIMIT);
     all_prs
 }
 
 pub fn fetch_my_prs(include_drafts: bool) -> Vec<gh::PullRequest> {
-    // Use gh search prs for a single API call across all repos
-    gh::search_my_prs(include_drafts)
+    // Use gh search prs for a single API call across all repos, capped to first page.
+    let mut prs = gh::search_my_prs(include_drafts);
+    prs.truncate(TUI_FIRST_PAGE_LIMIT);
+    prs
 }
 
 fn merge_excludes(config_exclude: &[String], cli_exclude: &[String]) -> Vec<String> {

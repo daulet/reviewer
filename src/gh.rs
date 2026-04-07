@@ -5,6 +5,9 @@ use serde::Deserialize;
 use std::path::PathBuf;
 use std::process::Command;
 
+const DEFAULT_PR_LIST_LIMIT: usize = 100;
+const FIRST_PAGE_PR_LIST_LIMIT: usize = 30;
+
 #[derive(Debug, Deserialize)]
 struct RepoInfo {
     #[serde(rename = "nameWithOwner")]
@@ -153,7 +156,8 @@ pub fn repo_name_with_owner(repo_path: &PathBuf) -> Option<String> {
     get_repo_info(repo_path).map(|info| info.name_with_owner)
 }
 
-fn get_open_prs(repo_path: &PathBuf) -> Vec<PrData> {
+fn get_open_prs(repo_path: &PathBuf, limit: usize) -> Vec<PrData> {
+    let limit_arg = limit.to_string();
     let output = Command::new("gh")
         .args([
             "pr",
@@ -161,8 +165,8 @@ fn get_open_prs(repo_path: &PathBuf) -> Vec<PrData> {
             "--json",
             "number,title,author,body,url,updatedAt,additions,deletions,reviews,isDraft,reviewDecision",
             "--limit",
-            "100",
         ])
+        .arg(&limit_arg)
         .current_dir(repo_path)
         .output()
         .ok();
@@ -225,18 +229,29 @@ fn pr_data_to_pull_request(pr_data: PrData, repo_path: PathBuf, repo_name: Strin
     }
 }
 
+fn repo_name_from_pr_url(url: &str) -> Option<String> {
+    let mut segments = url.split('/');
+    let _scheme = segments.next()?;
+    let _empty = segments.next()?;
+    let _host = segments.next()?;
+    let owner = segments.next()?;
+    let repo = segments.next()?;
+    Some(format!("{owner}/{repo}"))
+}
+
 fn fetch_prs_for_repo_with_mode(
     repo_path: &PathBuf,
     username: &str,
     include_drafts: bool,
     mode: RepoPrFetchMode,
+    limit: usize,
 ) -> Vec<PullRequest> {
-    let repo_info = match get_repo_info(repo_path) {
-        Some(info) => info,
-        None => return Vec::new(),
-    };
+    let prs_data = get_open_prs(repo_path, limit);
+    if prs_data.is_empty() {
+        return Vec::new();
+    }
 
-    let prs_data = get_open_prs(repo_path);
+    let mut repo_name_fallback: Option<String> = None;
     let mut prs = Vec::new();
 
     for pr_data in prs_data {
@@ -260,10 +275,20 @@ fn fetch_prs_for_repo_with_mode(
             continue;
         }
 
+        let repo_name = repo_name_from_pr_url(&pr_data.url).or_else(|| {
+            if repo_name_fallback.is_none() {
+                repo_name_fallback = get_repo_info(repo_path).map(|info| info.name_with_owner);
+            }
+            repo_name_fallback.clone()
+        });
+        let Some(repo_name) = repo_name else {
+            continue;
+        };
+
         prs.push(pr_data_to_pull_request(
             pr_data,
             repo_path.clone(),
-            repo_info.name_with_owner.clone(),
+            repo_name,
         ));
     }
 
@@ -275,11 +300,26 @@ pub fn fetch_prs_for_repo(
     username: &str,
     include_drafts: bool,
 ) -> Vec<PullRequest> {
+    fetch_prs_for_repo_with_limit(
+        repo_path,
+        username,
+        include_drafts,
+        FIRST_PAGE_PR_LIST_LIMIT,
+    )
+}
+
+pub fn fetch_prs_for_repo_with_limit(
+    repo_path: &PathBuf,
+    username: &str,
+    include_drafts: bool,
+    limit: usize,
+) -> Vec<PullRequest> {
     fetch_prs_for_repo_with_mode(
         repo_path,
         username,
         include_drafts,
         RepoPrFetchMode::ReviewCandidates,
+        limit,
     )
 }
 
@@ -293,6 +333,7 @@ pub fn fetch_prs_for_repo_with_authored(
         username,
         include_drafts,
         RepoPrFetchMode::ReviewAndSelfCandidates,
+        DEFAULT_PR_LIST_LIMIT,
     )
 }
 
@@ -373,8 +414,13 @@ pub fn get_pr_changed_files(pr: &PullRequest) -> Result<Vec<String>> {
 
 /// Search for all PRs authored by the current user across all repos
 pub fn search_my_prs(include_drafts: bool) -> Vec<PullRequest> {
+    search_my_prs_with_limit(include_drafts, FIRST_PAGE_PR_LIST_LIMIT)
+}
+
+fn search_my_prs_with_limit(include_drafts: bool, limit: usize) -> Vec<PullRequest> {
     use rayon::prelude::*;
 
+    let limit_arg = limit.to_string();
     let output = Command::new("gh")
         .args([
             "search",
@@ -384,8 +430,8 @@ pub fn search_my_prs(include_drafts: bool) -> Vec<PullRequest> {
             "--json",
             "number,title,author,body,url,updatedAt,isDraft,repository",
             "--limit",
-            "100",
         ])
+        .arg(&limit_arg)
         .output()
         .ok();
 

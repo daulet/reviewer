@@ -412,12 +412,40 @@ fn build_diff_tree_items(sections: &[FileDiffSection]) -> Vec<DiffTreeItem> {
 }
 
 enum AsyncResult {
-    Diff(usize, String, Option<String>, bool), // (pr_index, diff_content, delta_output, delta_too_large)
-    Comments(usize, Vec<Comment>),             // (pr_index, comments)
-    ReviewComments(usize, Vec<ReviewComment>), // (pr_index, review comments with diff context)
-    Checks(usize, Vec<gh::CheckStatus>),       // (pr_index, CI checks)
-    AiLaunch(Result<String, String>),          // worktree path or error
-    Refresh(Vec<PullRequest>),                 // refreshed PR list
+    Diff(DetailRequestKey, String, Option<String>, bool), // (request_key, diff_content, delta_output, delta_too_large)
+    Comments(DetailRequestKey, Vec<Comment>),             // (request_key, comments)
+    ReviewComments(DetailRequestKey, Vec<ReviewComment>), // (request_key, review comments with diff context)
+    Checks(DetailRequestKey, Vec<gh::CheckStatus>),       // (request_key, CI checks)
+    AiLaunch(Result<String, String>),                     // worktree path or error
+    Refresh(Vec<PullRequest>),                            // refreshed PR list
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DetailRequestKey {
+    epoch: u64,
+    repo_name: String,
+    pr_number: u64,
+}
+
+impl DetailRequestKey {
+    fn new(epoch: u64, repo_name: &str, pr_number: u64) -> Self {
+        Self {
+            epoch,
+            repo_name: repo_name.to_string(),
+            pr_number,
+        }
+    }
+
+    fn from_pr(epoch: u64, pr: &PullRequest) -> Self {
+        Self::new(epoch, &pr.repo_name, pr.number)
+    }
+
+    fn matches(&self, current_epoch: u64, current_pr: Option<&PullRequest>) -> bool {
+        self.epoch == current_epoch
+            && current_pr
+                .map(|pr| pr.repo_name == self.repo_name && pr.number == self.pr_number)
+                .unwrap_or(false)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -448,11 +476,12 @@ pub enum InputMode {
     Comment,
     LineComment, // Comment on a specific line in diff
     ConfirmApprove,
-    ConfirmClose, // Confirm close with optional comment
-    ConfirmMerge, // Confirm merge (squash)
-    Search,       // Searching in diff
-    ListSearch,   // Searching in PR list
-    GotoLine,     // Jump to specific line
+    ConfirmRequestChanges, // Request changes with required comment
+    ConfirmClose,          // Confirm close with optional comment
+    ConfirmMerge,          // Confirm merge (squash)
+    Search,                // Searching in diff
+    ListSearch,            // Searching in PR list
+    GotoLine,              // Jump to specific line
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -518,6 +547,7 @@ pub struct App {
     // Async loading
     async_tx: Sender<AsyncResult>,
     async_rx: Receiver<AsyncResult>,
+    detail_epoch: u64, // Incremented on each enter_detail(); guards against stale async results
     loading_diff: bool,
     loading_comments: bool,
     loading_review_comments: bool,
@@ -582,6 +612,7 @@ impl App {
             should_quit: false,
             async_tx,
             async_rx,
+            detail_epoch: 0,
             loading_diff: false,
             loading_comments: false,
             loading_review_comments: false,
@@ -624,6 +655,26 @@ impl App {
         self.selected_file_diff_path = None;
         self.filtered_diff_cache = None;
         self.filtered_diff_lines.clear();
+    }
+
+    fn reset_detail_session_state(&mut self) {
+        self.scroll_offset = 0;
+        self.diff_cache = None;
+        self.delta_cache = None;
+        self.diff_lines.clear();
+        self.delta_line_info.clear();
+        self.reset_large_diff_state();
+        self.comments_cache = None;
+        self.review_comments_cache = None;
+        self.checks_cache = None;
+        self.input_mode = InputMode::Normal;
+        self.input_buffer.clear();
+        self.line_comment_ctx = None;
+        self.loading_diff = false;
+        self.loading_comments = false;
+        self.loading_review_comments = false;
+        self.loading_checks = false;
+        self.clear_search();
     }
 
     fn large_diff_file_selector_enabled(&self) -> bool {
@@ -822,21 +873,10 @@ impl App {
 
     fn enter_detail(&mut self) {
         if self.selected_pr().is_some() {
+            self.detail_epoch += 1;
             self.view = View::Detail;
             self.detail_tab = DetailTab::Description;
-            self.scroll_offset = 0;
-            self.diff_cache = None;
-            self.delta_cache = None;
-            self.diff_lines.clear();
-            self.delta_line_info.clear();
-            self.reset_large_diff_state();
-            self.comments_cache = None;
-            self.review_comments_cache = None;
-            self.checks_cache = None;
-            self.loading_diff = false;
-            self.loading_comments = false;
-            self.loading_review_comments = false;
-            self.loading_checks = false;
+            self.reset_detail_session_state();
             self.needs_clear = true;
             // Load checks asynchronously
             self.load_checks();
@@ -845,21 +885,8 @@ impl App {
 
     fn exit_detail(&mut self) {
         self.view = View::List;
-        self.scroll_offset = 0;
-        self.diff_cache = None;
-        self.delta_cache = None;
-        self.diff_lines.clear();
-        self.delta_line_info.clear();
-        self.reset_large_diff_state();
-        self.comments_cache = None;
-        self.review_comments_cache = None;
-        self.checks_cache = None;
-        self.loading_diff = false;
-        self.loading_comments = false;
-        self.loading_review_comments = false;
-        self.loading_checks = false;
+        self.reset_detail_session_state();
         self.needs_clear = true;
-        self.clear_search();
     }
 
     fn next_tab(&mut self) {
@@ -920,6 +947,7 @@ impl App {
                 self.loading_diff = true;
                 let pr = pr.clone();
                 let tx = self.async_tx.clone();
+                let request_key = DetailRequestKey::from_pr(self.detail_epoch, &pr);
                 // Get terminal width for delta's side-by-side mode
                 let width = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(120);
                 thread::spawn(move || {
@@ -927,7 +955,12 @@ impl App {
                     let delta_too_large = diff::is_too_large_for_delta(&diff);
                     // Process with delta in background
                     let delta_output = diff::process_with_delta(&diff, width);
-                    let _ = tx.send(AsyncResult::Diff(idx, diff, delta_output, delta_too_large));
+                    let _ = tx.send(AsyncResult::Diff(
+                        request_key,
+                        diff,
+                        delta_output,
+                        delta_too_large,
+                    ));
                 });
             }
         }
@@ -942,9 +975,10 @@ impl App {
                 self.loading_comments = true;
                 let pr = pr.clone();
                 let tx = self.async_tx.clone();
+                let request_key = DetailRequestKey::from_pr(self.detail_epoch, &pr);
                 thread::spawn(move || {
                     let comments = gh::get_pr_comments(&pr).unwrap_or_default();
-                    let _ = tx.send(AsyncResult::Comments(idx, comments));
+                    let _ = tx.send(AsyncResult::Comments(request_key, comments));
                 });
             }
         }
@@ -959,9 +993,10 @@ impl App {
                 self.loading_review_comments = true;
                 let pr = pr.clone();
                 let tx = self.async_tx.clone();
+                let request_key = DetailRequestKey::from_pr(self.detail_epoch, &pr);
                 thread::spawn(move || {
                     let comments = gh::get_review_comments(&pr).unwrap_or_default();
-                    let _ = tx.send(AsyncResult::ReviewComments(idx, comments));
+                    let _ = tx.send(AsyncResult::ReviewComments(request_key, comments));
                 });
             }
         }
@@ -976,9 +1011,10 @@ impl App {
                 self.loading_checks = true;
                 let pr = pr.clone();
                 let tx = self.async_tx.clone();
+                let request_key = DetailRequestKey::from_pr(self.detail_epoch, &pr);
                 thread::spawn(move || {
                     let checks = gh::get_pr_checks(&pr).unwrap_or_default();
-                    let _ = tx.send(AsyncResult::Checks(idx, checks));
+                    let _ = tx.send(AsyncResult::Checks(request_key, checks));
                 });
             }
         }
@@ -989,9 +1025,9 @@ impl App {
         while let Ok(result) = self.async_rx.try_recv() {
             has_updates = true;
             match result {
-                AsyncResult::Diff(idx, diff, delta_output, delta_too_large) => {
-                    // Only update if still viewing the same PR
-                    if self.list_state.selected() == Some(idx) {
+                AsyncResult::Diff(request_key, diff, delta_output, delta_too_large) => {
+                    // Only update if this result belongs to the current detail session
+                    if request_key.matches(self.detail_epoch, self.selected_pr()) {
                         self.diff_lines = parse_diff(&diff);
                         // Parse delta output for line info if available
                         if let Some(ref delta) = delta_output {
@@ -1012,26 +1048,26 @@ impl App {
                         }
                         self.diff_cache = Some(diff);
                         self.delta_cache = delta_output;
+                        self.loading_diff = false;
                     }
-                    self.loading_diff = false;
                 }
-                AsyncResult::Comments(idx, comments) => {
-                    if self.list_state.selected() == Some(idx) {
+                AsyncResult::Comments(request_key, comments) => {
+                    if request_key.matches(self.detail_epoch, self.selected_pr()) {
                         self.comments_cache = Some(comments);
+                        self.loading_comments = false;
                     }
-                    self.loading_comments = false;
                 }
-                AsyncResult::ReviewComments(idx, comments) => {
-                    if self.list_state.selected() == Some(idx) {
+                AsyncResult::ReviewComments(request_key, comments) => {
+                    if request_key.matches(self.detail_epoch, self.selected_pr()) {
                         self.review_comments_cache = Some(comments);
+                        self.loading_review_comments = false;
                     }
-                    self.loading_review_comments = false;
                 }
-                AsyncResult::Checks(idx, checks) => {
-                    if self.list_state.selected() == Some(idx) {
+                AsyncResult::Checks(request_key, checks) => {
+                    if request_key.matches(self.detail_epoch, self.selected_pr()) {
                         self.checks_cache = Some(checks);
+                        self.loading_checks = false;
                     }
-                    self.loading_checks = false;
                 }
                 AsyncResult::AiLaunch(result) => {
                     self.launching_ai = false;
@@ -1053,13 +1089,26 @@ impl App {
                     self.refreshing = false;
                     self.needs_clear = true;
                     let count = prs.len();
+                    let was_in_detail = self.view == View::Detail;
+
+                    if was_in_detail {
+                        self.detail_epoch += 1;
+                        self.reset_detail_session_state();
+                    }
+
                     self.prs = prs;
-                    // Reset selection
+
                     if self.prs.is_empty() {
                         self.list_state.select(None);
+                        self.view = View::List;
                     } else {
                         self.list_state.select(Some(0));
+                        if was_in_detail {
+                            self.load_checks();
+                            self.load_tab_content();
+                        }
                     }
+
                     let draft_status = if self.include_drafts {
                         " (incl. drafts)"
                     } else {
@@ -1269,19 +1318,22 @@ impl App {
                     self.set_status(format!("Approved PR #{}", pr.number));
                     // Remove from list
                     if let Some(idx) = self.list_state.selected() {
+                        let was_in_detail = self.view == View::Detail;
                         self.prs.remove(idx);
                         if self.prs.is_empty() {
                             self.list_state.select(None);
-                            self.view = View::List;
-                        } else if idx >= self.prs.len() {
-                            self.list_state.select(Some(self.prs.len() - 1));
-                        }
-                        if self.view == View::Detail && !self.prs.is_empty() {
-                            self.diff_cache = None;
-                            self.comments_cache = None;
-                            self.review_comments_cache = None;
-                        } else if self.prs.is_empty() {
-                            self.view = View::List;
+                            if was_in_detail {
+                                self.exit_detail();
+                            } else {
+                                self.view = View::List;
+                            }
+                        } else {
+                            if idx >= self.prs.len() {
+                                self.list_state.select(Some(self.prs.len() - 1));
+                            }
+                            if was_in_detail {
+                                self.enter_detail();
+                            }
                         }
                     }
                 }
@@ -1295,6 +1347,64 @@ impl App {
 
     fn cancel_approve(&mut self) {
         self.input_mode = InputMode::Normal;
+    }
+
+    fn start_request_changes(&mut self) {
+        if self.mode != AppMode::Review {
+            self.set_status("Request changes only available in review mode".to_string());
+            return;
+        }
+
+        if self.selected_pr().is_some() {
+            self.input_mode = InputMode::ConfirmRequestChanges;
+            self.input_buffer.clear();
+        }
+    }
+
+    fn confirm_request_changes(&mut self) {
+        if let Some(pr) = self.selected_pr().cloned() {
+            let body = self.input_buffer.trim().to_string();
+            if body.is_empty() {
+                self.set_status("A comment is required when requesting changes".to_string());
+                self.input_mode = InputMode::Normal;
+                self.input_buffer.clear();
+                return;
+            }
+            match gh::request_changes_pr(&pr, &body) {
+                Ok(()) => {
+                    self.set_status(format!("Requested changes on PR #{}", pr.number));
+                    if let Some(idx) = self.list_state.selected() {
+                        let was_in_detail = self.view == View::Detail;
+                        self.prs.remove(idx);
+                        if self.prs.is_empty() {
+                            self.list_state.select(None);
+                            if was_in_detail {
+                                self.exit_detail();
+                            } else {
+                                self.view = View::List;
+                            }
+                        } else {
+                            if idx >= self.prs.len() {
+                                self.list_state.select(Some(self.prs.len() - 1));
+                            }
+                            if was_in_detail {
+                                self.enter_detail();
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.set_status(format!("Error: {}", e));
+                }
+            }
+        }
+        self.input_mode = InputMode::Normal;
+        self.input_buffer.clear();
+    }
+
+    fn cancel_request_changes(&mut self) {
+        self.input_mode = InputMode::Normal;
+        self.input_buffer.clear();
     }
 
     fn start_close(&mut self) {
@@ -1512,6 +1622,9 @@ impl App {
                         InputMode::Comment => self.handle_comment_key(key.code),
                         InputMode::LineComment => self.handle_line_comment_key(key.code),
                         InputMode::ConfirmApprove => self.handle_confirm_key(key.code),
+                        InputMode::ConfirmRequestChanges => {
+                            self.handle_request_changes_key(key.code)
+                        }
                         InputMode::ConfirmClose => self.handle_close_key(key.code),
                         InputMode::ConfirmMerge => self.handle_merge_key(key.code),
                         InputMode::Search => self.handle_search_key(key.code),
@@ -1603,6 +1716,7 @@ impl App {
                 KeyCode::Enter if self.showing_large_diff_tree() => self.open_selected_file_diff(),
                 KeyCode::Char('c') => self.start_line_comment(),
                 KeyCode::Char('a') => self.start_approve(),
+                KeyCode::Char('R') => self.start_request_changes(),
                 KeyCode::Char('x') => self.start_close(),
                 KeyCode::Char('m') => self.start_merge(),
                 KeyCode::Char('r') => self.launch_ai_review(),
@@ -1654,6 +1768,20 @@ impl App {
         match code {
             KeyCode::Char('y' | 'Y') | KeyCode::Enter => self.confirm_approve(),
             KeyCode::Char('n' | 'N') | KeyCode::Esc => self.cancel_approve(),
+            _ => {}
+        }
+    }
+
+    fn handle_request_changes_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Enter => self.confirm_request_changes(),
+            KeyCode::Esc => self.cancel_request_changes(),
+            KeyCode::Backspace => {
+                self.input_buffer.pop();
+            }
+            KeyCode::Char(c) => {
+                self.input_buffer.push(c);
+            }
             _ => {}
         }
     }
@@ -2043,6 +2171,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // Draw confirmation dialog if active
     if app.input_mode == InputMode::ConfirmApprove {
         draw_confirm_dialog(frame, app);
+    }
+
+    // Draw request changes dialog if active
+    if app.input_mode == InputMode::ConfirmRequestChanges {
+        draw_request_changes_dialog(frame, app);
     }
 
     // Draw close dialog if active
@@ -2522,7 +2655,7 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
                 " j/k: scroll | Esc: file tree | t: full diff | /: search | D: delta | m: merge | o: browser | y: copy | q: back"
             }
             AppMode::Review => {
-                " j/k: scroll | Esc: file tree | t: full diff | /: search | c: comment | D: delta | a: approve | o: browser | y: copy | q: back"
+                " j/k: scroll | Esc: file tree | t: full diff | /: search | c: comment | D: delta | a: approve | R: request changes | o: browser | y: copy | q: back"
             }
         }
     } else {
@@ -2531,13 +2664,13 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
                 " j/k: scroll | /: search | t: tree | D: delta | m: merge | o: browser | y: copy | q: back"
             }
             (DetailTab::Diff, AppMode::Review) => {
-                " j/k: scroll | /: search | t: tree | c: comment | D: delta | a: approve | o: browser | y: copy | q: back"
+                " j/k: scroll | /: search | t: tree | c: comment | D: delta | a: approve | R: request changes | o: browser | y: copy | q: back"
             }
             (_, AppMode::MyPrs) => {
                 " Tab: tabs | j/k: scroll | m: merge | o: browser | y: copy | q: back"
             }
             (_, AppMode::Review) => {
-                " Tab: tabs | j/k: scroll | a: approve | o: browser | y: copy | q: back"
+                " Tab: tabs | j/k: scroll | a: approve | R: request changes | o: browser | y: copy | q: back"
             }
         }
     };
@@ -2638,6 +2771,53 @@ fn draw_confirm_dialog(frame: &mut Frame, app: &App) {
             .borders(Borders::ALL)
             .title(" Confirm Approval ")
             .style(Style::default().fg(Color::Yellow)),
+    );
+
+    frame.render_widget(Clear, popup_area);
+    frame.render_widget(dialog, popup_area);
+}
+
+fn draw_request_changes_dialog(frame: &mut Frame, app: &App) {
+    let pr = match app.selected_pr() {
+        Some(pr) => pr,
+        None => return,
+    };
+
+    let area = frame.area();
+    let popup_area = Rect {
+        x: area.width / 6,
+        y: area.height / 3,
+        width: area.width * 2 / 3,
+        height: 9,
+    };
+
+    let text = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  Request changes on "),
+            Span::styled(
+                format!("[{}] #{}", pr.repo_name, pr.number),
+                Style::default().fg(Color::Cyan).bold(),
+            ),
+            Span::raw("?"),
+        ]),
+        Line::from(""),
+        Line::from("  Comment (required):"),
+        Line::from(format!("  > {}", app.input_buffer)),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  [Enter]", Style::default().fg(Color::Red).bold()),
+            Span::raw(" Submit    "),
+            Span::styled("[Esc]", Style::default().fg(Color::Green).bold()),
+            Span::raw(" Cancel"),
+        ]),
+    ];
+
+    let dialog = Paragraph::new(text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Request Changes ")
+            .style(Style::default().fg(Color::Red)),
     );
 
     frame.render_widget(Clear, popup_area);
@@ -2857,6 +3037,7 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AiConfig;
 
     // Tests use output patterns captured from real `delta` CLI output
 
@@ -3381,6 +3562,26 @@ diff --git a/README.md b/README.md
         }
     }
 
+    fn make_test_app(mode: AppMode) -> App {
+        let mut app = App::new(
+            PathBuf::new(),
+            Vec::new(),
+            "reviewer".to_string(),
+            false,
+            AiConfig::default(),
+            mode,
+        );
+        app.prs = vec![make_test_pr(
+            123,
+            "Add request changes",
+            "org/reviewer",
+            "alice",
+        )];
+        app.list_state.select(Some(0));
+        app.view = View::Detail;
+        app
+    }
+
     #[test]
     fn test_pr_matches_list_query_matches_pr_number() {
         let pr = make_test_pr(
@@ -3402,5 +3603,326 @@ diff --git a/README.md b/README.md
         assert!(pr_matches_list_query(&pr, "org/reviewer"));
         assert!(pr_matches_list_query(&pr, "alice"));
         assert!(!pr_matches_list_query(&pr, "nonexistent"));
+    }
+
+    #[test]
+    fn test_start_request_changes_requires_review_mode() {
+        let mut app = make_test_app(AppMode::MyPrs);
+
+        app.start_request_changes();
+
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Request changes only available in review mode")
+        );
+    }
+
+    #[test]
+    fn test_start_request_changes_enters_confirm_mode() {
+        let mut app = make_test_app(AppMode::Review);
+        app.input_buffer = "stale".to_string();
+
+        app.start_request_changes();
+
+        assert_eq!(app.input_mode, InputMode::ConfirmRequestChanges);
+        assert!(app.input_buffer.is_empty());
+    }
+
+    #[test]
+    fn test_confirm_request_changes_requires_comment() {
+        let mut app = make_test_app(AppMode::Review);
+        app.input_mode = InputMode::ConfirmRequestChanges;
+        app.input_buffer = "   ".to_string();
+
+        app.confirm_request_changes();
+
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert!(app.input_buffer.is_empty());
+        assert_eq!(app.prs.len(), 1);
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("A comment is required when requesting changes")
+        );
+    }
+
+    // --- Async epoch guard tests ---
+
+    #[test]
+    fn test_stale_async_diff_rejected_after_refresh_session_reset() {
+        let mut app = make_test_app(AppMode::Review);
+        app.detail_epoch = 7;
+        app.loading_diff = true;
+
+        app.async_tx
+            .send(AsyncResult::Refresh(vec![make_test_pr(
+                456,
+                "Refreshed PR",
+                "org/reviewer",
+                "bob",
+            )]))
+            .unwrap();
+        app.poll_async_results();
+
+        app.async_tx
+            .send(AsyncResult::Diff(
+                DetailRequestKey::new(7, "org/reviewer", 123),
+                "stale diff".to_string(),
+                None,
+                false,
+            ))
+            .unwrap();
+        app.poll_async_results();
+
+        assert!(app.diff_cache.is_none());
+        assert!(!app.loading_diff);
+        assert_eq!(app.detail_epoch, 8);
+        assert_eq!(app.prs[0].number, 456);
+    }
+
+    #[test]
+    fn test_current_async_diff_accepted() {
+        // A Diff result tagged with the current epoch must be applied.
+        let mut app = make_test_app(AppMode::Review);
+        app.detail_epoch = 2;
+        app.loading_diff = true;
+
+        app.async_tx
+            .send(AsyncResult::Diff(
+                DetailRequestKey::new(2, "org/reviewer", 123),
+                String::new(),
+                None,
+                false,
+            ))
+            .unwrap();
+        app.poll_async_results();
+
+        assert!(app.diff_cache.is_some());
+        assert!(!app.loading_diff);
+    }
+
+    #[test]
+    fn test_async_diff_rejected_when_pr_identity_changes_even_with_same_epoch() {
+        let mut app = make_test_app(AppMode::Review);
+        app.detail_epoch = 7;
+        app.loading_diff = true;
+        app.prs = vec![make_test_pr(456, "Refreshed PR", "org/reviewer", "bob")];
+        app.list_state.select(Some(0));
+
+        app.async_tx
+            .send(AsyncResult::Diff(
+                DetailRequestKey::new(7, "org/reviewer", 123),
+                "stale diff".to_string(),
+                None,
+                false,
+            ))
+            .unwrap();
+        app.poll_async_results();
+
+        assert!(app.diff_cache.is_none());
+        assert_eq!(app.prs[0].number, 456);
+    }
+
+    #[test]
+    fn test_stale_async_diff_rejected_after_refresh_keeps_same_pr_identity() {
+        let mut app = make_test_app(AppMode::Review);
+        app.detail_epoch = 11;
+        app.diff_cache = Some("fresh diff".to_string());
+
+        app.async_tx
+            .send(AsyncResult::Refresh(vec![make_test_pr(
+                123,
+                "Same PR Refreshed",
+                "org/reviewer",
+                "alice",
+            )]))
+            .unwrap();
+        app.poll_async_results();
+
+        app.async_tx
+            .send(AsyncResult::Diff(
+                DetailRequestKey::new(11, "org/reviewer", 123),
+                "stale diff".to_string(),
+                None,
+                false,
+            ))
+            .unwrap();
+        app.poll_async_results();
+
+        assert!(app.diff_cache.is_none());
+        assert_eq!(app.detail_epoch, 12);
+        assert_eq!(app.prs[0].number, 123);
+    }
+
+    #[test]
+    fn test_stale_async_checks_rejected_after_enter_detail() {
+        // Stale Checks result from a previous detail session must be discarded.
+        let mut app = make_test_app(AppMode::Review);
+        app.detail_epoch = 3;
+        app.loading_checks = true;
+
+        app.async_tx
+            .send(AsyncResult::Checks(
+                DetailRequestKey::new(2, "org/reviewer", 123),
+                vec![],
+            ))
+            .unwrap();
+        app.poll_async_results();
+
+        assert!(app.checks_cache.is_none());
+        assert!(app.loading_checks);
+    }
+
+    #[test]
+    fn test_current_async_checks_accepted() {
+        // A Checks result tagged with the current epoch must be applied.
+        let mut app = make_test_app(AppMode::Review);
+        app.detail_epoch = 3;
+        app.loading_checks = true;
+
+        app.async_tx
+            .send(AsyncResult::Checks(
+                DetailRequestKey::new(3, "org/reviewer", 123),
+                vec![],
+            ))
+            .unwrap();
+        app.poll_async_results();
+
+        assert!(app.checks_cache.is_some());
+        assert!(!app.loading_checks);
+    }
+
+    #[test]
+    fn test_async_comments_accepted_when_epoch_and_pr_identity_match() {
+        let mut app = make_test_app(AppMode::Review);
+        app.detail_epoch = 8;
+        app.loading_comments = true;
+
+        app.async_tx
+            .send(AsyncResult::Comments(
+                DetailRequestKey::new(8, "org/reviewer", 123),
+                vec![],
+            ))
+            .unwrap();
+        app.poll_async_results();
+
+        assert!(app.comments_cache.is_some());
+        assert!(!app.loading_comments);
+    }
+
+    #[test]
+    fn test_stale_async_comments_rejected_after_enter_detail() {
+        // Stale Comments result from a previous detail session must be discarded.
+        let mut app = make_test_app(AppMode::Review);
+        app.detail_epoch = 5;
+
+        app.async_tx
+            .send(AsyncResult::Comments(
+                DetailRequestKey::new(4, "org/reviewer", 123),
+                vec![],
+            ))
+            .unwrap();
+        app.poll_async_results();
+
+        assert!(app.comments_cache.is_none());
+    }
+
+    #[test]
+    fn test_refresh_in_detail_replaces_session_even_for_same_pr_identity() {
+        let mut app = make_test_app(AppMode::Review);
+        app.detail_epoch = 4;
+        app.loading_diff = true;
+        app.diff_cache = Some("old diff".to_string());
+        app.scroll_offset = 12;
+
+        app.async_tx
+            .send(AsyncResult::Refresh(vec![make_test_pr(
+                123,
+                "Same PR Refreshed",
+                "org/reviewer",
+                "alice",
+            )]))
+            .unwrap();
+        app.poll_async_results();
+
+        assert_eq!(app.detail_epoch, 5);
+        assert_eq!(app.view, View::Detail);
+        assert_eq!(app.prs[0].number, 123);
+        assert!(app.diff_cache.is_none());
+        assert_eq!(app.scroll_offset, 0);
+        assert!(app.loading_checks);
+    }
+
+    #[test]
+    fn test_refresh_in_detail_clears_modal_and_line_comment_state() {
+        let mut app = make_test_app(AppMode::Review);
+        app.detail_epoch = 4;
+        app.input_mode = InputMode::ConfirmClose;
+        app.input_buffer = "stale close note".to_string();
+        app.line_comment_ctx = Some(LineCommentContext {
+            file_path: "src/lib.rs".to_string(),
+            line_number: 7,
+            side: CommentSide::Right,
+        });
+
+        app.async_tx
+            .send(AsyncResult::Refresh(vec![make_test_pr(
+                123,
+                "Same PR Refreshed",
+                "org/reviewer",
+                "alice",
+            )]))
+            .unwrap();
+        app.poll_async_results();
+
+        assert_eq!(app.detail_epoch, 5);
+        assert_eq!(app.view, View::Detail);
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert!(app.input_buffer.is_empty());
+        assert!(app.line_comment_ctx.is_none());
+    }
+
+    #[test]
+    fn test_refresh_to_empty_list_exits_detail_and_clears_selection() {
+        let mut app = make_test_app(AppMode::Review);
+        app.detail_epoch = 9;
+        app.loading_diff = true;
+
+        app.async_tx.send(AsyncResult::Refresh(vec![])).unwrap();
+        app.poll_async_results();
+
+        assert_eq!(app.detail_epoch, 10);
+        assert!(app.prs.is_empty());
+        assert_eq!(app.view, View::List);
+        assert!(app.list_state.selected().is_none());
+        assert!(!app.loading_diff);
+    }
+
+    #[test]
+    fn test_enter_detail_increments_epoch() {
+        // Each call to enter_detail() must bump the epoch so that in-flight
+        // async results from the previous PR are rejected.
+        let mut app = make_test_app(AppMode::Review);
+        let epoch_before = app.detail_epoch;
+
+        app.enter_detail();
+
+        assert_eq!(app.detail_epoch, epoch_before + 1);
+    }
+
+    #[test]
+    fn test_enter_detail_clears_search_state() {
+        // enter_detail() must clear search state so that 'n'/'N' keys route
+        // to next/prev PR navigation rather than stale search match iteration.
+        let mut app = make_test_app(AppMode::Review);
+        app.search_query = "foo".to_string();
+        app.search_matches = vec![1, 5, 10];
+        app.search_match_idx = 2;
+
+        app.enter_detail();
+
+        assert!(app.search_query.is_empty());
+        assert!(app.search_matches.is_empty());
+        assert_eq!(app.search_match_idx, 0);
     }
 }

@@ -412,6 +412,7 @@ fn build_diff_tree_items(sections: &[FileDiffSection]) -> Vec<DiffTreeItem> {
 }
 
 enum AsyncResult {
+    Details(usize, Result<PullRequest, String>), // (pr_index, fully populated PR details)
     Diff(usize, String, Option<String>, bool), // (pr_index, diff_content, delta_output, delta_too_large)
     Comments(usize, Vec<Comment>),             // (pr_index, comments)
     ReviewComments(usize, Vec<ReviewComment>), // (pr_index, review comments with diff context)
@@ -436,7 +437,7 @@ pub enum DetailTab {
 /// App mode - determines what PRs are shown
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AppMode {
-    /// Review mode: PRs from others needing your review
+    /// Review mode: PRs involving the current user
     Review,
     /// My PRs mode: Your own PRs
     MyPrs,
@@ -479,7 +480,6 @@ pub enum CommentSide {
 pub struct App {
     pub prs: Vec<PullRequest>,
     pub repos_root: PathBuf,
-    pub repo_list: Vec<PathBuf>,
     pub username: String,
     pub include_drafts: bool,
     pub mode: AppMode,
@@ -522,6 +522,7 @@ pub struct App {
     loading_comments: bool,
     loading_review_comments: bool,
     loading_checks: bool,
+    loading_details: bool,
     refreshing: bool,
     // Screen state
     needs_clear: bool,
@@ -535,7 +536,6 @@ pub struct App {
 impl App {
     pub fn new(
         repos_root: PathBuf,
-        repo_list: Vec<PathBuf>,
         username: String,
         include_drafts: bool,
         ai: AiConfig,
@@ -545,7 +545,6 @@ impl App {
         Self {
             prs: Vec::new(),
             repos_root,
-            repo_list,
             username,
             include_drafts,
             mode,
@@ -586,6 +585,7 @@ impl App {
             loading_comments: false,
             loading_review_comments: false,
             loading_checks: false,
+            loading_details: false,
             refreshing: false,
             needs_clear: true,
             needs_redraw: true,
@@ -837,8 +837,10 @@ impl App {
             self.loading_comments = false;
             self.loading_review_comments = false;
             self.loading_checks = false;
+            self.loading_details = false;
             self.needs_clear = true;
-            // Load checks asynchronously
+            // Load details and checks asynchronously.
+            self.load_details();
             self.load_checks();
         }
     }
@@ -858,6 +860,7 @@ impl App {
         self.loading_comments = false;
         self.loading_review_comments = false;
         self.loading_checks = false;
+        self.loading_details = false;
         self.needs_clear = true;
         self.clear_search();
     }
@@ -886,7 +889,7 @@ impl App {
 
     fn load_tab_content(&mut self) {
         match self.detail_tab {
-            DetailTab::Description => {}
+            DetailTab::Description => self.load_details(),
             DetailTab::Diff => self.load_diff(),
             DetailTab::Comments => {
                 self.load_comments();
@@ -909,6 +912,27 @@ impl App {
 
     fn page_up(&mut self) {
         self.scroll_offset = self.scroll_offset.saturating_sub(20);
+    }
+
+    fn load_details(&mut self) {
+        if self.loading_details {
+            return;
+        }
+        if let Some(idx) = self.list_state.selected() {
+            if let Some(pr) = self.prs.get(idx) {
+                if pr.details_loaded {
+                    return;
+                }
+
+                self.loading_details = true;
+                let pr = pr.clone();
+                let tx = self.async_tx.clone();
+                thread::spawn(move || {
+                    let details = gh::fetch_pr_details(&pr).map_err(|e| format!("{:#}", e));
+                    let _ = tx.send(AsyncResult::Details(idx, details));
+                });
+            }
+        }
     }
 
     fn load_diff(&mut self) {
@@ -989,6 +1013,19 @@ impl App {
         while let Ok(result) = self.async_rx.try_recv() {
             has_updates = true;
             match result {
+                AsyncResult::Details(idx, result) => {
+                    if self.list_state.selected() == Some(idx) {
+                        match result {
+                            Ok(details) => {
+                                if let Some(pr) = self.prs.get_mut(idx) {
+                                    *pr = details;
+                                }
+                            }
+                            Err(e) => self.set_status(format!("Failed to load PR details: {}", e)),
+                        }
+                    }
+                    self.loading_details = false;
+                }
                 AsyncResult::Diff(idx, diff, delta_output, delta_too_large) => {
                     // Only update if still viewing the same PR
                     if self.list_state.selected() == Some(idx) {
@@ -1456,15 +1493,14 @@ impl App {
         self.set_status("Refreshing PR list...".to_string());
 
         let tx = self.async_tx.clone();
-        let repo_list = self.repo_list.clone();
         let username = self.username.clone();
         let include_drafts = self.include_drafts;
         let mode = self.mode;
 
         thread::spawn(move || {
             let prs = match mode {
-                AppMode::Review => crate::fetch_all_prs(&repo_list, &username, include_drafts),
-                AppMode::MyPrs => crate::fetch_my_prs(include_drafts),
+                AppMode::Review => crate::fetch_involved_prs(&username, include_drafts),
+                AppMode::MyPrs => crate::fetch_my_prs(&username, include_drafts),
             };
             let _ = tx.send(AsyncResult::Refresh(prs));
         });
@@ -2087,7 +2123,11 @@ fn draw_list(frame: &mut Frame, app: &mut App) {
         .prs
         .iter()
         .map(|pr| {
-            let stats = format!("+{}/-{}", pr.additions, pr.deletions);
+            let stats = if pr.details_loaded {
+                format!("+{}/-{}", pr.additions, pr.deletions)
+            } else {
+                "+?/-?".to_string()
+            };
             let age = format_age(&pr.updated_at);
             let mut title_spans = vec![
                 Span::styled(
@@ -2126,7 +2166,7 @@ fn draw_list(frame: &mut Frame, app: &mut App) {
 
     let draft_status = if app.include_drafts { " +drafts" } else { "" };
     let title = match app.mode {
-        AppMode::Review => format!(" PRs requiring review ({}){} ", app.prs.len(), draft_status),
+        AppMode::Review => format!(" PRs involving me ({}){} ", app.prs.len(), draft_status),
         AppMode::MyPrs => format!(" My PRs ({}){} ", app.prs.len(), draft_status),
     };
     let list = List::new(items)
@@ -2280,7 +2320,9 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
 
     match app.detail_tab {
         DetailTab::Description => {
-            let body = if pr.body.is_empty() {
+            let body = if app.loading_details && pr.body.is_empty() {
+                "Loading details...".to_string()
+            } else if pr.body.is_empty() {
                 "No description provided.".to_string()
             } else {
                 pr.body.clone()
@@ -2796,7 +2838,6 @@ fn draw_goto_input(frame: &mut Frame, app: &App) {
 
 pub fn run(
     repos_root: PathBuf,
-    repo_list: Vec<PathBuf>,
     username: String,
     include_drafts: bool,
     ai: AiConfig,
@@ -2812,7 +2853,7 @@ pub fn run(
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::new(backend)?;
 
-    let mut app = App::new(repos_root, repo_list, username, include_drafts, ai, mode);
+    let mut app = App::new(repos_root, username, include_drafts, ai, mode);
 
     // Start fetching PRs immediately in background
     app.refresh();
@@ -3378,6 +3419,7 @@ diff --git a/README.md b/README.md
             deletions: 0,
             is_draft: false,
             review_state: ReviewState::Pending,
+            details_loaded: true,
         }
     }
 

@@ -9,11 +9,8 @@ mod tui;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use rayon::prelude::*;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-
-const TUI_FIRST_PAGE_LIMIT: usize = 30;
 
 /// TUI for reviewing GitHub PRs across multiple repositories
 #[derive(Parser)]
@@ -46,11 +43,11 @@ struct Args {
     #[arg(short, long)]
     my: bool,
 
-    /// Override the repos root directory
+    /// Override the local repos root used for worktrees and repo-scan commands
     #[arg(short, long)]
     root: Option<PathBuf>,
 
-    /// Exclude directories (relative to root). Can be specified multiple times.
+    /// Exclude directories from repo scans (relative to root). Can be specified multiple times.
     /// Use --save-exclude to persist to config.
     #[arg(short, long)]
     exclude: Vec<String>,
@@ -106,28 +103,12 @@ struct TriggerArgs {
     repo_path: Option<PathBuf>,
 }
 
-pub fn fetch_all_prs(
-    repo_list: &[PathBuf],
-    username: &str,
-    include_drafts: bool,
-) -> Vec<gh::PullRequest> {
-    let all_prs: Vec<_> = repo_list
-        .par_iter()
-        .flat_map(|repo| gh::fetch_prs_for_repo(repo, username, include_drafts))
-        .collect();
-
-    // Sort by most recent first
-    let mut all_prs = all_prs;
-    all_prs.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-    all_prs.truncate(TUI_FIRST_PAGE_LIMIT);
-    all_prs
+pub fn fetch_involved_prs(username: &str, include_drafts: bool) -> Vec<gh::PullRequest> {
+    gh::search_involved_prs(username, include_drafts)
 }
 
-pub fn fetch_my_prs(include_drafts: bool) -> Vec<gh::PullRequest> {
-    // Use gh search prs for a single API call across all repos, capped to first page.
-    let mut prs = gh::search_my_prs(include_drafts);
-    prs.truncate(TUI_FIRST_PAGE_LIMIT);
-    prs
+pub fn fetch_my_prs(username: &str, include_drafts: bool) -> Vec<gh::PullRequest> {
+    gh::search_my_prs(username, include_drafts)
 }
 
 fn merge_excludes(config_exclude: &[String], cli_exclude: &[String]) -> Vec<String> {
@@ -210,57 +191,36 @@ fn resolve_repos_root(cfg: &mut config::Config, root_override: Option<PathBuf>) 
     Ok(path)
 }
 
+fn resolve_tui_repos_root(cfg: &config::Config, root_override: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(root) = root_override {
+        validate_repos_root(&root)?;
+        return Ok(root);
+    }
+
+    if let Some(root) = &cfg.repos_root {
+        let path = PathBuf::from(root);
+        if path.exists() && path.is_dir() {
+            return Ok(path);
+        }
+    }
+
+    std::env::current_dir().context("Failed to resolve current directory")
+}
+
 fn run_tui(
-    cfg: &config::Config,
+    ai: config::AiConfig,
     repos_root: PathBuf,
     username: String,
     include_drafts: bool,
     my_mode: bool,
-    exclude: &[String],
 ) -> Result<()> {
-    // Find repos
-    println!("Scanning for repos in: {}", repos_root.display());
-    if !exclude.is_empty() {
-        println!("Excluding: {}", exclude.join(", "));
-    }
-    let scan = repos::scan_unique_repos(&repos_root, 3, exclude);
-    let discovered_count = scan.discovered_count;
-    let unique_count = scan.unique_repos.len();
-    let duplicate_count = scan.duplicates_skipped();
-    let repo_list: Vec<PathBuf> = scan
-        .unique_repos
-        .into_iter()
-        .map(|repo| repo.path)
-        .collect();
-    if duplicate_count > 0 {
-        println!(
-            "Found {} repositories ({} unique, {} duplicates skipped)",
-            discovered_count, unique_count, duplicate_count
-        );
-    } else {
-        println!("Found {} repositories", unique_count);
-    }
-
-    if repo_list.is_empty() {
-        println!("No repositories found.");
-        return Ok(());
-    }
-
-    // Launch TUI immediately - it will fetch PRs in background
     println!("Launching TUI...");
     let mode = if my_mode {
         tui::AppMode::MyPrs
     } else {
         tui::AppMode::Review
     };
-    tui::run(
-        repos_root,
-        repo_list,
-        username,
-        include_drafts,
-        cfg.ai.clone(),
-        mode,
-    )?;
+    tui::run(repos_root, username, include_drafts, ai, mode)?;
 
     Ok(())
 }
@@ -482,15 +442,8 @@ fn main() -> Result<()> {
         None => {
             let username = gh::get_current_user()?;
             println!("Authenticated as: {}\n", username);
-            let repos_root = resolve_repos_root(&mut cfg, args.root)?;
-            run_tui(
-                &cfg,
-                repos_root,
-                username,
-                args.drafts,
-                args.my,
-                &effective_exclude,
-            )
+            let repos_root = resolve_tui_repos_root(&cfg, args.root)?;
+            run_tui(cfg.ai.clone(), repos_root, username, args.drafts, args.my)
         }
     }
 }

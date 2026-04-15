@@ -1680,6 +1680,7 @@ mod tests {
             deletions: 1,
             is_draft,
             review_state: ReviewState::Pending,
+            details_loaded: true,
         }
     }
 

@@ -75,7 +75,7 @@ struct SearchRepository {
     name_with_owner: String,
 }
 
-/// PR data from gh search prs command (limited fields available)
+/// PR data from the global GraphQL PR search.
 #[derive(Debug, Deserialize)]
 struct SearchPrData {
     number: u64,
@@ -88,6 +88,21 @@ struct SearchPrData {
     #[serde(rename = "isDraft")]
     is_draft: Option<bool>,
     repository: SearchRepository,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchResponse {
+    data: Option<SearchData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchData {
+    search: SearchNodes,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchNodes {
+    nodes: Vec<SearchPrData>,
 }
 
 /// Review state for user's PRs
@@ -123,6 +138,7 @@ pub struct PullRequest {
     pub deletions: u64,
     pub is_draft: bool,
     pub review_state: ReviewState,
+    pub details_loaded: bool,
 }
 
 pub fn get_current_user() -> Result<String> {
@@ -193,15 +209,23 @@ fn has_user_approved(pr: &PrData, username: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn determine_review_state(pr_data: &PrData) -> ReviewState {
-    if pr_data.is_draft.unwrap_or(false) {
+fn review_state_from_fields(is_draft: bool, review_decision: Option<&str>) -> ReviewState {
+    if is_draft {
         return ReviewState::Draft;
     }
-    match pr_data.review_decision.as_deref() {
+
+    match review_decision {
         Some("APPROVED") => ReviewState::Approved,
         Some("CHANGES_REQUESTED") => ReviewState::ChangesRequested,
         _ => ReviewState::Pending,
     }
+}
+
+fn determine_review_state(pr_data: &PrData) -> ReviewState {
+    review_state_from_fields(
+        pr_data.is_draft.unwrap_or(false),
+        pr_data.review_decision.as_deref(),
+    )
 }
 
 fn pr_data_to_pull_request(pr_data: PrData, repo_path: PathBuf, repo_name: String) -> PullRequest {
@@ -226,6 +250,34 @@ fn pr_data_to_pull_request(pr_data: PrData, repo_path: PathBuf, repo_name: Strin
         deletions: pr_data.deletions.unwrap_or(0),
         is_draft: pr_data.is_draft.unwrap_or(false),
         review_state,
+        details_loaded: true,
+    }
+}
+
+fn search_pr_data_to_pull_request(pr_data: SearchPrData) -> PullRequest {
+    let pr_author = pr_data
+        .author
+        .as_ref()
+        .and_then(|a| a.login.as_ref())
+        .map(|s| s.as_str())
+        .unwrap_or("unknown");
+    let is_draft = pr_data.is_draft.unwrap_or(false);
+    let review_state = review_state_from_fields(is_draft, None);
+
+    PullRequest {
+        number: pr_data.number,
+        title: pr_data.title,
+        author: pr_author.to_string(),
+        body: pr_data.body.unwrap_or_default(),
+        repo_path: PathBuf::new(),
+        repo_name: pr_data.repository.name_with_owner,
+        url: pr_data.url,
+        updated_at: pr_data.updated_at,
+        additions: 0,
+        deletions: 0,
+        is_draft,
+        review_state,
+        details_loaded: false,
     }
 }
 
@@ -295,34 +347,6 @@ fn fetch_prs_for_repo_with_mode(
     prs
 }
 
-pub fn fetch_prs_for_repo(
-    repo_path: &PathBuf,
-    username: &str,
-    include_drafts: bool,
-) -> Vec<PullRequest> {
-    fetch_prs_for_repo_with_limit(
-        repo_path,
-        username,
-        include_drafts,
-        FIRST_PAGE_PR_LIST_LIMIT,
-    )
-}
-
-pub fn fetch_prs_for_repo_with_limit(
-    repo_path: &PathBuf,
-    username: &str,
-    include_drafts: bool,
-    limit: usize,
-) -> Vec<PullRequest> {
-    fetch_prs_for_repo_with_mode(
-        repo_path,
-        username,
-        include_drafts,
-        RepoPrFetchMode::ReviewCandidates,
-        limit,
-    )
-}
-
 pub fn fetch_prs_for_repo_with_authored(
     repo_path: &PathBuf,
     username: &str,
@@ -378,6 +402,41 @@ pub fn fetch_pr_for_review(
     ))
 }
 
+pub fn fetch_pr_details(pr: &PullRequest) -> Result<PullRequest> {
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            &pr.number.to_string(),
+            "--repo",
+            &pr.repo_name,
+            "--json",
+            "number,title,author,body,url,updatedAt,additions,deletions,isDraft,reviewDecision",
+        ])
+        .output()
+        .context("Failed to fetch PR details")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to fetch PR details for {}#{}: {}",
+            pr.repo_name,
+            pr.number,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let pr_data: PrData = serde_json::from_slice(&output.stdout).context(format!(
+        "Failed to parse PR details response for {}#{}",
+        pr.repo_name, pr.number
+    ))?;
+
+    Ok(pr_data_to_pull_request(
+        pr_data,
+        pr.repo_path.clone(),
+        pr.repo_name.clone(),
+    ))
+}
+
 #[derive(Debug, Deserialize)]
 struct PrFileData {
     path: String,
@@ -390,8 +449,15 @@ struct PrFilesData {
 
 pub fn get_pr_changed_files(pr: &PullRequest) -> Result<Vec<String>> {
     let output = Command::new("gh")
-        .args(["pr", "view", &pr.number.to_string(), "--json", "files"])
-        .current_dir(&pr.repo_path)
+        .args([
+            "pr",
+            "view",
+            &pr.number.to_string(),
+            "--repo",
+            &pr.repo_name,
+            "--json",
+            "files",
+        ])
         .output()
         .context("Failed to get PR changed files")?;
 
@@ -412,121 +478,109 @@ pub fn get_pr_changed_files(pr: &PullRequest) -> Result<Vec<String>> {
         .collect())
 }
 
-/// Search for all PRs authored by the current user across all repos
-pub fn search_my_prs(include_drafts: bool) -> Vec<PullRequest> {
-    search_my_prs_with_limit(include_drafts, FIRST_PAGE_PR_LIST_LIMIT)
+#[derive(Debug, Clone, Copy)]
+enum SearchScope {
+    Involved,
+    Authored,
 }
 
-fn search_my_prs_with_limit(include_drafts: bool, limit: usize) -> Vec<PullRequest> {
-    use rayon::prelude::*;
+/// Search for the first page of open PRs involving the current user.
+pub fn search_involved_prs(username: &str, include_drafts: bool) -> Vec<PullRequest> {
+    search_prs_with_limit(
+        username,
+        include_drafts,
+        FIRST_PAGE_PR_LIST_LIMIT,
+        SearchScope::Involved,
+    )
+}
 
-    let limit_arg = limit.to_string();
+/// Search for the first page of open PRs authored by the current user.
+pub fn search_my_prs(username: &str, include_drafts: bool) -> Vec<PullRequest> {
+    search_prs_with_limit(
+        username,
+        include_drafts,
+        FIRST_PAGE_PR_LIST_LIMIT,
+        SearchScope::Authored,
+    )
+}
+
+fn search_prs_with_limit(
+    username: &str,
+    include_drafts: bool,
+    limit: usize,
+    scope: SearchScope,
+) -> Vec<PullRequest> {
+    let mut qualifiers = vec!["is:pr".to_string(), "is:open".to_string()];
+    qualifiers.push(match scope {
+        SearchScope::Involved => format!("involves:{username}"),
+        SearchScope::Authored => format!("author:{username}"),
+    });
+    if !include_drafts {
+        qualifiers.push("draft:false".to_string());
+    }
+    qualifiers.push("sort:updated-desc".to_string());
+
+    let search_query = qualifiers.join(" ");
+    let query_literal = serde_json::to_string(&search_query).unwrap_or_default();
+    let first = limit.min(100);
+    let query = format!(
+        r#"query {{
+            search(query: {query_literal}, type: ISSUE, first: {first}) {{
+                nodes {{
+                    ... on PullRequest {{
+                        number
+                        title
+                        author {{
+                            login
+                        }}
+                        body
+                        url
+                        updatedAt
+                        isDraft
+                        repository {{
+                            nameWithOwner
+                        }}
+                    }}
+                }}
+            }}
+        }}"#
+    );
+    let query_arg = format!("query={query}");
+
     let output = Command::new("gh")
-        .args([
-            "search",
-            "prs",
-            "--state=open",
-            "--author=@me",
-            "--json",
-            "number,title,author,body,url,updatedAt,isDraft,repository",
-            "--limit",
-        ])
-        .arg(&limit_arg)
+        .args(["api", "graphql", "-f"])
+        .arg(query_arg)
         .output()
         .ok();
 
-    let prs_data: Vec<SearchPrData> = match output {
-        Some(o) if o.status.success() => serde_json::from_slice(&o.stdout).unwrap_or_default(),
+    let response: SearchResponse = match output {
+        Some(o) if o.status.success() => {
+            serde_json::from_slice(&o.stdout).unwrap_or(SearchResponse { data: None })
+        }
         _ => return Vec::new(),
     };
 
-    // Filter drafts first, then fetch review states in parallel
-    let filtered: Vec<_> = prs_data
-        .into_iter()
-        .filter(|pr| include_drafts || !pr.is_draft.unwrap_or(false))
-        .collect();
-
-    let mut prs: Vec<PullRequest> = filtered
-        .par_iter()
-        .map(|pr_data| {
-            let pr_author = pr_data
-                .author
-                .as_ref()
-                .and_then(|a| a.login.as_ref())
-                .map(|s| s.as_str())
-                .unwrap_or("unknown");
-
-            // Search API doesn't provide reviewDecision, fetch in parallel
-            let review_state = if pr_data.is_draft.unwrap_or(false) {
-                ReviewState::Draft
-            } else {
-                fetch_pr_review_state(&pr_data.repository.name_with_owner, pr_data.number)
-            };
-
-            PullRequest {
-                number: pr_data.number,
-                title: pr_data.title.clone(),
-                author: pr_author.to_string(),
-                body: pr_data.body.clone().unwrap_or_default(),
-                repo_path: PathBuf::new(),
-                repo_name: pr_data.repository.name_with_owner.clone(),
-                url: pr_data.url.clone(),
-                updated_at: pr_data.updated_at,
-                additions: 0,
-                deletions: 0,
-                is_draft: pr_data.is_draft.unwrap_or(false),
-                review_state,
-            }
+    response
+        .data
+        .map(|data| {
+            data.search
+                .nodes
+                .into_iter()
+                .map(search_pr_data_to_pull_request)
+                .collect()
         })
-        .collect();
-
-    // Sort by review state priority, then by most recent
-    prs.sort_by(|a, b| match a.review_state.cmp(&b.review_state) {
-        std::cmp::Ordering::Equal => b.updated_at.cmp(&a.updated_at),
-        other => other,
-    });
-
-    prs
-}
-
-/// Fetch the review decision for a specific PR
-fn fetch_pr_review_state(repo: &str, pr_number: u64) -> ReviewState {
-    let output = Command::new("gh")
-        .args([
-            "pr",
-            "view",
-            &pr_number.to_string(),
-            "--repo",
-            repo,
-            "--json",
-            "reviewDecision",
-        ])
-        .output()
-        .ok();
-
-    #[derive(Deserialize)]
-    struct ReviewDecisionResponse {
-        #[serde(rename = "reviewDecision")]
-        review_decision: Option<String>,
-    }
-
-    match output {
-        Some(o) if o.status.success() => {
-            let response: Option<ReviewDecisionResponse> = serde_json::from_slice(&o.stdout).ok();
-            match response.and_then(|r| r.review_decision) {
-                Some(ref s) if s == "APPROVED" => ReviewState::Approved,
-                Some(ref s) if s == "CHANGES_REQUESTED" => ReviewState::ChangesRequested,
-                _ => ReviewState::Pending,
-            }
-        }
-        _ => ReviewState::Pending,
-    }
+        .unwrap_or_default()
 }
 
 pub fn get_pr_diff(pr: &PullRequest) -> Result<String> {
     let output = Command::new("gh")
-        .args(["pr", "diff", &pr.number.to_string()])
-        .current_dir(&pr.repo_path)
+        .args([
+            "pr",
+            "diff",
+            &pr.number.to_string(),
+            "--repo",
+            &pr.repo_name,
+        ])
         .output()
         .context("Failed to get PR diff")?;
 
@@ -552,12 +606,22 @@ struct PrRefs {
 }
 
 fn get_pr_diff_local(pr: &PullRequest) -> Result<String> {
+    if pr.repo_path.as_os_str().is_empty() {
+        anyhow::bail!(
+            "Diff is too large for gh to fetch directly and no local clone is associated with {}#{}",
+            pr.repo_name,
+            pr.number
+        );
+    }
+
     // Get the base and head commit SHAs
     let output = Command::new("gh")
         .args([
             "pr",
             "view",
             &pr.number.to_string(),
+            "--repo",
+            &pr.repo_name,
             "--json",
             "baseRefOid,headRefOid",
         ])
@@ -616,12 +680,13 @@ pub fn get_pr_comments(pr: &PullRequest) -> Result<Vec<Comment>> {
             "pr",
             "view",
             &pr.number.to_string(),
+            "--repo",
+            &pr.repo_name,
             "--json",
             "comments",
             "--jq",
             ".comments",
         ])
-        .current_dir(&pr.repo_path)
         .output()
         .context("Failed to get PR comments")?;
 
@@ -651,8 +716,15 @@ pub fn get_review_comments(pr: &PullRequest) -> Result<Vec<ReviewComment>> {
 
 pub fn add_pr_comment(pr: &PullRequest, comment: &str) -> Result<()> {
     let output = Command::new("gh")
-        .args(["pr", "comment", &pr.number.to_string(), "--body", comment])
-        .current_dir(&pr.repo_path)
+        .args([
+            "pr",
+            "comment",
+            &pr.number.to_string(),
+            "--repo",
+            &pr.repo_name,
+            "--body",
+            comment,
+        ])
         .output()
         .context("Failed to add comment")?;
 
@@ -695,7 +767,6 @@ pub fn add_line_comment(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .current_dir(&pr.repo_path)
         .spawn()
         .context("Failed to spawn gh command")?;
 
@@ -726,7 +797,14 @@ pub fn add_line_comment(
 
 pub fn approve_pr(pr: &PullRequest, comment: Option<&str>) -> Result<()> {
     let pr_number = pr.number.to_string();
-    let mut args = vec!["pr", "review", &pr_number, "--approve"];
+    let mut args = vec![
+        "pr",
+        "review",
+        &pr_number,
+        "--repo",
+        &pr.repo_name,
+        "--approve",
+    ];
 
     let body_arg;
     if let Some(c) = comment {
@@ -737,7 +815,6 @@ pub fn approve_pr(pr: &PullRequest, comment: Option<&str>) -> Result<()> {
 
     let output = Command::new("gh")
         .args(&args)
-        .current_dir(&pr.repo_path)
         .output()
         .context("Failed to approve PR")?;
 
@@ -766,7 +843,6 @@ pub fn close_pr(pr: &PullRequest, comment: Option<&str>) -> Result<()> {
             "--repo",
             &pr.repo_name,
         ])
-        .current_dir(&pr.repo_path)
         .output()
         .context("Failed to close PR")?;
 
@@ -1044,16 +1120,17 @@ pub fn create_pr_worktree(
 ) -> Result<std::path::PathBuf> {
     let worktree_base = repos_root.join(".worktrees");
     std::fs::create_dir_all(&worktree_base)?;
+    let repo_path = resolve_worktree_repo_path(pr, repos_root)?;
 
     let worktree_name = format!("{}-pr-{}", pr.repo_name.replace('/', "-"), pr.number);
     let canonical_path = worktree_base.join(&worktree_name);
-    cleanup_worktree_path(&pr.repo_path, &canonical_path);
+    cleanup_worktree_path(&repo_path, &canonical_path);
 
     // Fetch the PR head ref
     let pr_ref = format!("refs/pull/{}/head", pr.number);
     let fetch_output = Command::new("git")
         .args(["fetch", "origin", &pr_ref])
-        .current_dir(&pr.repo_path)
+        .current_dir(&repo_path)
         .output()
         .context("Failed to fetch PR ref")?;
 
@@ -1075,10 +1152,10 @@ pub fn create_pr_worktree(
     let mut errors = Vec::new();
     for candidate in candidates {
         if candidate.exists() {
-            cleanup_worktree_path(&pr.repo_path, &candidate);
+            cleanup_worktree_path(&repo_path, &candidate);
         }
 
-        match git_worktree_add(&pr.repo_path, &candidate, "FETCH_HEAD") {
+        match git_worktree_add(&repo_path, &candidate, "FETCH_HEAD") {
             Ok(()) => return Ok(candidate),
             Err(err) => errors.push(format!("{} => {}", candidate.display(), err)),
         }
@@ -1090,6 +1167,52 @@ pub fn create_pr_worktree(
         pr.number,
         errors.join("\n")
     );
+}
+
+fn resolve_worktree_repo_path(
+    pr: &PullRequest,
+    repos_root: &std::path::Path,
+) -> Result<std::path::PathBuf> {
+    if !pr.repo_path.as_os_str().is_empty() {
+        return Ok(pr.repo_path.clone());
+    }
+
+    for candidate in worktree_repo_path_candidates(&pr.repo_name, repos_root) {
+        if !candidate.join(".git").exists() {
+            continue;
+        }
+
+        match repo_name_with_owner(&candidate) {
+            Some(name) if name == pr.repo_name => return Ok(candidate),
+            Some(_) => {}
+            None => {}
+        }
+    }
+
+    anyhow::bail!(
+        "No local clone found for {} under {}. Use `reviewer trigger --repo-path` for PRs that need a worktree.",
+        pr.repo_name,
+        repos_root.display()
+    );
+}
+
+fn worktree_repo_path_candidates(repo_name: &str, repos_root: &std::path::Path) -> Vec<PathBuf> {
+    let mut parts = repo_name.split('/');
+    let Some(owner) = parts.next() else {
+        return Vec::new();
+    };
+    let Some(name) = parts.next() else {
+        return Vec::new();
+    };
+
+    let mut candidates = vec![
+        repos_root.join(name),
+        repos_root.join(owner).join(name),
+        repos_root.join(repo_name.replace('/', "-")),
+    ];
+    candidates.sort();
+    candidates.dedup();
+    candidates
 }
 
 fn cleanup_worktree_path(repo_path: &std::path::Path, worktree_path: &std::path::Path) {
@@ -1425,6 +1548,7 @@ mod tests {
             deletions: 1,
             is_draft: false,
             review_state: super::ReviewState::Pending,
+            details_loaded: true,
         }
     }
 

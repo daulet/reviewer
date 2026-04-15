@@ -5,7 +5,7 @@ How do you keep up with AI generated PRs? Answer: use AI assisted code reviews.
 ![alt text](./docs/image.png)
 ## Features
 
-- List, comment, approve PRs from your cloned repos;
+- List, comment, approve PRs involving your GitHub account;
 - Start interactive AI assisted review session, let it learn your code review approach;  
 - Run reviewer as daemon to kick off reviews as they are created;
 
@@ -128,10 +128,10 @@ The AI learns from skipped comments and offers to update this file automatically
 ## Usage
 
 ```bash
-reviewer                       # Scan configured directory
+reviewer                       # Show first page of open PRs involving you
 reviewer -d                    # Include draft PRs
-reviewer -r ~/dev              # Specify repos directory
-reviewer -e archived -e old    # Exclude directories
+reviewer -r ~/dev              # Specify local repos root for worktrees
+reviewer -e archived -e old    # Exclude directories for repo-scan commands
 
 reviewer --my                  # Show PRs you authored (same as -m)
 reviewer trigger --repo org/repo --pr 1234
@@ -142,7 +142,9 @@ reviewer daemon run            # Start daemon polling loop
 reviewer daemon status         # Show daemon state/counters
 ```
 
-On first run, you'll be prompted to set your repos root directory.
+The interactive PR list loads directly from GitHub and does not scan local
+clones on startup. Local clones are still used by daemon polling, explicit
+`reviewer trigger` runs, and worktree-backed AI review launches.
 
 Use `--my` (or `-m`) to switch to "my PRs" mode. In this mode, reviewer
 shows PRs authored by your GitHub account and enables `m` in detail view to

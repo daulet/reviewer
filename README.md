@@ -134,6 +134,8 @@ reviewer -r ~/dev              # Specify local repos root for worktrees
 reviewer -e archived -e old    # Exclude directories for repo-scan commands
 
 reviewer --my                  # Show PRs you authored (same as -m)
+reviewer trigger https://github.com/org/repo/pull/1234
+reviewer trigger org/repo#1234
 reviewer trigger --repo org/repo --pr 1234
 reviewer trigger --repo-path ~/dev/org-repo --pr 1234
 

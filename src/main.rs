@@ -92,14 +92,17 @@ enum DaemonCommand {
 
 #[derive(Parser)]
 struct TriggerArgs {
+    /// PR URL or shorthand, e.g. https://github.com/org/repo/pull/123 or org/repo#123
+    #[arg(value_name = "PR")]
+    target: Option<String>,
     /// PR number to trigger
     #[arg(long, value_name = "NUMBER")]
-    pr: u64,
+    pr: Option<u64>,
     /// Target repository in owner/name format
-    #[arg(long, value_name = "OWNER/REPO", required_unless_present = "repo_path")]
+    #[arg(long, value_name = "OWNER/REPO")]
     repo: Option<String>,
     /// Local path to the repo clone (skips repo scan)
-    #[arg(long, value_name = "PATH", required_unless_present = "repo")]
+    #[arg(long, value_name = "PATH")]
     repo_path: Option<PathBuf>,
 }
 
@@ -317,10 +320,157 @@ fn run_daemon_command(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedTriggerTarget {
+    repo: String,
+    pr: u64,
+}
+
+fn parse_trigger_target(target: &str) -> Result<ParsedTriggerTarget> {
+    let target = target.trim();
+    let target = target
+        .split('?')
+        .next()
+        .unwrap_or(target)
+        .trim_end_matches('/');
+
+    if let Some((repo, pr)) = target.rsplit_once('#') {
+        return Ok(ParsedTriggerTarget {
+            repo: parse_repo_name(repo)?,
+            pr: parse_pr_number(pr)?,
+        });
+    }
+
+    let path = target
+        .strip_prefix("https://github.com/")
+        .or_else(|| target.strip_prefix("http://github.com/"))
+        .or_else(|| target.strip_prefix("github.com/"))
+        .unwrap_or(target);
+
+    let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    if parts.len() == 4 && parts[2] == "pull" {
+        return Ok(ParsedTriggerTarget {
+            repo: parse_repo_name(&format!("{}/{}", parts[0], parts[1]))?,
+            pr: parse_pr_number(parts[3])?,
+        });
+    }
+
+    bail!(
+        "Could not parse trigger target '{}'. Use a GitHub PR URL like https://github.com/org/repo/pull/123 or org/repo#123.",
+        target
+    )
+}
+
+fn parse_repo_name(repo: &str) -> Result<String> {
+    let parts: Vec<&str> = repo.split('/').filter(|part| !part.is_empty()).collect();
+    if parts.len() == 2 {
+        Ok(format!("{}/{}", parts[0], parts[1]))
+    } else {
+        bail!("Repository must be in owner/name format, got '{}'", repo)
+    }
+}
+
+fn parse_pr_number(value: &str) -> Result<u64> {
+    value
+        .parse::<u64>()
+        .with_context(|| format!("PR number must be numeric, got '{}'", value))
+}
+
+fn merge_trigger_repo_arg(
+    positional: Option<String>,
+    flag: Option<String>,
+    has_repo_path: bool,
+) -> Result<Option<String>> {
+    match (positional, flag) {
+        (Some(positional), Some(flag)) if positional != flag => {
+            bail!(
+                "Repo mismatch: positional target resolves to {} but --repo={}",
+                positional,
+                flag
+            )
+        }
+        (Some(repo), _) | (_, Some(repo)) => Ok(Some(repo)),
+        (None, None) if has_repo_path => Ok(None),
+        (None, None) => bail!(
+            "Target repo is required. Provide a PR URL, owner/repo#number, --repo, or --repo-path."
+        ),
+    }
+}
+
+fn merge_trigger_pr_arg(positional: Option<u64>, flag: Option<u64>) -> Result<u64> {
+    match (positional, flag) {
+        (Some(positional), Some(flag)) if positional != flag => {
+            bail!(
+                "PR number mismatch: positional target resolves to #{} but --pr={}",
+                positional,
+                flag
+            )
+        }
+        (Some(pr), _) | (_, Some(pr)) => Ok(pr),
+        (None, None) => {
+            bail!("PR number is required. Provide a PR URL, owner/repo#number, or --pr.")
+        }
+    }
+}
+
+fn resolve_trigger_args(args: &TriggerArgs) -> Result<(Option<String>, u64)> {
+    let positional = args
+        .target
+        .as_deref()
+        .map(parse_trigger_target)
+        .transpose()?;
+    let positional_repo = positional.as_ref().map(|target| target.repo.clone());
+    let positional_pr = positional.map(|target| target.pr);
+
+    let repo =
+        merge_trigger_repo_arg(positional_repo, args.repo.clone(), args.repo_path.is_some())?;
+    let pr = merge_trigger_pr_arg(positional_pr, args.pr)?;
+
+    Ok((repo, pr))
+}
+
+fn trigger_repo_candidates(repos_root: &Path, repo_name: &str) -> Vec<PathBuf> {
+    let mut parts = repo_name.split('/');
+    let Some(owner) = parts.next() else {
+        return Vec::new();
+    };
+    let Some(name) = parts.next() else {
+        return Vec::new();
+    };
+
+    let mut candidates = Vec::new();
+    push_unique_trigger_candidate(&mut candidates, repos_root.join(name));
+    push_unique_trigger_candidate(&mut candidates, repos_root.join(owner).join(name));
+    push_unique_trigger_candidate(&mut candidates, repos_root.join(format!("{owner}-{name}")));
+    push_unique_trigger_candidate(&mut candidates, repos_root.to_path_buf());
+
+    if let Ok(entries) = std::fs::read_dir(repos_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                push_unique_trigger_candidate(&mut candidates, path.join(name));
+                push_unique_trigger_candidate(&mut candidates, path.join(owner).join(name));
+                push_unique_trigger_candidate(
+                    &mut candidates,
+                    path.join(format!("{owner}-{name}")),
+                );
+            }
+        }
+    }
+
+    candidates
+}
+
+fn push_unique_trigger_candidate(candidates: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if !candidates.contains(&candidate) {
+        candidates.push(candidate);
+    }
+}
+
 fn resolve_trigger_repo(
     repos_root: &Path,
-    effective_exclude: &[String],
     args: &TriggerArgs,
+    expected_repo: Option<&str>,
 ) -> Result<(PathBuf, String)> {
     if let Some(repo_path) = &args.repo_path {
         if !repo_path.exists() {
@@ -337,10 +487,10 @@ fn resolve_trigger_repo(
             )
         })?;
 
-        if let Some(expected_repo) = &args.repo {
-            if expected_repo != &repo_name {
+        if let Some(expected_repo) = expected_repo {
+            if expected_repo != repo_name {
                 bail!(
-                    "Repo mismatch: --repo={} but --repo-path resolves to {}",
+                    "Repo mismatch: target repo is {} but --repo-path resolves to {}",
                     expected_repo,
                     repo_name
                 );
@@ -350,38 +500,19 @@ fn resolve_trigger_repo(
         return Ok((repo_path.clone(), repo_name));
     }
 
-    let repo_name = args
-        .repo
-        .as_ref()
-        .context("Either --repo or --repo-path must be provided")?;
-
-    let tail = repo_name.rsplit('/').next().unwrap_or(repo_name);
-    let direct_candidate = repos_root.join(tail);
-    if direct_candidate.is_dir() && direct_candidate.join(".git").exists() {
-        match gh::repo_name_with_owner(&direct_candidate) {
-            Some(name_with_owner) if name_with_owner != *repo_name => {}
-            _ => return Ok((direct_candidate, repo_name.clone())),
+    let repo_name =
+        expected_repo.context("Either a target repo or --repo-path must be provided")?;
+    for candidate in trigger_repo_candidates(repos_root, repo_name) {
+        if !candidate.is_dir() || !candidate.join(".git").exists() {
+            continue;
+        }
+        if gh::repo_name_with_owner(&candidate).as_deref() == Some(repo_name) {
+            return Ok((candidate, repo_name.to_string()));
         }
     }
 
-    println!(
-        "Resolving local clone for {} under {}...",
-        repo_name,
-        repos_root.display()
-    );
-
-    let scan = repos::scan_unique_repos(repos_root, 3, effective_exclude);
-    let repo = scan
-        .unique_repos
-        .into_iter()
-        .find(|repo| repo.name_with_owner.as_deref() == Some(repo_name.as_str()));
-
-    if let Some(repo) = repo {
-        return Ok((repo.path, repo_name.clone()));
-    }
-
     bail!(
-        "Could not find local clone for {} under {}. Use --repo-path to specify it directly.",
+        "Repo {} is not cloned under {}. Clone it there or pass --repo-path.",
         repo_name,
         repos_root.display()
     );
@@ -390,35 +521,27 @@ fn resolve_trigger_repo(
 fn run_trigger_command(
     cfg: &mut config::Config,
     root_override: Option<PathBuf>,
-    effective_exclude: Vec<String>,
     trigger_args: TriggerArgs,
 ) -> Result<()> {
     let repos_root = resolve_repos_root(cfg, root_override)?;
+    let (expected_repo, pr_number) = resolve_trigger_args(&trigger_args)?;
     let (repo_path, repo_name) =
-        resolve_trigger_repo(&repos_root, &effective_exclude, &trigger_args)?;
+        resolve_trigger_repo(&repos_root, &trigger_args, expected_repo.as_deref())?;
 
-    println!("Triggering review for {}#{}...", repo_name, trigger_args.pr);
+    println!("Triggering review for {}#{}...", repo_name, pr_number);
 
-    let pr = gh::fetch_pr_for_review(&repo_path, &repo_name, trigger_args.pr)?;
+    let pr = gh::fetch_pr_for_review(&repo_path, &repo_name, pr_number)?;
     gh::validate_ai_launch_config(&cfg.ai)?;
 
-    let worktree_path = gh::create_pr_worktree(&pr, &repos_root).with_context(|| {
-        format!(
-            "Failed to create worktree for {}#{}",
-            repo_name, trigger_args.pr
-        )
-    })?;
-    gh::launch_ai(&worktree_path, &pr, &cfg.ai).with_context(|| {
-        format!(
-            "Failed to launch review for {}#{}",
-            repo_name, trigger_args.pr
-        )
-    })?;
+    let worktree_path = gh::create_pr_worktree(&pr, &repos_root)
+        .with_context(|| format!("Failed to create worktree for {}#{}", repo_name, pr_number))?;
+    gh::launch_ai(&worktree_path, &pr, &cfg.ai)
+        .with_context(|| format!("Failed to launch review for {}#{}", repo_name, pr_number))?;
 
     println!(
         "Triggered review for {}#{} (worktree: {})",
         repo_name,
-        trigger_args.pr,
+        pr_number,
         worktree_path.display()
     );
     Ok(())
@@ -445,7 +568,7 @@ fn main() -> Result<()> {
         }
         Some(Commands::Harness(harness_args)) => harness::run(harness_args),
         Some(Commands::Trigger(trigger_args)) => {
-            run_trigger_command(&mut cfg, args.root, effective_exclude, trigger_args)
+            run_trigger_command(&mut cfg, args.root, trigger_args)
         }
         None => {
             let username = gh::get_current_user()?;
@@ -458,7 +581,7 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::Args;
+    use super::{parse_trigger_target, resolve_trigger_args, Args, Commands};
     use clap::Parser;
 
     #[test]
@@ -485,5 +608,48 @@ mod tests {
             "2398",
         ]);
         assert!(parsed.is_ok());
+    }
+
+    #[test]
+    fn trigger_parses_with_url_target() {
+        let parsed = Args::try_parse_from([
+            "reviewer",
+            "trigger",
+            "https://github.com/nvidia-lpu/cyborg/pull/199",
+        ]);
+        assert!(parsed.is_ok());
+    }
+
+    #[test]
+    fn parse_trigger_target_accepts_github_url() {
+        let target = parse_trigger_target("https://github.com/nvidia-lpu/cyborg/pull/199").unwrap();
+        assert_eq!(target.repo, "nvidia-lpu/cyborg");
+        assert_eq!(target.pr, 199);
+    }
+
+    #[test]
+    fn parse_trigger_target_accepts_repo_hash_number() {
+        let target = parse_trigger_target("nvidia-lpu/cyborg#199").unwrap();
+        assert_eq!(target.repo, "nvidia-lpu/cyborg");
+        assert_eq!(target.pr, 199);
+    }
+
+    #[test]
+    fn trigger_target_flags_must_not_conflict() {
+        let parsed = Args::try_parse_from([
+            "reviewer",
+            "trigger",
+            "https://github.com/nvidia-lpu/cyborg/pull/199",
+            "--repo",
+            "nvidia-lpu/other",
+        ])
+        .unwrap();
+
+        let Some(Commands::Trigger(trigger_args)) = parsed.command else {
+            panic!("expected trigger command");
+        };
+
+        let err = resolve_trigger_args(&trigger_args).expect_err("expected mismatch");
+        assert!(format!("{err:#}").contains("Repo mismatch"));
     }
 }

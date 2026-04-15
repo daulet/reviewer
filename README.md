@@ -242,7 +242,7 @@ Daemon state is stored separately in:
             "review",
             "--auto-approve",
             "--tool",
-            "custom",
+            "codex",
             "--cmd",
             "{tool_command}"
           ]
@@ -261,7 +261,7 @@ Daemon state is stored separately in:
             "self-review",
             "--auto-approve",
             "--tool",
-            "custom",
+            "codex",
             "--cmd",
             "{tool_command}"
           ]

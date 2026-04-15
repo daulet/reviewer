@@ -210,6 +210,7 @@ Daemon state is stored separately in:
 {
   "repos_root": "/path/to/your/repos",
   "exclude": ["archived", "vendor"],
+  "exclude_users": ["@apps/*", "dependabot", "github-actions"],
   "daemon": {
     "poll_interval_sec": 60,
     "exclude_repos": ["org/legacy-repo"],
@@ -275,6 +276,8 @@ Daemon state is stored separately in:
   }
 }
 ```
+
+`exclude_users` filters PR authors from the TUI list and daemon review/self-review triggers. Patterns are case-insensitive, a leading `@` is optional, and `*`/`?` wildcards are supported. Exact user entries are also sent to GitHub search as `-author:<login>` and `-author:app/<login>` so excluded users do not consume page slots. `@apps/*` only matches GitHub bot/app actors, so it will not hide normal users. Auto-approve rules are evaluated before this filter, so excluded users can still be auto-approved when they match `daemon.auto_approve`.
 
 Terminal.app (macOS, new window) launch example:
 

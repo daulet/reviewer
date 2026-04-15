@@ -1,6 +1,7 @@
 mod config;
 mod daemon;
 mod diff;
+mod filters;
 mod gh;
 mod harness;
 mod repos;
@@ -110,16 +111,37 @@ pub fn fetch_involved_prs(
     username: &str,
     include_drafts: bool,
     after: Option<&str>,
+    exclude_users: &[String],
 ) -> gh::PullRequestPage {
-    gh::search_involved_prs(username, include_drafts, after)
+    filter_excluded_pr_authors(
+        gh::search_involved_prs(username, include_drafts, after, exclude_users),
+        exclude_users,
+    )
 }
 
 pub fn fetch_my_prs(
     username: &str,
     include_drafts: bool,
     after: Option<&str>,
+    exclude_users: &[String],
 ) -> gh::PullRequestPage {
-    gh::search_my_prs(username, include_drafts, after)
+    filter_excluded_pr_authors(
+        gh::search_my_prs(username, include_drafts, after, exclude_users),
+        exclude_users,
+    )
+}
+
+fn filter_excluded_pr_authors(
+    mut page: gh::PullRequestPage,
+    exclude_users: &[String],
+) -> gh::PullRequestPage {
+    let exclude_users = filters::normalize_user_patterns(exclude_users);
+    if !exclude_users.is_empty() {
+        page.prs.retain(|pr| {
+            !filters::author_excluded(&pr.author, pr.author_kind.as_deref(), &exclude_users)
+        });
+    }
+    page
 }
 
 fn merge_excludes(config_exclude: &[String], cli_exclude: &[String]) -> Vec<String> {
@@ -224,6 +246,7 @@ fn run_tui(
     username: String,
     include_drafts: bool,
     my_mode: bool,
+    exclude_users: Vec<String>,
 ) -> Result<()> {
     println!("Launching TUI...");
     let mode = if my_mode {
@@ -231,7 +254,14 @@ fn run_tui(
     } else {
         tui::AppMode::Review
     };
-    tui::run(repos_root, username, include_drafts, ai, mode)?;
+    tui::run(
+        repos_root,
+        username,
+        include_drafts,
+        ai,
+        mode,
+        exclude_users,
+    )?;
 
     Ok(())
 }
@@ -261,6 +291,14 @@ fn print_daemon_status(cfg: &config::Config) {
         println!("Excluded repos ({}):", status.excluded_repos.len());
         for repo in status.excluded_repos {
             println!("  - {}", repo);
+        }
+    }
+    if status.excluded_users.is_empty() {
+        println!("Excluded users: none");
+    } else {
+        println!("Excluded users ({}):", status.excluded_users.len());
+        for user in status.excluded_users {
+            println!("  - @{}", user);
         }
     }
     if status.repo_subpath_filters.is_empty() {
@@ -574,7 +612,14 @@ fn main() -> Result<()> {
             let username = gh::get_current_user()?;
             println!("Authenticated as: {}\n", username);
             let repos_root = resolve_tui_repos_root(&cfg, args.root)?;
-            run_tui(cfg.ai.clone(), repos_root, username, args.drafts, args.my)
+            run_tui(
+                cfg.ai.clone(),
+                repos_root,
+                username,
+                args.drafts,
+                args.my,
+                cfg.exclude_users.clone(),
+            )
         }
     }
 }

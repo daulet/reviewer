@@ -1,4 +1,5 @@
 use crate::config::{self, AiConfig};
+use crate::filters;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -16,7 +17,22 @@ struct RepoInfo {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Author {
+    #[serde(rename = "__typename", default)]
+    pub kind: Option<String>,
+    #[serde(rename = "type", default)]
+    pub rest_type: Option<String>,
+    #[serde(default, rename = "is_bot", alias = "isBot")]
+    pub is_bot: Option<bool>,
     pub login: Option<String>,
+}
+
+impl Author {
+    fn actor_kind(&self) -> Option<String> {
+        if self.is_bot.unwrap_or(false) {
+            return Some("Bot".to_string());
+        }
+        self.kind.clone().or_else(|| self.rest_type.clone())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -139,6 +155,7 @@ pub struct PullRequest {
     pub number: u64,
     pub title: String,
     pub author: String,
+    pub author_kind: Option<String>,
     pub body: String,
     pub repo_path: PathBuf,
     pub repo_name: String,
@@ -252,12 +269,14 @@ fn pr_data_to_pull_request(pr_data: PrData, repo_path: PathBuf, repo_name: Strin
         .and_then(|a| a.login.as_ref())
         .map(|s| s.as_str())
         .unwrap_or("unknown");
+    let author_kind = pr_data.author.as_ref().and_then(Author::actor_kind);
     let review_state = determine_review_state(&pr_data);
 
     PullRequest {
         number: pr_data.number,
         title: pr_data.title,
         author: pr_author.to_string(),
+        author_kind,
         body: pr_data.body.unwrap_or_default(),
         repo_path,
         repo_name,
@@ -278,6 +297,7 @@ fn search_pr_data_to_pull_request(pr_data: SearchPrData) -> PullRequest {
         .and_then(|a| a.login.as_ref())
         .map(|s| s.as_str())
         .unwrap_or("unknown");
+    let author_kind = pr_data.author.as_ref().and_then(Author::actor_kind);
     let is_draft = pr_data.is_draft.unwrap_or(false);
     let review_state = review_state_from_fields(is_draft, None);
 
@@ -285,6 +305,7 @@ fn search_pr_data_to_pull_request(pr_data: SearchPrData) -> PullRequest {
         number: pr_data.number,
         title: pr_data.title,
         author: pr_author.to_string(),
+        author_kind,
         body: pr_data.body.unwrap_or_default(),
         repo_path: PathBuf::new(),
         repo_name: pr_data.repository.name_with_owner,
@@ -506,6 +527,7 @@ pub fn search_involved_prs(
     username: &str,
     include_drafts: bool,
     after: Option<&str>,
+    exclude_users: &[String],
 ) -> PullRequestPage {
     search_prs_with_limit(
         username,
@@ -513,27 +535,33 @@ pub fn search_involved_prs(
         FIRST_PAGE_PR_LIST_LIMIT,
         SearchScope::Involved,
         after,
+        exclude_users,
     )
 }
 
 /// Search for the first page of open PRs authored by the current user.
-pub fn search_my_prs(username: &str, include_drafts: bool, after: Option<&str>) -> PullRequestPage {
+pub fn search_my_prs(
+    username: &str,
+    include_drafts: bool,
+    after: Option<&str>,
+    exclude_users: &[String],
+) -> PullRequestPage {
     search_prs_with_limit(
         username,
         include_drafts,
         FIRST_PAGE_PR_LIST_LIMIT,
         SearchScope::Authored,
         after,
+        exclude_users,
     )
 }
 
-fn search_prs_with_limit(
+fn search_qualifiers(
     username: &str,
     include_drafts: bool,
-    limit: usize,
     scope: SearchScope,
-    after: Option<&str>,
-) -> PullRequestPage {
+    exclude_users: &[String],
+) -> Vec<String> {
     let mut qualifiers = vec!["is:pr".to_string(), "is:open".to_string()];
     qualifiers.push(match scope {
         SearchScope::Involved => format!("involves:{username}"),
@@ -542,8 +570,24 @@ fn search_prs_with_limit(
     if !include_drafts {
         qualifiers.push("draft:false".to_string());
     }
+    qualifiers.extend(
+        filters::api_excludable_author_logins(exclude_users)
+            .into_iter()
+            .flat_map(|author| [format!("-author:{author}"), format!("-author:app/{author}")]),
+    );
     qualifiers.push("sort:updated-desc".to_string());
+    qualifiers
+}
 
+fn search_prs_with_limit(
+    username: &str,
+    include_drafts: bool,
+    limit: usize,
+    scope: SearchScope,
+    after: Option<&str>,
+    exclude_users: &[String],
+) -> PullRequestPage {
+    let qualifiers = search_qualifiers(username, include_drafts, scope, exclude_users);
     let search_query = qualifiers.join(" ");
     let query_literal = serde_json::to_string(&search_query).unwrap_or_default();
     let first = limit.min(100);
@@ -559,6 +603,7 @@ fn search_prs_with_limit(
                         number
                         title
                         author {{
+                            __typename
                             login
                         }}
                         body
@@ -1547,8 +1592,8 @@ pub fn launch_ai(working_dir: &std::path::Path, pr: &PullRequest, ai: &AiConfig)
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use super::{
-        build_shell_command, launch_with_steps, render_launch_template, LaunchContext,
-        LaunchTemplateValues, PullRequest,
+        build_shell_command, launch_with_steps, render_launch_template, search_qualifiers,
+        LaunchContext, LaunchTemplateValues, PullRequest, SearchScope,
     };
     use crate::config::AiConfig;
     use chrono::Utc;
@@ -1576,6 +1621,7 @@ mod tests {
             number,
             title: title.to_string(),
             author: "alice".to_string(),
+            author_kind: Some("User".to_string()),
             body: String::new(),
             repo_path: PathBuf::from("/tmp/repo"),
             repo_name: repo.to_string(),
@@ -1587,6 +1633,28 @@ mod tests {
             review_state: super::ReviewState::Pending,
             details_loaded: true,
         }
+    }
+
+    #[test]
+    fn search_qualifiers_adds_negative_authors_for_exact_excludes() {
+        let qualifiers = search_qualifiers(
+            "daulet",
+            false,
+            SearchScope::Involved,
+            &[
+                "dependabot".to_string(),
+                "lpu-renovate".to_string(),
+                "@apps/*".to_string(),
+                "github-*".to_string(),
+            ],
+        );
+
+        assert!(qualifiers.contains(&"-author:dependabot".to_string()));
+        assert!(qualifiers.contains(&"-author:app/dependabot".to_string()));
+        assert!(qualifiers.contains(&"-author:lpu-renovate".to_string()));
+        assert!(qualifiers.contains(&"-author:app/lpu-renovate".to_string()));
+        assert!(!qualifiers.contains(&"-author:apps/*".to_string()));
+        assert!(!qualifiers.contains(&"-author:github-*".to_string()));
     }
 
     #[test]

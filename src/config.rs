@@ -119,6 +119,8 @@ pub struct Config {
     #[serde(default)]
     pub exclude: Vec<String>,
     #[serde(default)]
+    pub exclude_users: Vec<String>,
+    #[serde(default)]
     pub ai: AiConfig,
     #[serde(default)]
     pub daemon: DaemonConfig,
@@ -198,7 +200,7 @@ fn merge_with_existing_config(existing: Value, updated: Value) -> Value {
     };
 
     let existing_object = ensure_object(&mut existing);
-    for field in ["repos_root", "exclude"] {
+    for field in ["repos_root", "exclude", "exclude_users"] {
         if let Some(value) = updated_object.get(field) {
             existing_object.insert(field.to_string(), value.clone());
         }
@@ -323,6 +325,7 @@ mod tests {
     fn merge_with_existing_config_preserves_unknown_daemon_fields() {
         let existing = json!({
           "repos_root": "/tmp/repos",
+          "exclude_users": ["@apps/*"],
           "daemon": {
             "poll_interval_sec": 30,
             "exclude_repos": ["org/legacy"],
@@ -347,6 +350,7 @@ mod tests {
         let updated = json!({
           "repos_root": "/tmp/repos-new",
           "exclude": [],
+          "exclude_users": ["dependabot"],
           "ai": {
             "provider": null,
             "command": null,
@@ -370,6 +374,7 @@ mod tests {
 
         let merged = merge_with_existing_config(existing, updated);
         assert_eq!(merged["repos_root"], json!("/tmp/repos-new"));
+        assert_eq!(merged["exclude_users"], json!(["dependabot"]));
         assert_eq!(merged["daemon"]["initialized"], json!(true));
         assert_eq!(merged["daemon"]["auto_approve"], json!([]));
         assert_eq!(merged["daemon"]["only_new_prs_on_start"], json!(true));
@@ -402,6 +407,7 @@ mod tests {
         let updated = json!({
           "repos_root": null,
           "exclude": [],
+          "exclude_users": [],
           "ai": {
             "provider": null,
             "command": null,
@@ -441,6 +447,12 @@ mod tests {
     fn ai_launch_self_review_steps_default_empty() {
         let cfg = Config::default();
         assert!(cfg.ai.launch.self_review_steps.is_empty());
+    }
+
+    #[test]
+    fn exclude_users_default_empty() {
+        let cfg = Config::default();
+        assert!(cfg.exclude_users.is_empty());
     }
 
     #[test]

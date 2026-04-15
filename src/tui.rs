@@ -1,4 +1,4 @@
-use crate::config::AiConfig;
+use crate::config::{self, AiConfig};
 use crate::diff::{self, SyntaxHighlighter};
 use crate::gh::{self, Comment, PullRequest, ReviewComment, ReviewState};
 use anyhow::Result;
@@ -483,6 +483,7 @@ pub struct App {
     pub repos_root: PathBuf,
     pub username: String,
     pub include_drafts: bool,
+    pub exclude_users: Vec<String>,
     pub mode: AppMode,
     pub list_state: ListState,
     pub view: View,
@@ -542,6 +543,7 @@ impl App {
         repos_root: PathBuf,
         username: String,
         include_drafts: bool,
+        exclude_users: Vec<String>,
         ai: AiConfig,
         mode: AppMode,
     ) -> Self {
@@ -551,6 +553,7 @@ impl App {
             repos_root,
             username,
             include_drafts,
+            exclude_users,
             mode,
             list_state: ListState::default(),
             view: View::List,
@@ -620,6 +623,36 @@ impl App {
 
     pub fn selected_pr(&self) -> Option<&PullRequest> {
         self.list_state.selected().and_then(|i| self.prs.get(i))
+    }
+
+    fn apply_excluded_user_filter_to_loaded_prs(&mut self) {
+        let exclude_users = crate::filters::normalize_user_patterns(&self.exclude_users);
+        if exclude_users.is_empty() {
+            return;
+        }
+
+        self.prs.retain(|pr| {
+            !crate::filters::author_excluded(&pr.author, pr.author_kind.as_deref(), &exclude_users)
+        });
+
+        let count = self.list_item_count();
+        if count == 0 {
+            self.list_state.select(None);
+        } else if self.list_state.selected().is_none_or(|idx| idx >= count) {
+            self.list_state.select(Some(count - 1));
+        }
+    }
+
+    fn reload_exclude_users_from_config(&mut self) {
+        match config::load_config() {
+            Ok(cfg) => {
+                self.exclude_users = cfg.exclude_users;
+                self.apply_excluded_user_filter_to_loaded_prs();
+            }
+            Err(err) => {
+                self.set_status(format!("Failed to reload config: {:#}", err));
+            }
+        }
     }
 
     fn pagination_row_count(&self) -> usize {
@@ -974,17 +1007,24 @@ impl App {
 
         self.loading_next_page = true;
         self.needs_redraw = true;
+        self.reload_exclude_users_from_config();
         let tx = self.async_tx.clone();
         let username = self.username.clone();
         let include_drafts = self.include_drafts;
+        let exclude_users = self.exclude_users.clone();
         let mode = self.mode;
 
         thread::spawn(move || {
             let page = match mode {
-                AppMode::Review => {
-                    crate::fetch_involved_prs(&username, include_drafts, Some(&cursor))
+                AppMode::Review => crate::fetch_involved_prs(
+                    &username,
+                    include_drafts,
+                    Some(&cursor),
+                    &exclude_users,
+                ),
+                AppMode::MyPrs => {
+                    crate::fetch_my_prs(&username, include_drafts, Some(&cursor), &exclude_users)
                 }
-                AppMode::MyPrs => crate::fetch_my_prs(&username, include_drafts, Some(&cursor)),
             };
             let _ = tx.send(AsyncResult::NextPage(cursor, page));
         });
@@ -1594,17 +1634,23 @@ impl App {
         self.loading_next_page = false;
         self.has_next_page = false;
         self.next_page_cursor = None;
+        self.reload_exclude_users_from_config();
         self.set_status("Refreshing PR list...".to_string());
 
         let tx = self.async_tx.clone();
         let username = self.username.clone();
         let include_drafts = self.include_drafts;
+        let exclude_users = self.exclude_users.clone();
         let mode = self.mode;
 
         thread::spawn(move || {
             let page = match mode {
-                AppMode::Review => crate::fetch_involved_prs(&username, include_drafts, None),
-                AppMode::MyPrs => crate::fetch_my_prs(&username, include_drafts, None),
+                AppMode::Review => {
+                    crate::fetch_involved_prs(&username, include_drafts, None, &exclude_users)
+                }
+                AppMode::MyPrs => {
+                    crate::fetch_my_prs(&username, include_drafts, None, &exclude_users)
+                }
             };
             let _ = tx.send(AsyncResult::Refresh(page));
         });
@@ -2961,6 +3007,7 @@ pub fn run(
     include_drafts: bool,
     ai: AiConfig,
     mode: AppMode,
+    exclude_users: Vec<String>,
 ) -> Result<()> {
     // Setup terminal
     crossterm::terminal::enable_raw_mode()?;
@@ -2972,7 +3019,14 @@ pub fn run(
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::new(backend)?;
 
-    let mut app = App::new(repos_root, username, include_drafts, ai, mode);
+    let mut app = App::new(
+        repos_root,
+        username,
+        include_drafts,
+        exclude_users,
+        ai,
+        mode,
+    );
 
     // Start fetching PRs immediately in background
     app.refresh();
@@ -3529,6 +3583,7 @@ diff --git a/README.md b/README.md
             number,
             title: title.to_string(),
             author: author.to_string(),
+            author_kind: Some("User".to_string()),
             body: String::new(),
             repo_path: PathBuf::from("/tmp/repo"),
             repo_name: repo.to_string(),

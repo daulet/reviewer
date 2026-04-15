@@ -1,3 +1,4 @@
+use crate::agent::{self, AgentPreview};
 use crate::config::{self, AiConfig};
 use crate::diff::{self, SyntaxHighlighter};
 use crate::gh::{self, Comment, PullRequest, ReviewComment, ReviewState};
@@ -418,6 +419,7 @@ enum AsyncResult {
     ReviewComments(usize, Vec<ReviewComment>), // (pr_index, review comments with diff context)
     Checks(usize, Vec<gh::CheckStatus>),       // (pr_index, CI checks)
     AiLaunch(Result<String, String>),          // worktree path or error
+    AgentPreview(usize, AgentPreview),         // (pr_index, tmux preview)
     Refresh(gh::PullRequestPage),              // refreshed first page
     NextPage(String, gh::PullRequestPage),     // (requested cursor, appended next page)
 }
@@ -433,6 +435,7 @@ pub enum DetailTab {
     Description,
     Diff,
     Comments,
+    Agent,
 }
 
 /// App mode - determines what PRs are shown
@@ -505,6 +508,7 @@ pub struct App {
     pub comments_cache: Option<Vec<Comment>>,
     pub review_comments_cache: Option<Vec<ReviewComment>>,
     pub checks_cache: Option<Vec<gh::CheckStatus>>,
+    pub agent_preview_cache: Option<AgentPreview>,
     pub input_mode: InputMode,
     pub input_buffer: String,
     pub line_comment_ctx: Option<LineCommentContext>, // For line-level comments
@@ -525,6 +529,7 @@ pub struct App {
     loading_review_comments: bool,
     loading_checks: bool,
     loading_details: bool,
+    loading_agent_preview: bool,
     loading_next_page: bool,
     refreshing: bool,
     next_page_cursor: Option<String>,
@@ -534,6 +539,7 @@ pub struct App {
     needs_redraw: bool,
     // AI launch state
     launching_ai: bool,
+    pending_agent_attach_target: Option<String>,
     // Syntax highlighter for diff rendering
     syntax_highlighter: SyntaxHighlighter,
 }
@@ -575,6 +581,7 @@ impl App {
             comments_cache: None,
             review_comments_cache: None,
             checks_cache: None,
+            agent_preview_cache: None,
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             line_comment_ctx: None,
@@ -593,6 +600,7 @@ impl App {
             loading_review_comments: false,
             loading_checks: false,
             loading_details: false,
+            loading_agent_preview: false,
             loading_next_page: false,
             refreshing: false,
             next_page_cursor: None,
@@ -600,6 +608,7 @@ impl App {
             needs_clear: true,
             needs_redraw: true,
             launching_ai: false,
+            pending_agent_attach_target: None,
             syntax_highlighter: SyntaxHighlighter::new(),
         }
     }
@@ -893,11 +902,13 @@ impl App {
             self.comments_cache = None;
             self.review_comments_cache = None;
             self.checks_cache = None;
+            self.agent_preview_cache = None;
             self.loading_diff = false;
             self.loading_comments = false;
             self.loading_review_comments = false;
             self.loading_checks = false;
             self.loading_details = false;
+            self.loading_agent_preview = false;
             self.needs_clear = true;
             // Load details and checks asynchronously.
             self.load_details();
@@ -916,11 +927,13 @@ impl App {
         self.comments_cache = None;
         self.review_comments_cache = None;
         self.checks_cache = None;
+        self.agent_preview_cache = None;
         self.loading_diff = false;
         self.loading_comments = false;
         self.loading_review_comments = false;
         self.loading_checks = false;
         self.loading_details = false;
+        self.loading_agent_preview = false;
         self.needs_clear = true;
         self.clear_search();
     }
@@ -929,7 +942,8 @@ impl App {
         self.detail_tab = match self.detail_tab {
             DetailTab::Description => DetailTab::Diff,
             DetailTab::Diff => DetailTab::Comments,
-            DetailTab::Comments => DetailTab::Description,
+            DetailTab::Comments => DetailTab::Agent,
+            DetailTab::Agent => DetailTab::Description,
         };
         self.scroll_offset = 0;
         self.needs_clear = true;
@@ -938,9 +952,10 @@ impl App {
 
     fn prev_tab(&mut self) {
         self.detail_tab = match self.detail_tab {
-            DetailTab::Description => DetailTab::Comments,
+            DetailTab::Description => DetailTab::Agent,
             DetailTab::Diff => DetailTab::Description,
             DetailTab::Comments => DetailTab::Diff,
+            DetailTab::Agent => DetailTab::Comments,
         };
         self.scroll_offset = 0;
         self.needs_clear = true;
@@ -955,6 +970,7 @@ impl App {
                 self.load_comments();
                 self.load_review_comments();
             }
+            DetailTab::Agent => self.load_agent_preview(),
         }
     }
 
@@ -1121,6 +1137,48 @@ impl App {
         }
     }
 
+    fn load_agent_preview(&mut self) {
+        if self.agent_preview_cache.is_some() || self.loading_agent_preview {
+            return;
+        }
+        self.refresh_agent_preview();
+    }
+
+    fn refresh_agent_preview(&mut self) {
+        if self.loading_agent_preview {
+            return;
+        }
+        if let Some(idx) = self.list_state.selected() {
+            if let Some(pr) = self.prs.get(idx) {
+                self.loading_agent_preview = true;
+                let pr = pr.clone();
+                let tx = self.async_tx.clone();
+                thread::spawn(move || {
+                    let preview = agent::preview_agent_session(&pr);
+                    let _ = tx.send(AsyncResult::AgentPreview(idx, preview));
+                });
+            }
+        }
+    }
+
+    fn attach_agent_session(&mut self) {
+        let target = self
+            .agent_preview_cache
+            .as_ref()
+            .and_then(|preview| preview.pane.as_ref())
+            .map(|pane| pane.target.clone());
+
+        if let Some(target) = target {
+            self.pending_agent_attach_target = Some(target);
+        } else {
+            self.set_status("No agent session found for this PR".to_string());
+        }
+    }
+
+    fn take_pending_agent_attach_target(&mut self) -> Option<String> {
+        self.pending_agent_attach_target.take()
+    }
+
     fn poll_async_results(&mut self) -> bool {
         let mut has_updates = false;
         while let Ok(result) = self.async_rx.try_recv() {
@@ -1183,16 +1241,26 @@ impl App {
                     }
                     self.loading_checks = false;
                 }
+                AsyncResult::AgentPreview(idx, preview) => {
+                    if self.list_state.selected() == Some(idx) {
+                        self.agent_preview_cache = Some(preview);
+                    }
+                    self.loading_agent_preview = false;
+                }
                 AsyncResult::AiLaunch(result) => {
                     self.launching_ai = false;
                     self.needs_clear = true;
                     match result {
                         Ok(path) => {
+                            self.agent_preview_cache = None;
                             self.set_status(format!(
                                 "Launched {} in {}",
                                 self.ai.display_name(),
                                 path
                             ));
+                            if self.detail_tab == DetailTab::Agent {
+                                self.load_agent_preview();
+                            }
                         }
                         Err(e) => {
                             self.set_status(format!("Failed: {}", e));
@@ -1786,7 +1854,17 @@ impl App {
                 }
                 KeyCode::PageDown => self.page_down(),
                 KeyCode::PageUp => self.page_up(),
+                KeyCode::Enter if self.detail_tab == DetailTab::Agent => {
+                    self.attach_agent_session()
+                }
                 KeyCode::Enter if self.showing_large_diff_tree() => self.open_selected_file_diff(),
+                KeyCode::Char('A') if self.detail_tab == DetailTab::Agent => {
+                    self.attach_agent_session()
+                }
+                KeyCode::Char('R') if self.detail_tab == DetailTab::Agent => {
+                    self.agent_preview_cache = None;
+                    self.refresh_agent_preview();
+                }
                 KeyCode::Char('c') => self.start_line_comment(),
                 KeyCode::Char('a') => self.start_approve(),
                 KeyCode::Char('x') => self.start_close(),
@@ -2421,11 +2499,12 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
     frame.render_widget(header, chunks[0]);
 
     // Tabs
-    let tabs = Tabs::new(vec!["Description", "Diff", "Comments"])
+    let tabs = Tabs::new(vec!["Description", "Diff", "Comments", "Agent"])
         .select(match app.detail_tab {
             DetailTab::Description => 0,
             DetailTab::Diff => 1,
             DetailTab::Comments => 2,
+            DetailTab::Agent => 3,
         })
         .style(Style::default().fg(Color::White))
         .highlight_style(
@@ -2481,6 +2560,7 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
             DetailTab::Description => " Description ".to_string(),
             DetailTab::Diff => diff_title,
             DetailTab::Comments => " Comments ".to_string(),
+            DetailTab::Agent => " Agent ".to_string(),
         });
 
     match app.detail_tab {
@@ -2718,6 +2798,54 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
                 .scroll((app.scroll_offset, 0));
             frame.render_widget(para, chunks[2]);
         }
+        DetailTab::Agent => {
+            if app.agent_preview_cache.is_none() && !app.loading_agent_preview {
+                app.load_agent_preview();
+            }
+
+            let body = if app.loading_agent_preview {
+                "Loading agent session...".to_string()
+            } else if let Some(preview) = app.agent_preview_cache.as_ref() {
+                match (&preview.pane, &preview.error) {
+                    (Some(pane), None) => {
+                        let mut text = format!(
+                            "tmux target: {} | {}:{} | {} | {}\n\n",
+                            pane.target,
+                            pane.session_name,
+                            pane.window_index,
+                            pane.pane_command,
+                            pane.pane_title
+                        );
+                        if preview.output.trim().is_empty() {
+                            text.push_str("Agent pane is currently blank.");
+                        } else {
+                            text.push_str(&preview.output);
+                        }
+                        text
+                    }
+                    (Some(pane), Some(err)) => format!(
+                        "Found tmux target {} for {}, but capture failed:\n\n{}",
+                        pane.target, preview.expected_slug, err
+                    ),
+                    (None, Some(err)) => format!(
+                        "Could not inspect tmux for {}:\n\n{}",
+                        preview.expected_slug, err
+                    ),
+                    (None, None) => format!(
+                        "No agent session found for {}.\n\nPress r to launch a review session, then R to refresh this tab.",
+                        preview.expected_slug
+                    ),
+                }
+            } else {
+                "No agent preview loaded.".to_string()
+            };
+
+            let para = Paragraph::new(body)
+                .block(content_block)
+                .wrap(Wrap { trim: false })
+                .scroll((app.scroll_offset, 0));
+            frame.render_widget(para, chunks[2]);
+        }
     }
 
     // Help - context-aware based on tab and mode
@@ -2734,6 +2862,9 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
         }
     } else {
         match (app.detail_tab, app.mode) {
+            (DetailTab::Agent, _) => {
+                " Tab: tabs | j/k: scroll | R: refresh agent | Enter/A: attach | r: launch | q: back"
+            }
             (DetailTab::Diff, AppMode::MyPrs) => {
                 " j/k: scroll | /: search | t: tree | D: delta | m: merge | o: browser | y: copy | q: back"
             }
@@ -3051,6 +3182,27 @@ pub fn run(
         }
 
         app.handle_event()?;
+        if let Some(target) = app.take_pending_agent_attach_target() {
+            crossterm::terminal::disable_raw_mode()?;
+            crossterm::execute!(
+                terminal.backend_mut(),
+                crossterm::terminal::LeaveAlternateScreen
+            )?;
+            terminal.show_cursor()?;
+
+            let attach_result = agent::switch_or_attach(&target);
+
+            crossterm::execute!(
+                terminal.backend_mut(),
+                crossterm::terminal::EnterAlternateScreen
+            )?;
+            crossterm::terminal::enable_raw_mode()?;
+            terminal.clear()?;
+            app.needs_clear = true;
+            if let Err(err) = attach_result {
+                app.set_status(format!("Failed to attach agent: {:#}", err));
+            }
+        }
 
         if app.should_quit {
             break;

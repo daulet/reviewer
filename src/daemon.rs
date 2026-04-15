@@ -548,26 +548,21 @@ fn trigger_review(
 }
 
 fn ai_config_for_trigger_kind(ai: &AiConfig, trigger_kind: ReviewTriggerKind) -> Option<AiConfig> {
-    match trigger_kind {
-        ReviewTriggerKind::Review => {
-            if ai.launch.steps.is_empty() {
-                None
-            } else {
-                Some(ai.clone())
-            }
-        }
-        ReviewTriggerKind::SelfReview => {
-            if !ai.launch.self_review_steps.is_empty() {
-                let mut self_review_ai = ai.clone();
-                self_review_ai.launch.steps = ai.launch.self_review_steps.clone();
-                Some(self_review_ai)
-            } else if ai.launch.steps.is_empty() {
-                None
-            } else {
-                Some(ai.clone())
-            }
-        }
+    if ai.launch.uses_tmux() {
+        return Some(ai.clone());
     }
+
+    if !ai.launch.is_configured() {
+        return None;
+    }
+
+    if trigger_kind == ReviewTriggerKind::SelfReview && !ai.launch.self_review_steps.is_empty() {
+        let mut self_review_ai = ai.clone();
+        self_review_ai.launch.steps = ai.launch.self_review_steps.clone();
+        return Some(self_review_ai);
+    }
+
+    Some(ai.clone())
 }
 
 fn ai_config_for_action<'a>(
@@ -706,14 +701,14 @@ pub fn poll_once(cfg: &Config, repos_root: &Path, username: &str) -> Result<Poll
         if let Some(ai_cfg) = review_ai.as_ref() {
             if let Err(err) = gh::validate_ai_launch_config(ai_cfg) {
                 eprintln!(
-                    "Skipping review triggers this poll: invalid ai.launch.steps config: {:#}",
+                    "Skipping review triggers this poll: invalid ai.launch config: {:#}",
                     err
                 );
                 review_ai = None;
             }
         } else {
             eprintln!(
-                "Skipping review triggers this poll: ai.launch.steps is empty. Configure ai.launch.steps to enable review actions."
+                "Skipping review triggers this poll: ai.launch is not configured. Configure ai.launch.steps or ai.launch.backend."
             );
         }
     }
@@ -728,7 +723,7 @@ pub fn poll_once(cfg: &Config, repos_root: &Path, username: &str) -> Result<Poll
             }
         } else {
             eprintln!(
-                "Skipping self-review triggers this poll: both ai.launch.steps and ai.launch.self_review_steps are empty."
+                "Skipping self-review triggers this poll: ai.launch is not configured. Configure ai.launch.steps, ai.launch.self_review_steps, or ai.launch.backend."
             );
         }
     }
@@ -1807,6 +1802,15 @@ mod tests {
     fn ai_config_for_trigger_kind_requires_review_steps_for_review_action() {
         let ai = AiConfig::default();
         assert!(ai_config_for_trigger_kind(&ai, ReviewTriggerKind::Review).is_none());
+    }
+
+    #[test]
+    fn ai_config_for_trigger_kind_accepts_tmux_backend_without_steps() {
+        let mut ai = AiConfig::default();
+        ai.launch.backend = Some("tmux".to_string());
+
+        assert!(ai_config_for_trigger_kind(&ai, ReviewTriggerKind::Review).is_some());
+        assert!(ai_config_for_trigger_kind(&ai, ReviewTriggerKind::SelfReview).is_some());
     }
 
     #[test]

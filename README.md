@@ -6,7 +6,8 @@ How do you keep up with AI generated PRs? Answer: use AI assisted code reviews.
 ## Features
 
 - List, comment, approve PRs involving your GitHub account;
-- Start interactive AI assisted review session, let it learn your code review approach;  
+- Start interactive AI assisted review session, let it learn your code review approach;
+- Preview the launched tmux-backed review agent from the PR detail `Agent` tab;
 - Run reviewer as daemon to kick off reviews as they are created;
 
 ## Installation
@@ -33,7 +34,7 @@ cargo install --git https://github.com/daulet/reviewer
 | [delta](https://github.com/dandavison/delta) | Enhanced diff rendering (side-by-side, syntax highlighting) | `brew install git-delta` |
 | [Codex CLI](https://github.com/openai/codex) | AI-assisted code reviews (OpenAI) | `npm install -g @openai/codex` |
 | [Claude Code](https://github.com/anthropics/claude-code) | AI-assisted code reviews | `npm install -g @anthropic-ai/claude-code` |
-| [Maestro](https://github.com/daulet/maestro) | Launch review sessions in managed tmux sessions | `brew install daulet/tap/maestro` |
+| [tmux](https://github.com/tmux/tmux) | Launch and preview review agent sessions | `brew install tmux` |
 
 The diff tries to use `delta` if installed. Choice of code reviewer tool can be configured in `~/.config/reviewer/config.json`.
 
@@ -234,48 +235,17 @@ Daemon state is stored separately in:
     "skill": "code-review",
     "prompt_template": "Review PR #{pr_number} in {repo}. Title: \"{title}\". Use {skill}. Follow {review_guide}",
     "launch": {
-      "steps": [
-        {
-          "command": "maestro",
-          "args": [
-            "start",
-            "--cwd",
-            "{workdir}",
-            "--title",
-            "review {repo}#{pr_number}",
-            "--tag",
-            "review",
-            "--auto-approve",
-            "--tool",
-            "codex",
-            "--cmd",
-            "{tool_command}"
-          ]
-        }
-      ],
-      "self_review_steps": [
-        {
-          "command": "maestro",
-          "args": [
-            "start",
-            "--cwd",
-            "{workdir}",
-            "--title",
-            "self-review {repo}#{pr_number}",
-            "--tag",
-            "self-review",
-            "--auto-approve",
-            "--tool",
-            "codex",
-            "--cmd",
-            "{tool_command}"
-          ]
-        }
-      ]
+      "backend": "tmux",
+      "tmux": {
+        "session": "reviewer",
+        "reuse_existing": true
+      }
     }
   }
 }
 ```
+
+The native tmux launcher creates one window per PR using a stable name like `nvidia-lpu-cyborg-pr-199`. The TUI `Agent` tab previews that pane with `tmux capture-pane`; press `Enter` or `A` from the tab to attach/switch to it.
 
 `exclude_users` filters PR authors from the TUI list and daemon review/self-review triggers. Patterns are case-insensitive, a leading `@` is optional, and `*`/`?` wildcards are supported. Exact user entries are also sent to GitHub search as `-author:<login>` and `-author:app/<login>` so excluded users do not consume page slots. `@apps/*` only matches GitHub bot/app actors, so it will not hide normal users. Auto-approve rules are evaluated before this filter, so excluded users can still be auto-approved when they match `daemon.auto_approve`.
 

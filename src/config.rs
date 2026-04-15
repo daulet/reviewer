@@ -12,6 +12,10 @@ fn default_only_new_prs_on_start() -> bool {
     true
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct AiLaunchStepConfig {
@@ -20,13 +24,47 @@ pub struct AiLaunchStepConfig {
     pub args: Vec<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct AiLaunchTmuxConfig {
+    pub session: Option<String>,
+    #[serde(default = "default_true")]
+    pub reuse_existing: bool,
+}
+
+impl Default for AiLaunchTmuxConfig {
+    fn default() -> Self {
+        Self {
+            session: None,
+            reuse_existing: true,
+        }
+    }
+}
+
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct AiLaunchConfig {
+    pub backend: Option<String>,
+    #[serde(default)]
+    pub tmux: AiLaunchTmuxConfig,
     #[serde(default)]
     pub steps: Vec<AiLaunchStepConfig>,
     #[serde(default)]
     pub self_review_steps: Vec<AiLaunchStepConfig>,
+}
+
+impl AiLaunchConfig {
+    pub fn backend_key(&self) -> &str {
+        self.backend.as_deref().unwrap_or("steps")
+    }
+
+    pub fn uses_tmux(&self) -> bool {
+        self.backend_key() == "tmux"
+    }
+
+    pub fn is_configured(&self) -> bool {
+        self.uses_tmux() || !self.steps.is_empty()
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
@@ -358,6 +396,11 @@ mod tests {
             "skill": null,
             "prompt_template": null,
             "launch": {
+              "backend": null,
+              "tmux": {
+                "session": null,
+                "reuse_existing": true
+              },
               "steps": []
             }
           },
@@ -415,6 +458,11 @@ mod tests {
             "skill": null,
             "prompt_template": null,
             "launch": {
+              "backend": null,
+              "tmux": {
+                "session": null,
+                "reuse_existing": true
+              },
               "steps": []
             }
           },
@@ -447,6 +495,13 @@ mod tests {
     fn ai_launch_self_review_steps_default_empty() {
         let cfg = Config::default();
         assert!(cfg.ai.launch.self_review_steps.is_empty());
+    }
+
+    #[test]
+    fn ai_launch_tmux_config_defaults_to_reuse_existing() {
+        let cfg = Config::default();
+        assert!(cfg.ai.launch.tmux.reuse_existing);
+        assert_eq!(cfg.ai.launch.backend_key(), "steps");
     }
 
     #[test]

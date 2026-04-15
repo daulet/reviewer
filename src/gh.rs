@@ -1,3 +1,4 @@
+use crate::agent;
 use crate::config::{self, AiConfig};
 use crate::filters;
 use anyhow::{Context, Result};
@@ -1476,18 +1477,155 @@ fn render_launch_template(template: &str, values: &LaunchTemplateValues) -> Stri
 }
 
 pub fn validate_ai_launch_config(ai: &AiConfig) -> Result<()> {
-    if ai.launch.steps.is_empty() {
-        anyhow::bail!(
-            "ai.launch.steps is empty. Configure launcher commands in ~/.config/reviewer/config.json"
-        );
-    }
+    match ai.launch.backend_key() {
+        "tmux" => {
+            if let Some(session) = ai.launch.tmux.session.as_deref() {
+                if session.trim().is_empty() || session.contains(':') {
+                    anyhow::bail!(
+                        "ai.launch.tmux.session must be non-empty and must not contain ':'"
+                    );
+                }
+            }
+        }
+        "steps" => {
+            if ai.launch.steps.is_empty() {
+                anyhow::bail!(
+                    "ai.launch.steps is empty. Configure launcher commands in ~/.config/reviewer/config.json or set ai.launch.backend to \"tmux\""
+                );
+            }
 
-    for (idx, step) in ai.launch.steps.iter().enumerate() {
-        if step.command.trim().is_empty() {
-            anyhow::bail!("ai.launch.steps[{idx}] command is empty");
+            for (idx, step) in ai.launch.steps.iter().enumerate() {
+                if step.command.trim().is_empty() {
+                    anyhow::bail!("ai.launch.steps[{idx}] command is empty");
+                }
+            }
+        }
+        other => {
+            anyhow::bail!(
+                "Unsupported ai.launch.backend '{}'. Expected 'steps' or 'tmux'.",
+                other
+            );
         }
     }
 
+    Ok(())
+}
+
+fn tmux_session_name(ai: &AiConfig) -> String {
+    ai.launch
+        .tmux
+        .session
+        .as_deref()
+        .map(str::trim)
+        .filter(|session| !session.is_empty())
+        .unwrap_or("reviewer")
+        .to_string()
+}
+
+fn tmux_run(args: &[&str]) -> Result<std::process::Output> {
+    let output = Command::new("tmux")
+        .args(args)
+        .output()
+        .context("Failed to run tmux")?;
+    Ok(output)
+}
+
+fn tmux_has_session(session: &str) -> bool {
+    Command::new("tmux")
+        .args(["has-session", "-t", session])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn tmux_create_pane(
+    session: &str,
+    window_name: &str,
+    working_dir: &std::path::Path,
+) -> Result<String> {
+    let working_dir = working_dir.display().to_string();
+    let output = if tmux_has_session(session) {
+        tmux_run(&[
+            "new-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            &format!("{session}:"),
+            "-n",
+            window_name,
+            "-c",
+            &working_dir,
+        ])?
+    } else {
+        tmux_run(&[
+            "new-session",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-s",
+            session,
+            "-n",
+            window_name,
+            "-c",
+            &working_dir,
+        ])?
+    };
+
+    if !output.status.success() {
+        anyhow::bail!("tmux launch failed: {}", command_error_message(&output));
+    }
+
+    let pane_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if pane_id.is_empty() {
+        anyhow::bail!("tmux did not return a pane id for launched session");
+    }
+    Ok(pane_id)
+}
+
+fn tmux_set_pane_title(target: &str, title: &str) -> Result<()> {
+    let output = tmux_run(&["select-pane", "-t", target, "-T", title])?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "tmux select-pane failed: {}",
+            command_error_message(&output)
+        );
+    }
+    Ok(())
+}
+
+fn tmux_send_command(target: &str, command_line: &str) -> Result<()> {
+    let output = tmux_run(&["send-keys", "-t", target, "-l", command_line])?;
+    if !output.status.success() {
+        anyhow::bail!("tmux send-keys failed: {}", command_error_message(&output));
+    }
+
+    let output = tmux_run(&["send-keys", "-t", target, "C-m"])?;
+    if !output.status.success() {
+        anyhow::bail!("tmux send enter failed: {}", command_error_message(&output));
+    }
+    Ok(())
+}
+
+fn launch_with_tmux(
+    working_dir: &std::path::Path,
+    pr: &PullRequest,
+    ai: &AiConfig,
+    values: &LaunchTemplateValues,
+) -> Result<()> {
+    validate_ai_launch_config(ai)?;
+
+    let session = tmux_session_name(ai);
+    let window_name = agent::pr_agent_slug(pr);
+    if ai.launch.tmux.reuse_existing && agent::find_agent_pane(pr)?.is_some() {
+        return Ok(());
+    }
+
+    let pane_id = tmux_create_pane(&session, &window_name, working_dir)?;
+    tmux_set_pane_title(&pane_id, &window_name)?;
+    tmux_send_command(&pane_id, &values.tool_command)?;
     Ok(())
 }
 
@@ -1586,14 +1724,22 @@ pub fn launch_ai(working_dir: &std::path::Path, pr: &PullRequest, ai: &AiConfig)
         skill_name: &skill_name,
         skill_invocation: &skill_invocation,
     });
-    launch_with_steps(working_dir, ai, &values)
+
+    match ai.launch.backend_key() {
+        "tmux" => launch_with_tmux(working_dir, pr, ai, &values),
+        "steps" => launch_with_steps(working_dir, ai, &values),
+        other => anyhow::bail!(
+            "Unsupported ai.launch.backend '{}'. Expected 'steps' or 'tmux'.",
+            other
+        ),
+    }
 }
 
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use super::{
         build_shell_command, launch_with_steps, render_launch_template, search_qualifiers,
-        LaunchContext, LaunchTemplateValues, PullRequest, SearchScope,
+        validate_ai_launch_config, LaunchContext, LaunchTemplateValues, PullRequest, SearchScope,
     };
     use crate::config::AiConfig;
     use chrono::Utc;
@@ -1700,5 +1846,13 @@ mod tests {
             msg.contains("ai.launch.steps is empty"),
             "unexpected error: {msg}"
         );
+    }
+
+    #[test]
+    fn validate_ai_launch_config_allows_tmux_without_steps() {
+        let mut ai = AiConfig::default();
+        ai.launch.backend = Some("tmux".to_string());
+
+        validate_ai_launch_config(&ai).expect("tmux launch backend should not require steps");
     }
 }

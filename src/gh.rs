@@ -103,6 +103,16 @@ struct SearchData {
 #[derive(Debug, Deserialize)]
 struct SearchNodes {
     nodes: Vec<SearchPrData>,
+    #[serde(rename = "pageInfo")]
+    page_info: PageInfo,
+}
+
+#[derive(Debug, Deserialize)]
+struct PageInfo {
+    #[serde(rename = "endCursor")]
+    end_cursor: Option<String>,
+    #[serde(rename = "hasNextPage")]
+    has_next_page: bool,
 }
 
 /// Review state for user's PRs
@@ -139,6 +149,13 @@ pub struct PullRequest {
     pub is_draft: bool,
     pub review_state: ReviewState,
     pub details_loaded: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PullRequestPage {
+    pub prs: Vec<PullRequest>,
+    pub end_cursor: Option<String>,
+    pub has_next_page: bool,
 }
 
 pub fn get_current_user() -> Result<String> {
@@ -485,22 +502,28 @@ enum SearchScope {
 }
 
 /// Search for the first page of open PRs involving the current user.
-pub fn search_involved_prs(username: &str, include_drafts: bool) -> Vec<PullRequest> {
+pub fn search_involved_prs(
+    username: &str,
+    include_drafts: bool,
+    after: Option<&str>,
+) -> PullRequestPage {
     search_prs_with_limit(
         username,
         include_drafts,
         FIRST_PAGE_PR_LIST_LIMIT,
         SearchScope::Involved,
+        after,
     )
 }
 
 /// Search for the first page of open PRs authored by the current user.
-pub fn search_my_prs(username: &str, include_drafts: bool) -> Vec<PullRequest> {
+pub fn search_my_prs(username: &str, include_drafts: bool, after: Option<&str>) -> PullRequestPage {
     search_prs_with_limit(
         username,
         include_drafts,
         FIRST_PAGE_PR_LIST_LIMIT,
         SearchScope::Authored,
+        after,
     )
 }
 
@@ -509,7 +532,8 @@ fn search_prs_with_limit(
     include_drafts: bool,
     limit: usize,
     scope: SearchScope,
-) -> Vec<PullRequest> {
+    after: Option<&str>,
+) -> PullRequestPage {
     let mut qualifiers = vec!["is:pr".to_string(), "is:open".to_string()];
     qualifiers.push(match scope {
         SearchScope::Involved => format!("involves:{username}"),
@@ -523,9 +547,13 @@ fn search_prs_with_limit(
     let search_query = qualifiers.join(" ");
     let query_literal = serde_json::to_string(&search_query).unwrap_or_default();
     let first = limit.min(100);
+    let after_arg = after
+        .and_then(|cursor| serde_json::to_string(cursor).ok())
+        .map(|cursor| format!(", after: {cursor}"))
+        .unwrap_or_default();
     let query = format!(
         r#"query {{
-            search(query: {query_literal}, type: ISSUE, first: {first}) {{
+            search(query: {query_literal}, type: ISSUE, first: {first}{after_arg}) {{
                 nodes {{
                     ... on PullRequest {{
                         number
@@ -542,6 +570,10 @@ fn search_prs_with_limit(
                         }}
                     }}
                 }}
+                pageInfo {{
+                    endCursor
+                    hasNextPage
+                }}
             }}
         }}"#
     );
@@ -557,17 +589,22 @@ fn search_prs_with_limit(
         Some(o) if o.status.success() => {
             serde_json::from_slice(&o.stdout).unwrap_or(SearchResponse { data: None })
         }
-        _ => return Vec::new(),
+        _ => return PullRequestPage::default(),
     };
 
     response
         .data
         .map(|data| {
-            data.search
-                .nodes
+            let SearchNodes { nodes, page_info } = data.search;
+            let prs = nodes
                 .into_iter()
                 .map(search_pr_data_to_pull_request)
-                .collect()
+                .collect();
+            PullRequestPage {
+                prs,
+                end_cursor: page_info.end_cursor,
+                has_next_page: page_info.has_next_page,
+            }
         })
         .unwrap_or_default()
 }

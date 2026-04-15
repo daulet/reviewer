@@ -418,7 +418,8 @@ enum AsyncResult {
     ReviewComments(usize, Vec<ReviewComment>), // (pr_index, review comments with diff context)
     Checks(usize, Vec<gh::CheckStatus>),       // (pr_index, CI checks)
     AiLaunch(Result<String, String>),          // worktree path or error
-    Refresh(Vec<PullRequest>),                 // refreshed PR list
+    Refresh(gh::PullRequestPage),              // refreshed first page
+    NextPage(String, gh::PullRequestPage),     // (requested cursor, appended next page)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -523,7 +524,10 @@ pub struct App {
     loading_review_comments: bool,
     loading_checks: bool,
     loading_details: bool,
+    loading_next_page: bool,
     refreshing: bool,
+    next_page_cursor: Option<String>,
+    has_next_page: bool,
     // Screen state
     needs_clear: bool,
     needs_redraw: bool,
@@ -586,7 +590,10 @@ impl App {
             loading_review_comments: false,
             loading_checks: false,
             loading_details: false,
+            loading_next_page: false,
             refreshing: false,
+            next_page_cursor: None,
+            has_next_page: false,
             needs_clear: true,
             needs_redraw: true,
             launching_ai: false,
@@ -613,6 +620,22 @@ impl App {
 
     pub fn selected_pr(&self) -> Option<&PullRequest> {
         self.list_state.selected().and_then(|i| self.prs.get(i))
+    }
+
+    fn pagination_row_count(&self) -> usize {
+        usize::from(self.has_next_page || self.loading_next_page)
+    }
+
+    fn pagination_row_index(&self) -> Option<usize> {
+        if self.pagination_row_count() == 0 {
+            None
+        } else {
+            Some(self.prs.len())
+        }
+    }
+
+    fn list_item_count(&self) -> usize {
+        self.prs.len() + self.pagination_row_count()
     }
 
     fn reset_large_diff_state(&mut self) {
@@ -757,24 +780,26 @@ impl App {
     }
 
     fn next(&mut self) {
-        if self.prs.is_empty() {
+        let count = self.list_item_count();
+        if count == 0 {
             return;
         }
         let i = match self.list_state.selected() {
-            Some(i) => (i + 1) % self.prs.len(),
+            Some(i) => (i + 1) % count,
             None => 0,
         };
         self.list_state.select(Some(i));
     }
 
     fn previous(&mut self) {
-        if self.prs.is_empty() {
+        let count = self.list_item_count();
+        if count == 0 {
             return;
         }
         let i = match self.list_state.selected() {
             Some(i) => {
                 if i == 0 {
-                    self.prs.len() - 1
+                    count - 1
                 } else {
                     i - 1
                 }
@@ -785,19 +810,20 @@ impl App {
     }
 
     fn next_page(&mut self) {
-        if self.prs.is_empty() {
+        let count = self.list_item_count();
+        if count == 0 {
             return;
         }
         let page_size = 10;
         let i = match self.list_state.selected() {
-            Some(i) => (i + page_size).min(self.prs.len() - 1),
+            Some(i) => (i + page_size).min(count - 1),
             None => 0,
         };
         self.list_state.select(Some(i));
     }
 
     fn previous_page(&mut self) {
-        if self.prs.is_empty() {
+        if self.list_item_count() == 0 {
             return;
         }
         let page_size = 10;
@@ -809,14 +835,15 @@ impl App {
     }
 
     fn go_to_first(&mut self) {
-        if !self.prs.is_empty() {
+        if self.list_item_count() > 0 {
             self.list_state.select(Some(0));
         }
     }
 
     fn go_to_last(&mut self) {
-        if !self.prs.is_empty() {
-            self.list_state.select(Some(self.prs.len() - 1));
+        let count = self.list_item_count();
+        if count > 0 {
+            self.list_state.select(Some(count - 1));
         }
     }
 
@@ -932,6 +959,52 @@ impl App {
                     let _ = tx.send(AsyncResult::Details(idx, details));
                 });
             }
+        }
+    }
+
+    fn load_next_page(&mut self) {
+        if self.loading_next_page || !self.has_next_page || self.refreshing {
+            return;
+        }
+
+        let Some(cursor) = self.next_page_cursor.clone() else {
+            self.has_next_page = false;
+            return;
+        };
+
+        self.loading_next_page = true;
+        self.needs_redraw = true;
+        let tx = self.async_tx.clone();
+        let username = self.username.clone();
+        let include_drafts = self.include_drafts;
+        let mode = self.mode;
+
+        thread::spawn(move || {
+            let page = match mode {
+                AppMode::Review => {
+                    crate::fetch_involved_prs(&username, include_drafts, Some(&cursor))
+                }
+                AppMode::MyPrs => crate::fetch_my_prs(&username, include_drafts, Some(&cursor)),
+            };
+            let _ = tx.send(AsyncResult::NextPage(cursor, page));
+        });
+    }
+
+    fn load_next_page_if_pagination_visible(&mut self, list_area_height: u16) {
+        let Some(pagination_idx) = self.pagination_row_index() else {
+            return;
+        };
+        if self.loading_next_page || !self.has_next_page {
+            return;
+        }
+
+        let content_height = list_area_height.saturating_sub(2) as usize;
+        let visible_item_capacity = content_height.div_ceil(2).max(1);
+        let first_visible = self.list_state.offset();
+        let past_last_visible = first_visible.saturating_add(visible_item_capacity);
+
+        if pagination_idx >= first_visible && pagination_idx < past_last_visible {
+            self.load_next_page();
         }
     }
 
@@ -1086,11 +1159,14 @@ impl App {
                         }
                     }
                 }
-                AsyncResult::Refresh(prs) => {
+                AsyncResult::Refresh(page) => {
                     self.refreshing = false;
+                    self.loading_next_page = false;
                     self.needs_clear = true;
-                    let count = prs.len();
-                    self.prs = prs;
+                    let count = page.prs.len();
+                    self.prs = page.prs;
+                    self.next_page_cursor = page.end_cursor;
+                    self.has_next_page = page.has_next_page;
                     // Reset selection
                     if self.prs.is_empty() {
                         self.list_state.select(None);
@@ -1103,6 +1179,31 @@ impl App {
                         ""
                     };
                     self.set_status(format!("Refreshed: {} PRs{}", count, draft_status));
+                }
+                AsyncResult::NextPage(cursor, page) => {
+                    if self.next_page_cursor.as_deref() != Some(cursor.as_str()) {
+                        continue;
+                    }
+                    self.loading_next_page = false;
+                    self.needs_clear = true;
+                    let added = page.prs.len();
+                    self.prs.extend(page.prs);
+                    self.next_page_cursor = page.end_cursor;
+                    self.has_next_page = page.has_next_page;
+
+                    if self.list_item_count() == 0 {
+                        self.list_state.select(None);
+                    } else if self
+                        .list_state
+                        .selected()
+                        .is_some_and(|idx| idx >= self.list_item_count())
+                    {
+                        self.list_state.select(Some(self.list_item_count() - 1));
+                    }
+
+                    if added > 0 {
+                        self.set_status(format!("Loaded {} more PRs", added));
+                    }
                 }
             }
         }
@@ -1490,6 +1591,9 @@ impl App {
             return;
         }
         self.refreshing = true;
+        self.loading_next_page = false;
+        self.has_next_page = false;
+        self.next_page_cursor = None;
         self.set_status("Refreshing PR list...".to_string());
 
         let tx = self.async_tx.clone();
@@ -1498,11 +1602,11 @@ impl App {
         let mode = self.mode;
 
         thread::spawn(move || {
-            let prs = match mode {
-                AppMode::Review => crate::fetch_involved_prs(&username, include_drafts),
-                AppMode::MyPrs => crate::fetch_my_prs(&username, include_drafts),
+            let page = match mode {
+                AppMode::Review => crate::fetch_involved_prs(&username, include_drafts, None),
+                AppMode::MyPrs => crate::fetch_my_prs(&username, include_drafts, None),
             };
-            let _ = tx.send(AsyncResult::Refresh(prs));
+            let _ = tx.send(AsyncResult::Refresh(page));
         });
     }
 
@@ -2119,7 +2223,7 @@ fn draw_list(frame: &mut Frame, app: &mut App) {
         .constraints([Constraint::Min(0), Constraint::Length(3)])
         .split(frame.area());
 
-    let items: Vec<ListItem> = app
+    let mut items: Vec<ListItem> = app
         .prs
         .iter()
         .map(|pr| {
@@ -2164,6 +2268,20 @@ fn draw_list(frame: &mut Frame, app: &mut App) {
         })
         .collect();
 
+    if app.pagination_row_count() > 0 {
+        let label = if app.loading_next_page {
+            "Loading more PRs..."
+        } else {
+            "More PRs..."
+        };
+        items.push(ListItem::new(Line::from(vec![Span::styled(
+            label,
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        )])));
+    }
+
     let draft_status = if app.include_drafts { " +drafts" } else { "" };
     let title = match app.mode {
         AppMode::Review => format!(" PRs involving me ({}){} ", app.prs.len(), draft_status),
@@ -2179,6 +2297,7 @@ fn draw_list(frame: &mut Frame, app: &mut App) {
         .highlight_symbol("▶ ");
 
     frame.render_stateful_widget(list, chunks[0], &mut app.list_state);
+    app.load_next_page_if_pagination_visible(chunks[0].height);
 
     let help = Paragraph::new(
         " j/k: navigate | Ctrl+d/u: page | Enter: open | /: search | o: browser | y: copy URL | R: refresh | q: quit",

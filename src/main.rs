@@ -103,12 +103,20 @@ struct TriggerArgs {
     repo_path: Option<PathBuf>,
 }
 
-pub fn fetch_involved_prs(username: &str, include_drafts: bool) -> Vec<gh::PullRequest> {
-    gh::search_involved_prs(username, include_drafts)
+pub fn fetch_involved_prs(
+    username: &str,
+    include_drafts: bool,
+    after: Option<&str>,
+) -> gh::PullRequestPage {
+    gh::search_involved_prs(username, include_drafts, after)
 }
 
-pub fn fetch_my_prs(username: &str, include_drafts: bool) -> Vec<gh::PullRequest> {
-    gh::search_my_prs(username, include_drafts)
+pub fn fetch_my_prs(
+    username: &str,
+    include_drafts: bool,
+    after: Option<&str>,
+) -> gh::PullRequestPage {
+    gh::search_my_prs(username, include_drafts, after)
 }
 
 fn merge_excludes(config_exclude: &[String], cli_exclude: &[String]) -> Vec<String> {

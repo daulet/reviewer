@@ -132,6 +132,36 @@ pub fn fetch_my_prs(
     )
 }
 
+pub fn fetch_watching_prs(
+    repos_root: &Path,
+    username: &str,
+    include_drafts: bool,
+    after: Option<&str>,
+    exclude_users: &[String],
+) -> gh::PullRequestPage {
+    if after.is_some() {
+        return gh::PullRequestPage::default();
+    }
+
+    let cfg = match config::load_config() {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            eprintln!("Failed to load config for watched repos view: {:#}", err);
+            return gh::PullRequestPage::default();
+        }
+    };
+
+    let prs = daemon::list_watched_prs(&cfg, repos_root, username, include_drafts);
+    filter_excluded_pr_authors(
+        gh::PullRequestPage {
+            prs,
+            end_cursor: None,
+            has_next_page: false,
+        },
+        exclude_users,
+    )
+}
+
 fn filter_excluded_pr_authors(
     mut page: gh::PullRequestPage,
     exclude_users: &[String],

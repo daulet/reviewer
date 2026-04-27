@@ -129,12 +129,12 @@ The AI learns from skipped comments and offers to update this file automatically
 ## Usage
 
 ```bash
-reviewer                       # Show first page of open PRs involving you
+reviewer                       # Open PR list tabs (defaults to "Involving Me")
 reviewer -d                    # Include draft PRs
 reviewer -r ~/dev              # Specify local repos root for worktrees
 reviewer -e archived -e old    # Exclude directories for repo-scan commands
 
-reviewer --my                  # Show PRs you authored (same as -m)
+reviewer --my                  # Start on "My PRs" tab (same as -m)
 reviewer trigger https://github.com/org/repo/pull/1234
 reviewer trigger org/repo#1234
 reviewer trigger --repo org/repo --pr 1234
@@ -145,13 +145,18 @@ reviewer daemon run            # Start daemon polling loop
 reviewer daemon status         # Show daemon state/counters
 ```
 
-The interactive PR list loads directly from GitHub and does not scan local
-clones on startup. Local clones are still used by daemon polling, explicit
-`reviewer trigger` runs, and worktree-backed AI review launches.
+The interactive PR list loads directly from GitHub for `Involving Me` and `My PRs`
+and does not scan local clones on startup. The `Watching Repos` tab uses local
+repo discovery plus daemon repo/path filters. Local clones are also used by daemon
+polling, explicit `reviewer trigger` runs, and worktree-backed AI review launches.
 
-Use `--my` (or `-m`) to switch to "my PRs" mode. In this mode, reviewer
-shows PRs authored by your GitHub account and enables `m` in detail view to
-merge mergeable PRs with squash.
+The list view has three tabs:
+- `Involving Me`: open PRs involving your account.
+- `My PRs`: open PRs authored by your account (enables `m` in detail view to squash-merge mergeable PRs).
+- `Watching Repos`: open PRs from repos/paths configured by `reviewer daemon init` (`daemon.exclude_repos` + `daemon.repo_subpath_filters`).
+
+In list view, use `Tab`/`Shift+Tab` (or `←`/`→`, or `1`/`2`/`3`) to switch tabs.
+Use `--my` (or `-m`) to start directly on the `My PRs` tab.
 
 `reviewer trigger` launches a review session for an explicit PR and bypasses
 the list-mode draft/approved filters.

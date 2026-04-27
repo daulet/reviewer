@@ -495,6 +495,28 @@ fn collect_open_prs(
     username: &str,
     include_drafts: bool,
 ) -> Vec<DaemonReviewCandidate> {
+    collect_monitored_prs(
+        repos,
+        excluded_repos,
+        repo_subpath_filters,
+        username,
+        include_drafts,
+    )
+    .into_iter()
+    .filter_map(|pr| {
+        classify_trigger_kind(&pr, username)
+            .map(|trigger_kind| DaemonReviewCandidate { pr, trigger_kind })
+    })
+    .collect()
+}
+
+fn collect_monitored_prs(
+    repos: &[RepoDescriptor],
+    excluded_repos: &HashSet<String>,
+    repo_subpath_filters: &RepoSubpathFilterMap,
+    username: &str,
+    include_drafts: bool,
+) -> Vec<PullRequest> {
     repos
         .par_iter()
         .filter(|repo| !excluded_repos.contains(&repo.name))
@@ -502,13 +524,34 @@ fn collect_open_prs(
             let prs = gh::fetch_prs_for_repo_with_authored(&repo.path, username, include_drafts);
             apply_repo_subpath_filter(repo, prs, repo_subpath_filters)
                 .into_iter()
-                .filter_map(|pr| {
-                    classify_trigger_kind(&pr, username)
-                        .map(|trigger_kind| DaemonReviewCandidate { pr, trigger_kind })
-                })
                 .collect::<Vec<_>>()
         })
         .collect()
+}
+
+pub fn list_watched_prs(
+    cfg: &Config,
+    repos_root: &Path,
+    username: &str,
+    include_drafts: bool,
+) -> Vec<PullRequest> {
+    let repos = discover_repos(repos_root, &cfg.exclude);
+    let excluded_repos = monitored_repo_set(&cfg.daemon.exclude_repos);
+    let repo_subpath_filters = normalize_repo_subpath_filters(&cfg.daemon.repo_subpath_filters);
+    let mut prs = collect_monitored_prs(
+        &repos,
+        &excluded_repos,
+        &repo_subpath_filters,
+        username,
+        include_drafts,
+    );
+    prs.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| a.repo_name.cmp(&b.repo_name))
+            .then_with(|| a.number.cmp(&b.number))
+    });
+    prs
 }
 
 fn build_seed_record(pr: &PullRequest, now: DateTime<Utc>) -> ReviewedPrRecord {

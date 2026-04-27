@@ -6,10 +6,10 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Tabs, Wrap},
     Frame,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -420,8 +420,8 @@ enum AsyncResult {
     Checks(usize, Vec<gh::CheckStatus>),       // (pr_index, CI checks)
     AiLaunch(Result<String, String>),          // worktree path or error
     AgentPreview(usize, AgentPreview),         // (pr_index, tmux preview)
-    Refresh(gh::PullRequestPage),              // refreshed first page
-    NextPage(String, gh::PullRequestPage),     // (requested cursor, appended next page)
+    Refresh(AppMode, gh::PullRequestPage),     // refreshed first page
+    NextPage(AppMode, String, gh::PullRequestPage), // (mode, requested cursor, appended next page)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -445,6 +445,8 @@ pub enum AppMode {
     Review,
     /// My PRs mode: Your own PRs
     MyPrs,
+    /// Watching mode: PRs from daemon-configured watched repos
+    Watching,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -889,6 +891,41 @@ impl App {
         }
     }
 
+    fn select_list_tab(&mut self, mode: AppMode) {
+        if self.mode == mode {
+            return;
+        }
+
+        self.mode = mode;
+        self.prs.clear();
+        self.list_state.select(None);
+        self.refreshing = false;
+        self.loading_next_page = false;
+        self.has_next_page = false;
+        self.next_page_cursor = None;
+        self.clear_search();
+        self.needs_clear = true;
+        self.refresh();
+    }
+
+    fn next_list_tab(&mut self) {
+        let next = match self.mode {
+            AppMode::Review => AppMode::MyPrs,
+            AppMode::MyPrs => AppMode::Watching,
+            AppMode::Watching => AppMode::Review,
+        };
+        self.select_list_tab(next);
+    }
+
+    fn prev_list_tab(&mut self) {
+        let prev = match self.mode {
+            AppMode::Review => AppMode::Watching,
+            AppMode::MyPrs => AppMode::Review,
+            AppMode::Watching => AppMode::MyPrs,
+        };
+        self.select_list_tab(prev);
+    }
+
     fn enter_detail(&mut self) {
         if self.selected_pr().is_some() {
             self.view = View::Detail;
@@ -1028,6 +1065,7 @@ impl App {
         let username = self.username.clone();
         let include_drafts = self.include_drafts;
         let exclude_users = self.exclude_users.clone();
+        let repos_root = self.repos_root.clone();
         let mode = self.mode;
 
         thread::spawn(move || {
@@ -1041,8 +1079,15 @@ impl App {
                 AppMode::MyPrs => {
                     crate::fetch_my_prs(&username, include_drafts, Some(&cursor), &exclude_users)
                 }
+                AppMode::Watching => crate::fetch_watching_prs(
+                    &repos_root,
+                    &username,
+                    include_drafts,
+                    Some(&cursor),
+                    &exclude_users,
+                ),
             };
-            let _ = tx.send(AsyncResult::NextPage(cursor, page));
+            let _ = tx.send(AsyncResult::NextPage(mode, cursor, page));
         });
     }
 
@@ -1267,7 +1312,10 @@ impl App {
                         }
                     }
                 }
-                AsyncResult::Refresh(page) => {
+                AsyncResult::Refresh(mode, page) => {
+                    if self.mode != mode {
+                        continue;
+                    }
                     self.refreshing = false;
                     self.loading_next_page = false;
                     self.needs_clear = true;
@@ -1288,7 +1336,10 @@ impl App {
                     };
                     self.set_status(format!("Refreshed: {} PRs{}", count, draft_status));
                 }
-                AsyncResult::NextPage(cursor, page) => {
+                AsyncResult::NextPage(mode, cursor, page) => {
+                    if self.mode != mode {
+                        continue;
+                    }
                     if self.next_page_cursor.as_deref() != Some(cursor.as_str()) {
                         continue;
                     }
@@ -1590,7 +1641,7 @@ impl App {
     fn start_merge(&mut self) {
         // Only allow merge in MyPrs mode
         if self.mode != AppMode::MyPrs {
-            self.set_status("Merge only available in --my mode".to_string());
+            self.set_status("Merge only available in My PRs tab".to_string());
             return;
         }
 
@@ -1709,6 +1760,7 @@ impl App {
         let username = self.username.clone();
         let include_drafts = self.include_drafts;
         let exclude_users = self.exclude_users.clone();
+        let repos_root = self.repos_root.clone();
         let mode = self.mode;
 
         thread::spawn(move || {
@@ -1719,8 +1771,15 @@ impl App {
                 AppMode::MyPrs => {
                     crate::fetch_my_prs(&username, include_drafts, None, &exclude_users)
                 }
+                AppMode::Watching => crate::fetch_watching_prs(
+                    &repos_root,
+                    &username,
+                    include_drafts,
+                    None,
+                    &exclude_users,
+                ),
             };
-            let _ = tx.send(AsyncResult::Refresh(page));
+            let _ = tx.send(AsyncResult::Refresh(mode, page));
         });
     }
 
@@ -1794,6 +1853,11 @@ impl App {
         match self.view {
             View::List => match code {
                 KeyCode::Char('q') => self.should_quit = true,
+                KeyCode::Tab | KeyCode::Right => self.next_list_tab(),
+                KeyCode::BackTab | KeyCode::Left => self.prev_list_tab(),
+                KeyCode::Char('1') => self.select_list_tab(AppMode::Review),
+                KeyCode::Char('2') => self.select_list_tab(AppMode::MyPrs),
+                KeyCode::Char('3') => self.select_list_tab(AppMode::Watching),
                 // Page navigation with Ctrl+d/u (must be before non-Ctrl)
                 KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => self.next_page(),
                 KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
@@ -2344,8 +2408,110 @@ fn review_state_span(state: &ReviewState) -> Span<'static> {
 fn draw_list(frame: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(3)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(3),
+        ])
         .split(frame.area());
+
+    let tab_specs = [
+        ("Involving Me", AppMode::Review),
+        ("My PRs", AppMode::MyPrs),
+        ("Watching Repos", AppMode::Watching),
+    ];
+    let mut tab_constraints: Vec<Constraint> = tab_specs
+        .iter()
+        .enumerate()
+        .flat_map(|(idx, (label, _))| {
+            let width = label.chars().count() as u16 + 4;
+            let mut parts = vec![Constraint::Length(width)];
+            if idx + 1 < tab_specs.len() {
+                parts.push(Constraint::Length(1));
+            }
+            parts
+        })
+        .collect();
+    tab_constraints.push(Constraint::Min(0));
+    let tab_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(tab_constraints)
+        .split(chunks[0]);
+
+    for (idx, (label, mode)) in tab_specs.iter().enumerate() {
+        let area_idx = idx * 2;
+        let area = tab_chunks[area_idx];
+        if app.mode == *mode {
+            let selected = Paragraph::new(Line::from(Span::styled(
+                *label,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )))
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
+                    .border_style(Style::default().fg(Color::White)),
+            );
+            frame.render_widget(selected, area);
+        } else {
+            let unselected = Paragraph::new(Line::from(Span::styled(
+                *label,
+                Style::default().fg(Color::DarkGray),
+            )))
+            .alignment(Alignment::Center)
+            .block(Block::default().padding(Padding::new(1, 1, 1, 1)));
+            frame.render_widget(unselected, area);
+        }
+    }
+
+    let selected_tab_area = tab_specs
+        .iter()
+        .position(|(_, mode)| *mode == app.mode)
+        .map(|idx| tab_chunks[idx * 2]);
+
+    let border_area = Rect {
+        x: chunks[0].x,
+        y: chunks[0]
+            .y
+            .saturating_add(chunks[0].height.saturating_sub(1)),
+        width: chunks[0].width,
+        height: 1,
+    };
+    let mut border_chars = vec!['─'; usize::from(border_area.width)];
+    if !border_chars.is_empty() {
+        border_chars[0] = '┌';
+        if border_chars.len() > 1 {
+            let last = border_chars.len() - 1;
+            border_chars[last] = '┐';
+        }
+    }
+    if let Some(area) = selected_tab_area {
+        if area.width >= 2 && !border_chars.is_empty() {
+            let start = usize::from(area.x.saturating_sub(chunks[0].x));
+            if start < border_chars.len() {
+                let mut end = start + usize::from(area.width.saturating_sub(1));
+                end = end.min(border_chars.len() - 1);
+                border_chars[start] = if start == 0 { '│' } else { '┘' };
+                border_chars[end] = if end == border_chars.len() - 1 {
+                    '│'
+                } else {
+                    '└'
+                };
+                if end > start + 1 {
+                    for ch in &mut border_chars[(start + 1)..end] {
+                        *ch = ' ';
+                    }
+                }
+            }
+        }
+    }
+    let border_line: String = border_chars.into_iter().collect();
+    frame.render_widget(
+        Paragraph::new(border_line).style(Style::default().fg(Color::White)),
+        border_area,
+    );
 
     let mut items: Vec<ListItem> = app
         .prs
@@ -2406,13 +2572,12 @@ fn draw_list(frame: &mut Frame, app: &mut App) {
         )])));
     }
 
-    let draft_status = if app.include_drafts { " +drafts" } else { "" };
-    let title = match app.mode {
-        AppMode::Review => format!(" PRs involving me ({}){} ", app.prs.len(), draft_status),
-        AppMode::MyPrs => format!(" My PRs ({}){} ", app.prs.len(), draft_status),
-    };
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(title))
+        .block(
+            Block::default()
+                .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
+                .border_style(Style::default().fg(Color::White)),
+        )
         .highlight_style(
             Style::default()
                 .bg(Color::DarkGray)
@@ -2420,15 +2585,15 @@ fn draw_list(frame: &mut Frame, app: &mut App) {
         )
         .highlight_symbol("▶ ");
 
-    frame.render_stateful_widget(list, chunks[0], &mut app.list_state);
-    app.load_next_page_if_pagination_visible(chunks[0].height);
+    frame.render_stateful_widget(list, chunks[1], &mut app.list_state);
+    app.load_next_page_if_pagination_visible(chunks[1].height);
 
     let help = Paragraph::new(
-        " j/k: navigate | Ctrl+d/u: page | Enter: open | /: search | o: browser | y: copy URL | R: refresh | q: quit",
+        " Tab/←/→: switch tabs | j/k: navigate | Ctrl+d/u: page | Enter: open | /: search | o: browser | y: copy URL | R: refresh | q: quit",
     )
     .style(Style::default().fg(Color::DarkGray))
     .block(Block::default().borders(Borders::ALL).title(" Help "));
-    frame.render_widget(help, chunks[1]);
+    frame.render_widget(help, chunks[2]);
 }
 
 fn draw_detail(frame: &mut Frame, app: &mut App) {
@@ -2495,7 +2660,7 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
         Span::styled(format!("@{}", pr.author), Style::default().fg(Color::Green)),
         ci_status,
     ]))
-    .block(Block::default().borders(Borders::ALL));
+    .block(Block::default().borders(Borders::TOP | Borders::LEFT | Borders::RIGHT));
     frame.render_widget(header, chunks[0]);
 
     // Tabs
@@ -2512,7 +2677,7 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         )
-        .block(Block::default().borders(Borders::ALL));
+        .block(Block::default().borders(Borders::TOP | Borders::LEFT | Borders::RIGHT));
     frame.render_widget(tabs, chunks[1]);
 
     // Build diff title with current line info
@@ -2856,7 +3021,7 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
             AppMode::MyPrs => {
                 " j/k: scroll | Esc: file tree | t: full diff | /: search | D: delta | m: merge | o: browser | y: copy | q: back"
             }
-            AppMode::Review => {
+            AppMode::Review | AppMode::Watching => {
                 " j/k: scroll | Esc: file tree | t: full diff | /: search | c: comment | D: delta | a: approve | o: browser | y: copy | q: back"
             }
         }
@@ -2868,13 +3033,13 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
             (DetailTab::Diff, AppMode::MyPrs) => {
                 " j/k: scroll | /: search | t: tree | D: delta | m: merge | o: browser | y: copy | q: back"
             }
-            (DetailTab::Diff, AppMode::Review) => {
+            (DetailTab::Diff, AppMode::Review | AppMode::Watching) => {
                 " j/k: scroll | /: search | t: tree | c: comment | D: delta | a: approve | o: browser | y: copy | q: back"
             }
             (_, AppMode::MyPrs) => {
                 " Tab: tabs | j/k: scroll | m: merge | o: browser | y: copy | q: back"
             }
-            (_, AppMode::Review) => {
+            (_, AppMode::Review | AppMode::Watching) => {
                 " Tab: tabs | j/k: scroll | a: approve | o: browser | y: copy | q: back"
             }
         }

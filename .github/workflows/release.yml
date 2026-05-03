@@ -19,6 +19,9 @@ env:
   BINARY_NAME: reviewer
   TAP_REPO: daulet/homebrew-tap
   TAP_BRANCH: main
+  FORMULA_DESC: "TUI for reviewing GitHub PRs with Claude Code/Codex integration"
+  DEB_HOMEPAGE: "https://github.com/daulet/reviewer"
+  DEB_DEPENDS: "gh"
   FORMULA_PATH: Formula/reviewer.rb
 
 concurrency:
@@ -90,18 +93,36 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             binary: reviewer
+            deb_arch: amd64
+            linker_package: ""
+            linker_env: ""
+          - os: ubuntu-22.04
+            target: aarch64-unknown-linux-gnu
+            binary: reviewer
+            deb_arch: arm64
+            linker_package: gcc-aarch64-linux-gnu
+            linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
           - os: macos-14
             target: aarch64-apple-darwin
             binary: reviewer
+            deb_arch: ""
+            linker_package: ""
+            linker_env: ""
           - os: macos-14
             target: x86_64-apple-darwin
             binary: reviewer
+            deb_arch: ""
+            linker_package: ""
+            linker_env: ""
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             binary: reviewer.exe
+            deb_arch: ""
+            linker_package: ""
+            linker_env: ""
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -114,12 +135,26 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install cross linker
+        if: ${{ matrix.linker_package != '' }}
+        shell: bash
+        env:
+          LINKER_PACKAGE: ${{ matrix.linker_package }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends "${LINKER_PACKAGE}"
+
       - name: Build release binary (Unix)
         if: runner.os != 'Windows'
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
-        run: cargo build --release --locked --target "${TARGET}"
+          LINKER_ENV: ${{ matrix.linker_env }}
+        run: |
+          if [[ -n "${LINKER_ENV}" ]]; then
+            export "${LINKER_ENV?}"
+          fi
+          cargo build --release --locked --target "${TARGET}"
 
       - name: Build release binary (Windows)
         if: runner.os == 'Windows'
@@ -134,10 +169,25 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
           TARGET_BINARY: ${{ matrix.binary }}
+          VERSION: ${{ needs.resolve_tag.outputs.version }}
+          DEB_ARCH: ${{ matrix.deb_arch }}
         run: |
           mkdir -p dist
           cp "target/${TARGET}/release/${TARGET_BINARY}" "dist/${BINARY_NAME}"
           tar -C dist -czf "dist/${BINARY_NAME}-${TARGET}.tar.gz" "${BINARY_NAME}"
+
+          if [[ -n "${DEB_ARCH}" ]]; then
+            .github/scripts/package_deb.sh \
+              --binary "dist/${BINARY_NAME}" \
+              --name "${BINARY_NAME}" \
+              --version "${VERSION}" \
+              --arch "${DEB_ARCH}" \
+              --out-dir dist \
+              --desc "${FORMULA_DESC}" \
+              --homepage "${DEB_HOMEPAGE}" \
+              --depends "${DEB_DEPENDS}"
+          fi
+
           rm -f "dist/${BINARY_NAME}"
 
           python3 - <<'PY'
@@ -146,11 +196,19 @@ jobs:
           from pathlib import Path
 
           target = os.environ["TARGET"]
-          binary = os.environ["BINARY_NAME"]
-          archive = Path("dist") / f"{binary}-{target}.tar.gz"
-          digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+          artifacts = sorted(
+              path
+              for path in Path("dist").iterdir()
+              if path.is_file() and not path.name.startswith("checksums-")
+          )
           checksum_path = Path("dist") / f"checksums-{target}.txt"
-          checksum_path.write_text(f"{digest}  {archive.name}\n", encoding="utf-8")
+          checksum_path.write_text(
+              "".join(
+                  f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n"
+                  for path in artifacts
+              ),
+              encoding="utf-8",
+          )
           PY
 
       - name: Package archive and checksum (Windows)
@@ -206,6 +264,7 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.zip
+            dist/*.deb
             dist/checksums.txt
 
   update_homebrew:
@@ -286,3 +345,105 @@ jobs:
           git add "${FORMULA_PATH}"
           git commit -m "reviewer ${{ needs.resolve_tag.outputs.version }}"
           git push origin HEAD:"${TAP_BRANCH}"
+
+  update_apt:
+    name: Update APT Repository
+    needs:
+      - resolve_tag
+      - publish
+    runs-on: ubuntu-latest
+    env:
+      PACKAGES_REPO: daulet/packages
+      PACKAGES_REPO_TOKEN: ${{ secrets.PACKAGES_REPO_TOKEN || secrets.TAP_GITHUB_TOKEN || secrets.HOMEBREW_TAP_TOKEN }}
+      PACKAGE_RELEASE_TAG: reviewer-${{ needs.resolve_tag.outputs.tag }}
+    steps:
+      - name: Check packages token
+        id: packages_token
+        shell: bash
+        run: |
+          if [[ -n "${PACKAGES_REPO_TOKEN}" ]]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=APT repository update skipped::Set PACKAGES_REPO_TOKEN with contents write access to ${PACKAGES_REPO}."
+          fi
+
+      - name: Download build artifacts
+        if: steps.packages_token.outputs.available == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      - name: Resolve Debian package assets
+        if: steps.packages_token.outputs.available == 'true'
+        id: debs
+        shell: bash
+        run: |
+          AMD64_DEB="$(find dist -maxdepth 1 -type f -name '*.deb' | grep -E '[_-]amd64\.deb$' | sort | head -n1)"
+          ARM64_DEB="$(find dist -maxdepth 1 -type f -name '*.deb' | grep -E '[_-]arm64\.deb$' | sort | head -n1)"
+
+          if [[ -z "${AMD64_DEB}" || -z "${ARM64_DEB}" ]]; then
+            echo "Failed to locate amd64 and arm64 .deb artifacts in dist" >&2
+            ls -la dist >&2
+            exit 1
+          fi
+
+          {
+            echo "amd64_name=$(basename "${AMD64_DEB}")"
+            echo "amd64_sha=$(sha256sum "${AMD64_DEB}" | awk '{print $1}')"
+            echo "arm64_name=$(basename "${ARM64_DEB}")"
+            echo "arm64_sha=$(sha256sum "${ARM64_DEB}" | awk '{print $1}')"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish Debian packages to packages repository release
+        if: steps.packages_token.outputs.available == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: ${{ env.PACKAGES_REPO }}
+          token: ${{ env.PACKAGES_REPO_TOKEN }}
+          tag_name: ${{ env.PACKAGE_RELEASE_TAG }}
+          name: ${{ env.BINARY_NAME }} ${{ needs.resolve_tag.outputs.tag }} Debian packages
+          files: dist/*.deb
+          overwrite_files: true
+
+      - name: Checkout packages repository
+        if: steps.packages_token.outputs.available == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PACKAGES_REPO }}
+          token: ${{ env.PACKAGES_REPO_TOKEN }}
+          path: packages
+
+      - name: Update packages manifest
+        if: steps.packages_token.outputs.available == 'true'
+        shell: bash
+        run: |
+          python3 packages/scripts/update-package.py \
+            --manifest packages/packages.json \
+            --name "${BINARY_NAME}" \
+            --repo "${PACKAGES_REPO}" \
+            --tag "${PACKAGE_RELEASE_TAG}" \
+            --version "${{ needs.resolve_tag.outputs.version }}" \
+            --asset "amd64:${{ steps.debs.outputs.amd64_name }}:${{ steps.debs.outputs.amd64_sha }}" \
+            --asset "arm64:${{ steps.debs.outputs.arm64_name }}:${{ steps.debs.outputs.arm64_sha }}"
+
+      - name: Commit and push packages manifest
+        if: steps.packages_token.outputs.available == 'true'
+        shell: bash
+        run: |
+          cd packages
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if [[ -z "$(git status --porcelain -- packages.json)" ]]; then
+            echo "APT package manifest already up to date."
+            exit 0
+          fi
+
+          git add packages.json
+          git commit -m "${BINARY_NAME} ${{ needs.resolve_tag.outputs.version }}"
+          git pull --rebase origin main
+          git push origin HEAD:main
+

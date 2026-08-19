@@ -1,9 +1,14 @@
+use crate::agent;
 use crate::config::{self, AiConfig};
+use crate::filters;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::process::Command;
+
+const DEFAULT_PR_LIST_LIMIT: usize = 100;
+const FIRST_PAGE_PR_LIST_LIMIT: usize = 30;
 
 #[derive(Debug, Deserialize)]
 struct RepoInfo {
@@ -13,7 +18,22 @@ struct RepoInfo {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Author {
+    #[serde(rename = "__typename", default)]
+    pub kind: Option<String>,
+    #[serde(rename = "type", default)]
+    pub rest_type: Option<String>,
+    #[serde(default, rename = "is_bot", alias = "isBot")]
+    pub is_bot: Option<bool>,
     pub login: Option<String>,
+}
+
+impl Author {
+    fn actor_kind(&self) -> Option<String> {
+        if self.is_bot.unwrap_or(false) {
+            return Some("Bot".to_string());
+        }
+        self.kind.clone().or_else(|| self.rest_type.clone())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -72,7 +92,7 @@ struct SearchRepository {
     name_with_owner: String,
 }
 
-/// PR data from gh search prs command (limited fields available)
+/// PR data from the global GraphQL PR search.
 #[derive(Debug, Deserialize)]
 struct SearchPrData {
     number: u64,
@@ -85,6 +105,31 @@ struct SearchPrData {
     #[serde(rename = "isDraft")]
     is_draft: Option<bool>,
     repository: SearchRepository,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchResponse {
+    data: Option<SearchData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchData {
+    search: SearchNodes,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchNodes {
+    nodes: Vec<SearchPrData>,
+    #[serde(rename = "pageInfo")]
+    page_info: PageInfo,
+}
+
+#[derive(Debug, Deserialize)]
+struct PageInfo {
+    #[serde(rename = "endCursor")]
+    end_cursor: Option<String>,
+    #[serde(rename = "hasNextPage")]
+    has_next_page: bool,
 }
 
 /// Review state for user's PRs
@@ -111,6 +156,7 @@ pub struct PullRequest {
     pub number: u64,
     pub title: String,
     pub author: String,
+    pub author_kind: Option<String>,
     pub body: String,
     pub repo_path: PathBuf,
     pub repo_name: String,
@@ -120,6 +166,14 @@ pub struct PullRequest {
     pub deletions: u64,
     pub is_draft: bool,
     pub review_state: ReviewState,
+    pub details_loaded: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PullRequestPage {
+    pub prs: Vec<PullRequest>,
+    pub end_cursor: Option<String>,
+    pub has_next_page: bool,
 }
 
 pub fn get_current_user() -> Result<String> {
@@ -153,7 +207,8 @@ pub fn repo_name_with_owner(repo_path: &PathBuf) -> Option<String> {
     get_repo_info(repo_path).map(|info| info.name_with_owner)
 }
 
-fn get_open_prs(repo_path: &PathBuf) -> Vec<PrData> {
+fn get_open_prs(repo_path: &PathBuf, limit: usize) -> Vec<PrData> {
+    let limit_arg = limit.to_string();
     let output = Command::new("gh")
         .args([
             "pr",
@@ -161,8 +216,8 @@ fn get_open_prs(repo_path: &PathBuf) -> Vec<PrData> {
             "--json",
             "number,title,author,body,url,updatedAt,additions,deletions,reviews,isDraft,reviewDecision",
             "--limit",
-            "100",
         ])
+        .arg(&limit_arg)
         .current_dir(repo_path)
         .output()
         .ok();
@@ -189,15 +244,90 @@ fn has_user_approved(pr: &PrData, username: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn determine_review_state(pr_data: &PrData) -> ReviewState {
-    if pr_data.is_draft.unwrap_or(false) {
+fn review_state_from_fields(is_draft: bool, review_decision: Option<&str>) -> ReviewState {
+    if is_draft {
         return ReviewState::Draft;
     }
-    match pr_data.review_decision.as_deref() {
+
+    match review_decision {
         Some("APPROVED") => ReviewState::Approved,
         Some("CHANGES_REQUESTED") => ReviewState::ChangesRequested,
         _ => ReviewState::Pending,
     }
+}
+
+fn determine_review_state(pr_data: &PrData) -> ReviewState {
+    review_state_from_fields(
+        pr_data.is_draft.unwrap_or(false),
+        pr_data.review_decision.as_deref(),
+    )
+}
+
+fn pr_data_to_pull_request(pr_data: PrData, repo_path: PathBuf, repo_name: String) -> PullRequest {
+    let pr_author = pr_data
+        .author
+        .as_ref()
+        .and_then(|a| a.login.as_ref())
+        .map(|s| s.as_str())
+        .unwrap_or("unknown");
+    let author_kind = pr_data.author.as_ref().and_then(Author::actor_kind);
+    let review_state = determine_review_state(&pr_data);
+
+    PullRequest {
+        number: pr_data.number,
+        title: pr_data.title,
+        author: pr_author.to_string(),
+        author_kind,
+        body: pr_data.body.unwrap_or_default(),
+        repo_path,
+        repo_name,
+        url: pr_data.url,
+        updated_at: pr_data.updated_at,
+        additions: pr_data.additions.unwrap_or(0),
+        deletions: pr_data.deletions.unwrap_or(0),
+        is_draft: pr_data.is_draft.unwrap_or(false),
+        review_state,
+        details_loaded: true,
+    }
+}
+
+fn search_pr_data_to_pull_request(pr_data: SearchPrData) -> PullRequest {
+    let pr_author = pr_data
+        .author
+        .as_ref()
+        .and_then(|a| a.login.as_ref())
+        .map(|s| s.as_str())
+        .unwrap_or("unknown");
+    let author_kind = pr_data.author.as_ref().and_then(Author::actor_kind);
+    let is_draft = pr_data.is_draft.unwrap_or(false);
+    let review_state = review_state_from_fields(is_draft, None);
+
+    PullRequest {
+        number: pr_data.number,
+        title: pr_data.title,
+        author: pr_author.to_string(),
+        author_kind,
+        body: pr_data.body.unwrap_or_default(),
+        repo_path: PathBuf::new(),
+        repo_name: pr_data.repository.name_with_owner,
+        url: pr_data.url,
+        updated_at: pr_data.updated_at,
+        additions: 0,
+        deletions: 0,
+        is_draft,
+        review_state,
+        details_loaded: false,
+    }
+}
+
+fn repo_name_from_pr_url(url: &str) -> Option<String> {
+    let mut segments = url.split('/');
+    let _scheme = segments.next()?;
+    let _empty = segments.next()?;
+    let _host = segments.next()?;
+    let owner = segments.next()?;
+    let repo = segments.next()?;
+    Some(format!("{owner}/{repo}"))
 }
 
 fn fetch_prs_for_repo_with_mode(
@@ -205,13 +335,14 @@ fn fetch_prs_for_repo_with_mode(
     username: &str,
     include_drafts: bool,
     mode: RepoPrFetchMode,
+    limit: usize,
 ) -> Vec<PullRequest> {
-    let repo_info = match get_repo_info(repo_path) {
-        Some(info) => info,
-        None => return Vec::new(),
-    };
+    let prs_data = get_open_prs(repo_path, limit);
+    if prs_data.is_empty() {
+        return Vec::new();
+    }
 
-    let prs_data = get_open_prs(repo_path);
+    let mut repo_name_fallback: Option<String> = None;
     let mut prs = Vec::new();
 
     for pr_data in prs_data {
@@ -235,38 +366,24 @@ fn fetch_prs_for_repo_with_mode(
             continue;
         }
 
-        let review_state = determine_review_state(&pr_data);
-
-        prs.push(PullRequest {
-            number: pr_data.number,
-            title: pr_data.title,
-            author: pr_author.to_string(),
-            body: pr_data.body.unwrap_or_default(),
-            repo_path: repo_path.clone(),
-            repo_name: repo_info.name_with_owner.clone(),
-            url: pr_data.url,
-            updated_at: pr_data.updated_at,
-            additions: pr_data.additions.unwrap_or(0),
-            deletions: pr_data.deletions.unwrap_or(0),
-            is_draft: pr_data.is_draft.unwrap_or(false),
-            review_state,
+        let repo_name = repo_name_from_pr_url(&pr_data.url).or_else(|| {
+            if repo_name_fallback.is_none() {
+                repo_name_fallback = get_repo_info(repo_path).map(|info| info.name_with_owner);
+            }
+            repo_name_fallback.clone()
         });
+        let Some(repo_name) = repo_name else {
+            continue;
+        };
+
+        prs.push(pr_data_to_pull_request(
+            pr_data,
+            repo_path.clone(),
+            repo_name,
+        ));
     }
 
     prs
-}
-
-pub fn fetch_prs_for_repo(
-    repo_path: &PathBuf,
-    username: &str,
-    include_drafts: bool,
-) -> Vec<PullRequest> {
-    fetch_prs_for_repo_with_mode(
-        repo_path,
-        username,
-        include_drafts,
-        RepoPrFetchMode::ReviewCandidates,
-    )
 }
 
 pub fn fetch_prs_for_repo_with_authored(
@@ -279,7 +396,84 @@ pub fn fetch_prs_for_repo_with_authored(
         username,
         include_drafts,
         RepoPrFetchMode::ReviewAndSelfCandidates,
+        DEFAULT_PR_LIST_LIMIT,
     )
+}
+
+/// Fetch a specific PR directly, bypassing list-mode filtering (draft/approved checks).
+pub fn fetch_pr_for_review(
+    repo_path: &PathBuf,
+    repo_name: &str,
+    pr_number: u64,
+) -> Result<PullRequest> {
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            &pr_number.to_string(),
+            "--repo",
+            repo_name,
+            "--json",
+            "number,title,author,body,url,updatedAt,additions,deletions,isDraft,reviewDecision",
+        ])
+        .current_dir(repo_path)
+        .output()
+        .context("Failed to fetch PR details")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to fetch PR details for {}#{}: {}",
+            repo_name,
+            pr_number,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let pr_data: PrData = serde_json::from_slice(&output.stdout).context(format!(
+        "Failed to parse PR details response for {}#{}",
+        repo_name, pr_number
+    ))?;
+
+    Ok(pr_data_to_pull_request(
+        pr_data,
+        repo_path.clone(),
+        repo_name.to_string(),
+    ))
+}
+
+pub fn fetch_pr_details(pr: &PullRequest) -> Result<PullRequest> {
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            &pr.number.to_string(),
+            "--repo",
+            &pr.repo_name,
+            "--json",
+            "number,title,author,body,url,updatedAt,additions,deletions,isDraft,reviewDecision",
+        ])
+        .output()
+        .context("Failed to fetch PR details")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to fetch PR details for {}#{}: {}",
+            pr.repo_name,
+            pr.number,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let pr_data: PrData = serde_json::from_slice(&output.stdout).context(format!(
+        "Failed to parse PR details response for {}#{}",
+        pr.repo_name, pr.number
+    ))?;
+
+    Ok(pr_data_to_pull_request(
+        pr_data,
+        pr.repo_path.clone(),
+        pr.repo_name.clone(),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -294,8 +488,15 @@ struct PrFilesData {
 
 pub fn get_pr_changed_files(pr: &PullRequest) -> Result<Vec<String>> {
     let output = Command::new("gh")
-        .args(["pr", "view", &pr.number.to_string(), "--json", "files"])
-        .current_dir(&pr.repo_path)
+        .args([
+            "pr",
+            "view",
+            &pr.number.to_string(),
+            "--repo",
+            &pr.repo_name,
+            "--json",
+            "files",
+        ])
         .output()
         .context("Failed to get PR changed files")?;
 
@@ -316,116 +517,153 @@ pub fn get_pr_changed_files(pr: &PullRequest) -> Result<Vec<String>> {
         .collect())
 }
 
-/// Search for all PRs authored by the current user across all repos
-pub fn search_my_prs(include_drafts: bool) -> Vec<PullRequest> {
-    use rayon::prelude::*;
-
-    let output = Command::new("gh")
-        .args([
-            "search",
-            "prs",
-            "--state=open",
-            "--author=@me",
-            "--json",
-            "number,title,author,body,url,updatedAt,isDraft,repository",
-            "--limit",
-            "100",
-        ])
-        .output()
-        .ok();
-
-    let prs_data: Vec<SearchPrData> = match output {
-        Some(o) if o.status.success() => serde_json::from_slice(&o.stdout).unwrap_or_default(),
-        _ => return Vec::new(),
-    };
-
-    // Filter drafts first, then fetch review states in parallel
-    let filtered: Vec<_> = prs_data
-        .into_iter()
-        .filter(|pr| include_drafts || !pr.is_draft.unwrap_or(false))
-        .collect();
-
-    let mut prs: Vec<PullRequest> = filtered
-        .par_iter()
-        .map(|pr_data| {
-            let pr_author = pr_data
-                .author
-                .as_ref()
-                .and_then(|a| a.login.as_ref())
-                .map(|s| s.as_str())
-                .unwrap_or("unknown");
-
-            // Search API doesn't provide reviewDecision, fetch in parallel
-            let review_state = if pr_data.is_draft.unwrap_or(false) {
-                ReviewState::Draft
-            } else {
-                fetch_pr_review_state(&pr_data.repository.name_with_owner, pr_data.number)
-            };
-
-            PullRequest {
-                number: pr_data.number,
-                title: pr_data.title.clone(),
-                author: pr_author.to_string(),
-                body: pr_data.body.clone().unwrap_or_default(),
-                repo_path: PathBuf::new(),
-                repo_name: pr_data.repository.name_with_owner.clone(),
-                url: pr_data.url.clone(),
-                updated_at: pr_data.updated_at,
-                additions: 0,
-                deletions: 0,
-                is_draft: pr_data.is_draft.unwrap_or(false),
-                review_state,
-            }
-        })
-        .collect();
-
-    // Sort by review state priority, then by most recent
-    prs.sort_by(|a, b| match a.review_state.cmp(&b.review_state) {
-        std::cmp::Ordering::Equal => b.updated_at.cmp(&a.updated_at),
-        other => other,
-    });
-
-    prs
+#[derive(Debug, Clone, Copy)]
+enum SearchScope {
+    Involved,
+    Authored,
 }
 
-/// Fetch the review decision for a specific PR
-fn fetch_pr_review_state(repo: &str, pr_number: u64) -> ReviewState {
+/// Search for the first page of open PRs involving the current user.
+pub fn search_involved_prs(
+    username: &str,
+    include_drafts: bool,
+    after: Option<&str>,
+    exclude_users: &[String],
+) -> PullRequestPage {
+    search_prs_with_limit(
+        username,
+        include_drafts,
+        FIRST_PAGE_PR_LIST_LIMIT,
+        SearchScope::Involved,
+        after,
+        exclude_users,
+    )
+}
+
+/// Search for the first page of open PRs authored by the current user.
+pub fn search_my_prs(
+    username: &str,
+    include_drafts: bool,
+    after: Option<&str>,
+    exclude_users: &[String],
+) -> PullRequestPage {
+    search_prs_with_limit(
+        username,
+        include_drafts,
+        FIRST_PAGE_PR_LIST_LIMIT,
+        SearchScope::Authored,
+        after,
+        exclude_users,
+    )
+}
+
+fn search_qualifiers(
+    username: &str,
+    include_drafts: bool,
+    scope: SearchScope,
+    exclude_users: &[String],
+) -> Vec<String> {
+    let mut qualifiers = vec!["is:pr".to_string(), "is:open".to_string()];
+    qualifiers.push(match scope {
+        SearchScope::Involved => format!("involves:{username}"),
+        SearchScope::Authored => format!("author:{username}"),
+    });
+    if !include_drafts {
+        qualifiers.push("draft:false".to_string());
+    }
+    qualifiers.extend(
+        filters::api_excludable_author_logins(exclude_users)
+            .into_iter()
+            .flat_map(|author| [format!("-author:{author}"), format!("-author:app/{author}")]),
+    );
+    qualifiers.push("sort:updated-desc".to_string());
+    qualifiers
+}
+
+fn search_prs_with_limit(
+    username: &str,
+    include_drafts: bool,
+    limit: usize,
+    scope: SearchScope,
+    after: Option<&str>,
+    exclude_users: &[String],
+) -> PullRequestPage {
+    let qualifiers = search_qualifiers(username, include_drafts, scope, exclude_users);
+    let search_query = qualifiers.join(" ");
+    let query_literal = serde_json::to_string(&search_query).unwrap_or_default();
+    let first = limit.min(100);
+    let after_arg = after
+        .and_then(|cursor| serde_json::to_string(cursor).ok())
+        .map(|cursor| format!(", after: {cursor}"))
+        .unwrap_or_default();
+    let query = format!(
+        r#"query {{
+            search(query: {query_literal}, type: ISSUE, first: {first}{after_arg}) {{
+                nodes {{
+                    ... on PullRequest {{
+                        number
+                        title
+                        author {{
+                            __typename
+                            login
+                        }}
+                        body
+                        url
+                        updatedAt
+                        isDraft
+                        repository {{
+                            nameWithOwner
+                        }}
+                    }}
+                }}
+                pageInfo {{
+                    endCursor
+                    hasNextPage
+                }}
+            }}
+        }}"#
+    );
+    let query_arg = format!("query={query}");
+
     let output = Command::new("gh")
-        .args([
-            "pr",
-            "view",
-            &pr_number.to_string(),
-            "--repo",
-            repo,
-            "--json",
-            "reviewDecision",
-        ])
+        .args(["api", "graphql", "-f"])
+        .arg(query_arg)
         .output()
         .ok();
 
-    #[derive(Deserialize)]
-    struct ReviewDecisionResponse {
-        #[serde(rename = "reviewDecision")]
-        review_decision: Option<String>,
-    }
-
-    match output {
+    let response: SearchResponse = match output {
         Some(o) if o.status.success() => {
-            let response: Option<ReviewDecisionResponse> = serde_json::from_slice(&o.stdout).ok();
-            match response.and_then(|r| r.review_decision) {
-                Some(ref s) if s == "APPROVED" => ReviewState::Approved,
-                Some(ref s) if s == "CHANGES_REQUESTED" => ReviewState::ChangesRequested,
-                _ => ReviewState::Pending,
-            }
+            serde_json::from_slice(&o.stdout).unwrap_or(SearchResponse { data: None })
         }
-        _ => ReviewState::Pending,
-    }
+        _ => return PullRequestPage::default(),
+    };
+
+    response
+        .data
+        .map(|data| {
+            let SearchNodes { nodes, page_info } = data.search;
+            let prs = nodes
+                .into_iter()
+                .map(search_pr_data_to_pull_request)
+                .collect();
+            PullRequestPage {
+                prs,
+                end_cursor: page_info.end_cursor,
+                has_next_page: page_info.has_next_page,
+            }
+        })
+        .unwrap_or_default()
 }
 
 pub fn get_pr_diff(pr: &PullRequest) -> Result<String> {
     let output = Command::new("gh")
-        .args(["pr", "diff", &pr.number.to_string()])
-        .current_dir(&pr.repo_path)
+        .args([
+            "pr",
+            "diff",
+            &pr.number.to_string(),
+            "--repo",
+            &pr.repo_name,
+        ])
         .output()
         .context("Failed to get PR diff")?;
 
@@ -451,12 +689,22 @@ struct PrRefs {
 }
 
 fn get_pr_diff_local(pr: &PullRequest) -> Result<String> {
+    if pr.repo_path.as_os_str().is_empty() {
+        anyhow::bail!(
+            "Diff is too large for gh to fetch directly and no local clone is associated with {}#{}",
+            pr.repo_name,
+            pr.number
+        );
+    }
+
     // Get the base and head commit SHAs
     let output = Command::new("gh")
         .args([
             "pr",
             "view",
             &pr.number.to_string(),
+            "--repo",
+            &pr.repo_name,
             "--json",
             "baseRefOid,headRefOid",
         ])
@@ -515,12 +763,13 @@ pub fn get_pr_comments(pr: &PullRequest) -> Result<Vec<Comment>> {
             "pr",
             "view",
             &pr.number.to_string(),
+            "--repo",
+            &pr.repo_name,
             "--json",
             "comments",
             "--jq",
             ".comments",
         ])
-        .current_dir(&pr.repo_path)
         .output()
         .context("Failed to get PR comments")?;
 
@@ -550,8 +799,15 @@ pub fn get_review_comments(pr: &PullRequest) -> Result<Vec<ReviewComment>> {
 
 pub fn add_pr_comment(pr: &PullRequest, comment: &str) -> Result<()> {
     let output = Command::new("gh")
-        .args(["pr", "comment", &pr.number.to_string(), "--body", comment])
-        .current_dir(&pr.repo_path)
+        .args([
+            "pr",
+            "comment",
+            &pr.number.to_string(),
+            "--repo",
+            &pr.repo_name,
+            "--body",
+            comment,
+        ])
         .output()
         .context("Failed to add comment")?;
 
@@ -594,7 +850,6 @@ pub fn add_line_comment(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .current_dir(&pr.repo_path)
         .spawn()
         .context("Failed to spawn gh command")?;
 
@@ -625,7 +880,14 @@ pub fn add_line_comment(
 
 pub fn approve_pr(pr: &PullRequest, comment: Option<&str>) -> Result<()> {
     let pr_number = pr.number.to_string();
-    let mut args = vec!["pr", "review", &pr_number, "--approve"];
+    let mut args = vec![
+        "pr",
+        "review",
+        &pr_number,
+        "--repo",
+        &pr.repo_name,
+        "--approve",
+    ];
 
     let body_arg;
     if let Some(c) = comment {
@@ -636,7 +898,6 @@ pub fn approve_pr(pr: &PullRequest, comment: Option<&str>) -> Result<()> {
 
     let output = Command::new("gh")
         .args(&args)
-        .current_dir(&pr.repo_path)
         .output()
         .context("Failed to approve PR")?;
 
@@ -695,7 +956,6 @@ pub fn close_pr(pr: &PullRequest, comment: Option<&str>) -> Result<()> {
             "--repo",
             &pr.repo_name,
         ])
-        .current_dir(&pr.repo_path)
         .output()
         .context("Failed to close PR")?;
 
@@ -973,16 +1233,17 @@ pub fn create_pr_worktree(
 ) -> Result<std::path::PathBuf> {
     let worktree_base = repos_root.join(".worktrees");
     std::fs::create_dir_all(&worktree_base)?;
+    let repo_path = resolve_worktree_repo_path(pr, repos_root)?;
 
     let worktree_name = format!("{}-pr-{}", pr.repo_name.replace('/', "-"), pr.number);
     let canonical_path = worktree_base.join(&worktree_name);
-    cleanup_worktree_path(&pr.repo_path, &canonical_path);
+    cleanup_worktree_path(&repo_path, &canonical_path);
 
     // Fetch the PR head ref
     let pr_ref = format!("refs/pull/{}/head", pr.number);
     let fetch_output = Command::new("git")
         .args(["fetch", "origin", &pr_ref])
-        .current_dir(&pr.repo_path)
+        .current_dir(&repo_path)
         .output()
         .context("Failed to fetch PR ref")?;
 
@@ -1004,10 +1265,10 @@ pub fn create_pr_worktree(
     let mut errors = Vec::new();
     for candidate in candidates {
         if candidate.exists() {
-            cleanup_worktree_path(&pr.repo_path, &candidate);
+            cleanup_worktree_path(&repo_path, &candidate);
         }
 
-        match git_worktree_add(&pr.repo_path, &candidate, "FETCH_HEAD") {
+        match git_worktree_add(&repo_path, &candidate, "FETCH_HEAD") {
             Ok(()) => return Ok(candidate),
             Err(err) => errors.push(format!("{} => {}", candidate.display(), err)),
         }
@@ -1019,6 +1280,52 @@ pub fn create_pr_worktree(
         pr.number,
         errors.join("\n")
     );
+}
+
+fn resolve_worktree_repo_path(
+    pr: &PullRequest,
+    repos_root: &std::path::Path,
+) -> Result<std::path::PathBuf> {
+    if !pr.repo_path.as_os_str().is_empty() {
+        return Ok(pr.repo_path.clone());
+    }
+
+    for candidate in worktree_repo_path_candidates(&pr.repo_name, repos_root) {
+        if !candidate.join(".git").exists() {
+            continue;
+        }
+
+        match repo_name_with_owner(&candidate) {
+            Some(name) if name == pr.repo_name => return Ok(candidate),
+            Some(_) => {}
+            None => {}
+        }
+    }
+
+    anyhow::bail!(
+        "No local clone found for {} under {}. Use `reviewer trigger --repo-path` for PRs that need a worktree.",
+        pr.repo_name,
+        repos_root.display()
+    );
+}
+
+fn worktree_repo_path_candidates(repo_name: &str, repos_root: &std::path::Path) -> Vec<PathBuf> {
+    let mut parts = repo_name.split('/');
+    let Some(owner) = parts.next() else {
+        return Vec::new();
+    };
+    let Some(name) = parts.next() else {
+        return Vec::new();
+    };
+
+    let mut candidates = vec![
+        repos_root.join(name),
+        repos_root.join(owner).join(name),
+        repos_root.join(repo_name.replace('/', "-")),
+    ];
+    candidates.sort();
+    candidates.dedup();
+    candidates
 }
 
 fn cleanup_worktree_path(repo_path: &std::path::Path, worktree_path: &std::path::Path) {
@@ -1199,16 +1506,165 @@ fn render_launch_template(template: &str, values: &LaunchTemplateValues) -> Stri
     rendered
 }
 
+pub fn validate_ai_launch_config(ai: &AiConfig) -> Result<()> {
+    match ai.launch.backend_key() {
+        "tmux" => {
+            if let Some(session) = ai.launch.tmux.session.as_deref() {
+                if session.trim().is_empty() || session.contains(':') {
+                    anyhow::bail!(
+                        "ai.launch.tmux.session must be non-empty and must not contain ':'"
+                    );
+                }
+            }
+        }
+        "steps" => {
+            if ai.launch.steps.is_empty() {
+                anyhow::bail!(
+                    "ai.launch.steps is empty. Configure launcher commands in ~/.config/reviewer/config.json or set ai.launch.backend to \"tmux\""
+                );
+            }
+
+            for (idx, step) in ai.launch.steps.iter().enumerate() {
+                if step.command.trim().is_empty() {
+                    anyhow::bail!("ai.launch.steps[{idx}] command is empty");
+                }
+            }
+        }
+        other => {
+            anyhow::bail!(
+                "Unsupported ai.launch.backend '{}'. Expected 'steps' or 'tmux'.",
+                other
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn tmux_session_name(ai: &AiConfig) -> String {
+    ai.launch
+        .tmux
+        .session
+        .as_deref()
+        .map(str::trim)
+        .filter(|session| !session.is_empty())
+        .unwrap_or("reviewer")
+        .to_string()
+}
+
+fn tmux_run(args: &[&str]) -> Result<std::process::Output> {
+    let output = Command::new("tmux")
+        .args(args)
+        .output()
+        .context("Failed to run tmux")?;
+    Ok(output)
+}
+
+fn tmux_has_session(session: &str) -> bool {
+    Command::new("tmux")
+        .args(["has-session", "-t", session])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn tmux_create_pane(
+    session: &str,
+    window_name: &str,
+    working_dir: &std::path::Path,
+) -> Result<String> {
+    let working_dir = working_dir.display().to_string();
+    let output = if tmux_has_session(session) {
+        tmux_run(&[
+            "new-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            &format!("{session}:"),
+            "-n",
+            window_name,
+            "-c",
+            &working_dir,
+        ])?
+    } else {
+        tmux_run(&[
+            "new-session",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-s",
+            session,
+            "-n",
+            window_name,
+            "-c",
+            &working_dir,
+        ])?
+    };
+
+    if !output.status.success() {
+        anyhow::bail!("tmux launch failed: {}", command_error_message(&output));
+    }
+
+    let pane_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if pane_id.is_empty() {
+        anyhow::bail!("tmux did not return a pane id for launched session");
+    }
+    Ok(pane_id)
+}
+
+fn tmux_set_pane_title(target: &str, title: &str) -> Result<()> {
+    let output = tmux_run(&["select-pane", "-t", target, "-T", title])?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "tmux select-pane failed: {}",
+            command_error_message(&output)
+        );
+    }
+    Ok(())
+}
+
+fn tmux_send_command(target: &str, command_line: &str) -> Result<()> {
+    let output = tmux_run(&["send-keys", "-t", target, "-l", command_line])?;
+    if !output.status.success() {
+        anyhow::bail!("tmux send-keys failed: {}", command_error_message(&output));
+    }
+
+    let output = tmux_run(&["send-keys", "-t", target, "C-m"])?;
+    if !output.status.success() {
+        anyhow::bail!("tmux send enter failed: {}", command_error_message(&output));
+    }
+    Ok(())
+}
+
+fn launch_with_tmux(
+    working_dir: &std::path::Path,
+    pr: &PullRequest,
+    ai: &AiConfig,
+    values: &LaunchTemplateValues,
+) -> Result<()> {
+    validate_ai_launch_config(ai)?;
+
+    let session = tmux_session_name(ai);
+    let window_name = agent::pr_agent_slug(pr);
+    if ai.launch.tmux.reuse_existing && agent::find_agent_pane(pr)?.is_some() {
+        return Ok(());
+    }
+
+    let pane_id = tmux_create_pane(&session, &window_name, working_dir)?;
+    tmux_set_pane_title(&pane_id, &window_name)?;
+    tmux_send_command(&pane_id, &values.tool_command)?;
+    Ok(())
+}
+
 fn launch_with_steps(
     working_dir: &std::path::Path,
     ai: &AiConfig,
     values: &LaunchTemplateValues,
 ) -> Result<()> {
-    if ai.launch.steps.is_empty() {
-        anyhow::bail!(
-            "ai.launch.steps is empty. Configure launcher commands in ~/.config/reviewer/config.json"
-        );
-    }
+    validate_ai_launch_config(ai)?;
 
     let total = ai.launch.steps.len();
     for (idx, step) in ai.launch.steps.iter().enumerate() {
@@ -1298,7 +1754,15 @@ pub fn launch_ai(working_dir: &std::path::Path, pr: &PullRequest, ai: &AiConfig)
         skill_name: &skill_name,
         skill_invocation: &skill_invocation,
     });
-    launch_with_steps(working_dir, ai, &values)
+
+    match ai.launch.backend_key() {
+        "tmux" => launch_with_tmux(working_dir, pr, ai, &values),
+        "steps" => launch_with_steps(working_dir, ai, &values),
+        other => anyhow::bail!(
+            "Unsupported ai.launch.backend '{}'. Expected 'steps' or 'tmux'.",
+            other
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -1323,8 +1787,8 @@ mod request_changes_tests {
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use super::{
-        build_shell_command, launch_with_steps, render_launch_template, LaunchContext,
-        LaunchTemplateValues, PullRequest,
+        build_shell_command, launch_with_steps, render_launch_template, search_qualifiers,
+        validate_ai_launch_config, LaunchContext, LaunchTemplateValues, PullRequest, SearchScope,
     };
     use crate::config::AiConfig;
     use chrono::Utc;
@@ -1352,6 +1816,7 @@ mod tests {
             number,
             title: title.to_string(),
             author: "alice".to_string(),
+            author_kind: Some("User".to_string()),
             body: String::new(),
             repo_path: PathBuf::from("/tmp/repo"),
             repo_name: repo.to_string(),
@@ -1361,7 +1826,30 @@ mod tests {
             deletions: 1,
             is_draft: false,
             review_state: super::ReviewState::Pending,
+            details_loaded: true,
         }
+    }
+
+    #[test]
+    fn search_qualifiers_adds_negative_authors_for_exact_excludes() {
+        let qualifiers = search_qualifiers(
+            "daulet",
+            false,
+            SearchScope::Involved,
+            &[
+                "dependabot".to_string(),
+                "lpu-renovate".to_string(),
+                "@apps/*".to_string(),
+                "github-*".to_string(),
+            ],
+        );
+
+        assert!(qualifiers.contains(&"-author:dependabot".to_string()));
+        assert!(qualifiers.contains(&"-author:app/dependabot".to_string()));
+        assert!(qualifiers.contains(&"-author:lpu-renovate".to_string()));
+        assert!(qualifiers.contains(&"-author:app/lpu-renovate".to_string()));
+        assert!(!qualifiers.contains(&"-author:apps/*".to_string()));
+        assert!(!qualifiers.contains(&"-author:github-*".to_string()));
     }
 
     #[test]
@@ -1407,5 +1895,13 @@ mod tests {
             msg.contains("ai.launch.steps is empty"),
             "unexpected error: {msg}"
         );
+    }
+
+    #[test]
+    fn validate_ai_launch_config_allows_tmux_without_steps() {
+        let mut ai = AiConfig::default();
+        ai.launch.backend = Some("tmux".to_string());
+
+        validate_ai_launch_config(&ai).expect("tmux launch backend should not require steps");
     }
 }

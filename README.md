@@ -5,8 +5,9 @@ How do you keep up with AI generated PRs? Answer: use AI assisted code reviews.
 ![alt text](./docs/image.png)
 ## Features
 
-- List, comment, approve PRs from your cloned repos;
-- Start interactive AI assisted review session, let it learn your code review approach;  
+- List, comment, approve PRs involving your GitHub account;
+- Start interactive AI assisted review session, let it learn your code review approach;
+- Preview the launched tmux-backed review agent from the PR detail `Agent` tab;
 - Run reviewer as daemon to kick off reviews as they are created;
 
 ## Installation
@@ -33,7 +34,7 @@ cargo install --git https://github.com/daulet/reviewer
 | [delta](https://github.com/dandavison/delta) | Enhanced diff rendering (side-by-side, syntax highlighting) | `brew install git-delta` |
 | [Codex CLI](https://github.com/openai/codex) | AI-assisted code reviews (OpenAI) | `npm install -g @openai/codex` |
 | [Claude Code](https://github.com/anthropics/claude-code) | AI-assisted code reviews | `npm install -g @anthropic-ai/claude-code` |
-| [Maestro](https://github.com/daulet/maestro) | Launch review sessions in managed tmux sessions | `brew install daulet/tap/maestro` |
+| [tmux](https://github.com/tmux/tmux) | Launch and preview review agent sessions | `brew install tmux` |
 
 The diff tries to use `delta` if installed. Choice of code reviewer tool can be configured in `~/.config/reviewer/config.json`.
 
@@ -128,23 +129,37 @@ The AI learns from skipped comments and offers to update this file automatically
 ## Usage
 
 ```bash
-reviewer                       # Scan configured directory
+reviewer                       # Open PR list tabs (defaults to "Involving Me")
 reviewer -d                    # Include draft PRs
-reviewer -r ~/dev              # Specify repos directory
-reviewer -e archived -e old    # Exclude directories
+reviewer -r ~/dev              # Specify local repos root for worktrees
+reviewer -e archived -e old    # Exclude directories for repo-scan commands
 
-reviewer --my                  # Show PRs you authored (same as -m)
+reviewer --my                  # Start on "My PRs" tab (same as -m)
+reviewer trigger https://github.com/org/repo/pull/1234
+reviewer trigger org/repo#1234
+reviewer trigger --repo org/repo --pr 1234
+reviewer trigger --repo-path ~/dev/org-repo --pr 1234
 
 reviewer daemon init           # Pick repos to monitor
 reviewer daemon run            # Start daemon polling loop
 reviewer daemon status         # Show daemon state/counters
 ```
 
-On first run, you'll be prompted to set your repos root directory.
+The interactive PR list loads directly from GitHub for `Involving Me` and `My PRs`
+and does not scan local clones on startup. The `Watching Repos` tab uses local
+repo discovery plus daemon repo/path filters. Local clones are also used by daemon
+polling, explicit `reviewer trigger` runs, and worktree-backed AI review launches.
 
-Use `--my` (or `-m`) to switch to "my PRs" mode. In this mode, reviewer
-shows PRs authored by your GitHub account and enables `m` in detail view to
-merge mergeable PRs with squash.
+The list view has three tabs:
+- `Involving Me`: open PRs involving your account.
+- `My PRs`: open PRs authored by your account (enables `m` in detail view to squash-merge mergeable PRs).
+- `Watching Repos`: open PRs from repos/paths configured by `reviewer daemon init` (`daemon.exclude_repos` + `daemon.repo_subpath_filters`).
+
+In list view, use `Tab`/`Shift+Tab` (or `←`/`→`, or `1`/`2`/`3`) to switch tabs.
+Use `--my` (or `-m`) to start directly on the `My PRs` tab.
+
+`reviewer trigger` launches a review session for an explicit PR and bypasses
+the list-mode draft/approved filters.
 
 Daemon notes:
 - On first daemon setup, reviewer shows an interactive checkbox list of repos and saves exclusions by `owner/repo`.
@@ -156,6 +171,12 @@ Daemon notes:
 - Long-running daemon processes auto-restart after binary upgrades (detected on poll boundaries).
 - Optional `daemon.repo_subpath_filters` lets you restrict a repo to PRs touching specific subpaths.
   Omit a repo (or set an empty list) to monitor all PRs in that repo.
+- Optional `daemon.auto_approve` rules auto-approve PRs when both repo and author match.
+  Matching is case-insensitive, supports `*` (any sequence) and `?` (single character),
+  and applies only to non-self-review daemon triggers.
+- Optional `daemon.only_new_prs_on_start` controls first-run behavior:
+  when `true` (default), daemon init seeds currently open PRs as seen so only PRs opened
+  after first launch are processed. Later restarts still process PRs opened while daemon was down.
 - Daemon also triggers self-reviews for PRs authored by your account (non-drafts only).
   Set `ai.launch.self_review_steps` to customize launch commands for those sessions.
 
@@ -195,6 +216,7 @@ Daemon state is stored separately in:
 {
   "repos_root": "/path/to/your/repos",
   "exclude": ["archived", "vendor"],
+  "exclude_users": ["@apps/*", "dependabot", "github-actions"],
   "daemon": {
     "poll_interval_sec": 60,
     "exclude_repos": ["org/legacy-repo"],
@@ -202,6 +224,12 @@ Daemon state is stored separately in:
       "org/monorepo": ["services/payments", "infra/terraform"],
       "org/full-repo": []
     },
+    "auto_approve": [
+      {"repo": "org/reviewer", "user": "dependabot[bot]"},
+      {"repo": "org/*", "user": "*[bot]"},
+      {"repo": "org/monorepo", "user": "renovate[bo?]"}
+    ],
+    "only_new_prs_on_start": true,
     "initialized": true,
     "include_drafts": false
   },
@@ -212,48 +240,19 @@ Daemon state is stored separately in:
     "skill": "code-review",
     "prompt_template": "Review PR #{pr_number} in {repo}. Title: \"{title}\". Use {skill}. Follow {review_guide}",
     "launch": {
-      "steps": [
-        {
-          "command": "maestro",
-          "args": [
-            "start",
-            "--cwd",
-            "{workdir}",
-            "--title",
-            "review {repo}#{pr_number}",
-            "--tag",
-            "review",
-            "--auto-approve",
-            "--tool",
-            "custom",
-            "--cmd",
-            "{tool_command}"
-          ]
-        }
-      ],
-      "self_review_steps": [
-        {
-          "command": "maestro",
-          "args": [
-            "start",
-            "--cwd",
-            "{workdir}",
-            "--title",
-            "self-review {repo}#{pr_number}",
-            "--tag",
-            "self-review",
-            "--auto-approve",
-            "--tool",
-            "custom",
-            "--cmd",
-            "{tool_command}"
-          ]
-        }
-      ]
+      "backend": "tmux",
+      "tmux": {
+        "session": "reviewer",
+        "reuse_existing": true
+      }
     }
   }
 }
 ```
+
+The native tmux launcher creates one window per PR using a stable name like `nvidia-lpu-cyborg-pr-199`. The TUI `Agent` tab previews that pane with `tmux capture-pane`; press `Enter` or `A` from the tab to attach/switch to it.
+
+`exclude_users` filters PR authors from the TUI list and daemon review/self-review triggers. Patterns are case-insensitive, a leading `@` is optional, and `*`/`?` wildcards are supported. Exact user entries are also sent to GitHub search as `-author:<login>` and `-author:app/<login>` so excluded users do not consume page slots. `@apps/*` only matches GitHub bot/app actors, so it will not hide normal users. Auto-approve rules are evaluated before this filter, so excluded users can still be auto-approved when they match `daemon.auto_approve`.
 
 Terminal.app (macOS, new window) launch example:
 

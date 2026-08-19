@@ -1,14 +1,15 @@
-use crate::config::AiConfig;
+use crate::agent::{self, AgentPreview};
+use crate::config::{self, AiConfig};
 use crate::diff::{self, SyntaxHighlighter};
 use crate::gh::{self, Comment, PullRequest, ReviewComment, ReviewState};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Tabs, Wrap},
     Frame,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -412,12 +413,15 @@ fn build_diff_tree_items(sections: &[FileDiffSection]) -> Vec<DiffTreeItem> {
 }
 
 enum AsyncResult {
+    Details(usize, Result<PullRequest, String>), // (pr_index, fully populated PR details)
     Diff(DetailRequestKey, String, Option<String>, bool), // (request_key, diff_content, delta_output, delta_too_large)
     Comments(DetailRequestKey, Vec<Comment>),             // (request_key, comments)
     ReviewComments(DetailRequestKey, Vec<ReviewComment>), // (request_key, review comments with diff context)
     Checks(DetailRequestKey, Vec<gh::CheckStatus>),       // (request_key, CI checks)
     AiLaunch(Result<String, String>),                     // worktree path or error
-    Refresh(Vec<PullRequest>),                            // refreshed PR list
+    AgentPreview(usize, AgentPreview),                    // (pr_index, tmux preview)
+    Refresh(AppMode, gh::PullRequestPage),                // refreshed first page
+    NextPage(AppMode, String, gh::PullRequestPage), // (mode, requested cursor, appended next page)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -459,15 +463,18 @@ pub enum DetailTab {
     Description,
     Diff,
     Comments,
+    Agent,
 }
 
 /// App mode - determines what PRs are shown
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AppMode {
-    /// Review mode: PRs from others needing your review
+    /// Review mode: PRs involving the current user
     Review,
     /// My PRs mode: Your own PRs
     MyPrs,
+    /// Watching mode: PRs from daemon-configured watched repos
+    Watching,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -508,9 +515,9 @@ pub enum CommentSide {
 pub struct App {
     pub prs: Vec<PullRequest>,
     pub repos_root: PathBuf,
-    pub repo_list: Vec<PathBuf>,
     pub username: String,
     pub include_drafts: bool,
+    pub exclude_users: Vec<String>,
     pub mode: AppMode,
     pub list_state: ListState,
     pub view: View,
@@ -532,6 +539,7 @@ pub struct App {
     pub comments_cache: Option<Vec<Comment>>,
     pub review_comments_cache: Option<Vec<ReviewComment>>,
     pub checks_cache: Option<Vec<gh::CheckStatus>>,
+    pub agent_preview_cache: Option<AgentPreview>,
     pub input_mode: InputMode,
     pub input_buffer: String,
     pub line_comment_ctx: Option<LineCommentContext>, // For line-level comments
@@ -552,12 +560,18 @@ pub struct App {
     loading_comments: bool,
     loading_review_comments: bool,
     loading_checks: bool,
+    loading_details: bool,
+    loading_agent_preview: bool,
+    loading_next_page: bool,
     refreshing: bool,
+    next_page_cursor: Option<String>,
+    has_next_page: bool,
     // Screen state
     needs_clear: bool,
     needs_redraw: bool,
     // AI launch state
     launching_ai: bool,
+    pending_agent_attach_target: Option<String>,
     // Syntax highlighter for diff rendering
     syntax_highlighter: SyntaxHighlighter,
 }
@@ -565,9 +579,9 @@ pub struct App {
 impl App {
     pub fn new(
         repos_root: PathBuf,
-        repo_list: Vec<PathBuf>,
         username: String,
         include_drafts: bool,
+        exclude_users: Vec<String>,
         ai: AiConfig,
         mode: AppMode,
     ) -> Self {
@@ -575,9 +589,9 @@ impl App {
         Self {
             prs: Vec::new(),
             repos_root,
-            repo_list,
             username,
             include_drafts,
+            exclude_users,
             mode,
             list_state: ListState::default(),
             view: View::List,
@@ -599,6 +613,7 @@ impl App {
             comments_cache: None,
             review_comments_cache: None,
             checks_cache: None,
+            agent_preview_cache: None,
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             line_comment_ctx: None,
@@ -617,10 +632,16 @@ impl App {
             loading_comments: false,
             loading_review_comments: false,
             loading_checks: false,
+            loading_details: false,
+            loading_agent_preview: false,
+            loading_next_page: false,
             refreshing: false,
+            next_page_cursor: None,
+            has_next_page: false,
             needs_clear: true,
             needs_redraw: true,
             launching_ai: false,
+            pending_agent_attach_target: None,
             syntax_highlighter: SyntaxHighlighter::new(),
         }
     }
@@ -646,6 +667,52 @@ impl App {
         self.list_state.selected().and_then(|i| self.prs.get(i))
     }
 
+    fn apply_excluded_user_filter_to_loaded_prs(&mut self) {
+        let exclude_users = crate::filters::normalize_user_patterns(&self.exclude_users);
+        if exclude_users.is_empty() {
+            return;
+        }
+
+        self.prs.retain(|pr| {
+            !crate::filters::author_excluded(&pr.author, pr.author_kind.as_deref(), &exclude_users)
+        });
+
+        let count = self.list_item_count();
+        if count == 0 {
+            self.list_state.select(None);
+        } else if self.list_state.selected().is_none_or(|idx| idx >= count) {
+            self.list_state.select(Some(count - 1));
+        }
+    }
+
+    fn reload_exclude_users_from_config(&mut self) {
+        match config::load_config() {
+            Ok(cfg) => {
+                self.exclude_users = cfg.exclude_users;
+                self.apply_excluded_user_filter_to_loaded_prs();
+            }
+            Err(err) => {
+                self.set_status(format!("Failed to reload config: {:#}", err));
+            }
+        }
+    }
+
+    fn pagination_row_count(&self) -> usize {
+        usize::from(self.has_next_page || self.loading_next_page)
+    }
+
+    fn pagination_row_index(&self) -> Option<usize> {
+        if self.pagination_row_count() == 0 {
+            None
+        } else {
+            Some(self.prs.len())
+        }
+    }
+
+    fn list_item_count(&self) -> usize {
+        self.prs.len() + self.pagination_row_count()
+    }
+
     fn reset_large_diff_state(&mut self) {
         self.diff_tree_enabled = false;
         self.delta_too_large = false;
@@ -667,6 +734,7 @@ impl App {
         self.comments_cache = None;
         self.review_comments_cache = None;
         self.checks_cache = None;
+        self.agent_preview_cache = None;
         self.input_mode = InputMode::Normal;
         self.input_buffer.clear();
         self.line_comment_ctx = None;
@@ -674,6 +742,8 @@ impl App {
         self.loading_comments = false;
         self.loading_review_comments = false;
         self.loading_checks = false;
+        self.loading_details = false;
+        self.loading_agent_preview = false;
         self.clear_search();
     }
 
@@ -808,24 +878,26 @@ impl App {
     }
 
     fn next(&mut self) {
-        if self.prs.is_empty() {
+        let count = self.list_item_count();
+        if count == 0 {
             return;
         }
         let i = match self.list_state.selected() {
-            Some(i) => (i + 1) % self.prs.len(),
+            Some(i) => (i + 1) % count,
             None => 0,
         };
         self.list_state.select(Some(i));
     }
 
     fn previous(&mut self) {
-        if self.prs.is_empty() {
+        let count = self.list_item_count();
+        if count == 0 {
             return;
         }
         let i = match self.list_state.selected() {
             Some(i) => {
                 if i == 0 {
-                    self.prs.len() - 1
+                    count - 1
                 } else {
                     i - 1
                 }
@@ -836,19 +908,20 @@ impl App {
     }
 
     fn next_page(&mut self) {
-        if self.prs.is_empty() {
+        let count = self.list_item_count();
+        if count == 0 {
             return;
         }
         let page_size = 10;
         let i = match self.list_state.selected() {
-            Some(i) => (i + page_size).min(self.prs.len() - 1),
+            Some(i) => (i + page_size).min(count - 1),
             None => 0,
         };
         self.list_state.select(Some(i));
     }
 
     fn previous_page(&mut self) {
-        if self.prs.is_empty() {
+        if self.list_item_count() == 0 {
             return;
         }
         let page_size = 10;
@@ -860,15 +933,51 @@ impl App {
     }
 
     fn go_to_first(&mut self) {
-        if !self.prs.is_empty() {
+        if self.list_item_count() > 0 {
             self.list_state.select(Some(0));
         }
     }
 
     fn go_to_last(&mut self) {
-        if !self.prs.is_empty() {
-            self.list_state.select(Some(self.prs.len() - 1));
+        let count = self.list_item_count();
+        if count > 0 {
+            self.list_state.select(Some(count - 1));
         }
+    }
+
+    fn select_list_tab(&mut self, mode: AppMode) {
+        if self.mode == mode {
+            return;
+        }
+
+        self.mode = mode;
+        self.prs.clear();
+        self.list_state.select(None);
+        self.refreshing = false;
+        self.loading_next_page = false;
+        self.has_next_page = false;
+        self.next_page_cursor = None;
+        self.clear_search();
+        self.needs_clear = true;
+        self.refresh();
+    }
+
+    fn next_list_tab(&mut self) {
+        let next = match self.mode {
+            AppMode::Review => AppMode::MyPrs,
+            AppMode::MyPrs => AppMode::Watching,
+            AppMode::Watching => AppMode::Review,
+        };
+        self.select_list_tab(next);
+    }
+
+    fn prev_list_tab(&mut self) {
+        let prev = match self.mode {
+            AppMode::Review => AppMode::Watching,
+            AppMode::MyPrs => AppMode::Review,
+            AppMode::Watching => AppMode::MyPrs,
+        };
+        self.select_list_tab(prev);
     }
 
     fn enter_detail(&mut self) {
@@ -878,7 +987,8 @@ impl App {
             self.detail_tab = DetailTab::Description;
             self.reset_detail_session_state();
             self.needs_clear = true;
-            // Load checks asynchronously
+            // Load details and checks asynchronously.
+            self.load_details();
             self.load_checks();
         }
     }
@@ -893,7 +1003,8 @@ impl App {
         self.detail_tab = match self.detail_tab {
             DetailTab::Description => DetailTab::Diff,
             DetailTab::Diff => DetailTab::Comments,
-            DetailTab::Comments => DetailTab::Description,
+            DetailTab::Comments => DetailTab::Agent,
+            DetailTab::Agent => DetailTab::Description,
         };
         self.scroll_offset = 0;
         self.needs_clear = true;
@@ -902,9 +1013,10 @@ impl App {
 
     fn prev_tab(&mut self) {
         self.detail_tab = match self.detail_tab {
-            DetailTab::Description => DetailTab::Comments,
+            DetailTab::Description => DetailTab::Agent,
             DetailTab::Diff => DetailTab::Description,
             DetailTab::Comments => DetailTab::Diff,
+            DetailTab::Agent => DetailTab::Comments,
         };
         self.scroll_offset = 0;
         self.needs_clear = true;
@@ -913,12 +1025,13 @@ impl App {
 
     fn load_tab_content(&mut self) {
         match self.detail_tab {
-            DetailTab::Description => {}
+            DetailTab::Description => self.load_details(),
             DetailTab::Diff => self.load_diff(),
             DetailTab::Comments => {
                 self.load_comments();
                 self.load_review_comments();
             }
+            DetailTab::Agent => self.load_agent_preview(),
         }
     }
 
@@ -936,6 +1049,88 @@ impl App {
 
     fn page_up(&mut self) {
         self.scroll_offset = self.scroll_offset.saturating_sub(20);
+    }
+
+    fn load_details(&mut self) {
+        if self.loading_details {
+            return;
+        }
+        if let Some(idx) = self.list_state.selected() {
+            if let Some(pr) = self.prs.get(idx) {
+                if pr.details_loaded {
+                    return;
+                }
+
+                self.loading_details = true;
+                let pr = pr.clone();
+                let tx = self.async_tx.clone();
+                thread::spawn(move || {
+                    let details = gh::fetch_pr_details(&pr).map_err(|e| format!("{:#}", e));
+                    let _ = tx.send(AsyncResult::Details(idx, details));
+                });
+            }
+        }
+    }
+
+    fn load_next_page(&mut self) {
+        if self.loading_next_page || !self.has_next_page || self.refreshing {
+            return;
+        }
+
+        let Some(cursor) = self.next_page_cursor.clone() else {
+            self.has_next_page = false;
+            return;
+        };
+
+        self.loading_next_page = true;
+        self.needs_redraw = true;
+        self.reload_exclude_users_from_config();
+        let tx = self.async_tx.clone();
+        let username = self.username.clone();
+        let include_drafts = self.include_drafts;
+        let exclude_users = self.exclude_users.clone();
+        let repos_root = self.repos_root.clone();
+        let mode = self.mode;
+
+        thread::spawn(move || {
+            let page = match mode {
+                AppMode::Review => crate::fetch_involved_prs(
+                    &username,
+                    include_drafts,
+                    Some(&cursor),
+                    &exclude_users,
+                ),
+                AppMode::MyPrs => {
+                    crate::fetch_my_prs(&username, include_drafts, Some(&cursor), &exclude_users)
+                }
+                AppMode::Watching => crate::fetch_watching_prs(
+                    &repos_root,
+                    &username,
+                    include_drafts,
+                    Some(&cursor),
+                    &exclude_users,
+                ),
+            };
+            let _ = tx.send(AsyncResult::NextPage(mode, cursor, page));
+        });
+    }
+
+    fn load_next_page_if_pagination_visible(&mut self, list_area_height: u16) {
+        let Some(pagination_idx) = self.pagination_row_index() else {
+            return;
+        };
+        if self.loading_next_page || !self.has_next_page {
+            return;
+        }
+
+        let content_height = list_area_height.saturating_sub(2) as usize;
+        let visible_item_capacity = content_height.div_ceil(2).max(1);
+        let first_visible = self.list_state.offset();
+        let past_last_visible = first_visible.saturating_add(visible_item_capacity);
+
+        if pagination_idx >= first_visible && pagination_idx < past_last_visible {
+            self.load_next_page();
+        }
     }
 
     fn load_diff(&mut self) {
@@ -1020,11 +1215,66 @@ impl App {
         }
     }
 
+    fn load_agent_preview(&mut self) {
+        if self.agent_preview_cache.is_some() || self.loading_agent_preview {
+            return;
+        }
+        self.refresh_agent_preview();
+    }
+
+    fn refresh_agent_preview(&mut self) {
+        if self.loading_agent_preview {
+            return;
+        }
+        if let Some(idx) = self.list_state.selected() {
+            if let Some(pr) = self.prs.get(idx) {
+                self.loading_agent_preview = true;
+                let pr = pr.clone();
+                let tx = self.async_tx.clone();
+                thread::spawn(move || {
+                    let preview = agent::preview_agent_session(&pr);
+                    let _ = tx.send(AsyncResult::AgentPreview(idx, preview));
+                });
+            }
+        }
+    }
+
+    fn attach_agent_session(&mut self) {
+        let target = self
+            .agent_preview_cache
+            .as_ref()
+            .and_then(|preview| preview.pane.as_ref())
+            .map(|pane| pane.target.clone());
+
+        if let Some(target) = target {
+            self.pending_agent_attach_target = Some(target);
+        } else {
+            self.set_status("No agent session found for this PR".to_string());
+        }
+    }
+
+    fn take_pending_agent_attach_target(&mut self) -> Option<String> {
+        self.pending_agent_attach_target.take()
+    }
+
     fn poll_async_results(&mut self) -> bool {
         let mut has_updates = false;
         while let Ok(result) = self.async_rx.try_recv() {
             has_updates = true;
             match result {
+                AsyncResult::Details(idx, result) => {
+                    if self.list_state.selected() == Some(idx) {
+                        match result {
+                            Ok(details) => {
+                                if let Some(pr) = self.prs.get_mut(idx) {
+                                    *pr = details;
+                                }
+                            }
+                            Err(e) => self.set_status(format!("Failed to load PR details: {}", e)),
+                        }
+                    }
+                    self.loading_details = false;
+                }
                 AsyncResult::Diff(request_key, diff, delta_output, delta_too_large) => {
                     // Only update if this result belongs to the current detail session
                     if request_key.matches(self.detail_epoch, self.selected_pr()) {
@@ -1069,35 +1319,53 @@ impl App {
                         self.loading_checks = false;
                     }
                 }
+                AsyncResult::AgentPreview(idx, preview) => {
+                    if self.list_state.selected() == Some(idx) {
+                        self.agent_preview_cache = Some(preview);
+                    }
+                    self.loading_agent_preview = false;
+                }
                 AsyncResult::AiLaunch(result) => {
                     self.launching_ai = false;
                     self.needs_clear = true;
                     match result {
                         Ok(path) => {
+                            self.agent_preview_cache = None;
                             self.set_status(format!(
                                 "Launched {} in {}",
                                 self.ai.display_name(),
                                 path
                             ));
+                            if self.detail_tab == DetailTab::Agent {
+                                self.load_agent_preview();
+                            }
                         }
                         Err(e) => {
                             self.set_status(format!("Failed: {}", e));
                         }
                     }
                 }
-                AsyncResult::Refresh(prs) => {
+                AsyncResult::Refresh(mode, page) => {
+                    if self.mode != mode {
+                        continue;
+                    }
                     self.refreshing = false;
+                    self.loading_next_page = false;
                     self.needs_clear = true;
-                    let count = prs.len();
+                    let count = page.prs.len();
                     let was_in_detail = self.view == View::Detail;
 
+                    // Refresh swaps the PR list under the detail view, so start a fresh
+                    // detail session to keep in-flight results from the previous PR out.
                     if was_in_detail {
                         self.detail_epoch += 1;
                         self.reset_detail_session_state();
                     }
 
-                    self.prs = prs;
-
+                    self.prs = page.prs;
+                    self.next_page_cursor = page.end_cursor;
+                    self.has_next_page = page.has_next_page;
+                    // Reset selection
                     if self.prs.is_empty() {
                         self.list_state.select(None);
                         self.view = View::List;
@@ -1115,6 +1383,34 @@ impl App {
                         ""
                     };
                     self.set_status(format!("Refreshed: {} PRs{}", count, draft_status));
+                }
+                AsyncResult::NextPage(mode, cursor, page) => {
+                    if self.mode != mode {
+                        continue;
+                    }
+                    if self.next_page_cursor.as_deref() != Some(cursor.as_str()) {
+                        continue;
+                    }
+                    self.loading_next_page = false;
+                    self.needs_clear = true;
+                    let added = page.prs.len();
+                    self.prs.extend(page.prs);
+                    self.next_page_cursor = page.end_cursor;
+                    self.has_next_page = page.has_next_page;
+
+                    if self.list_item_count() == 0 {
+                        self.list_state.select(None);
+                    } else if self
+                        .list_state
+                        .selected()
+                        .is_some_and(|idx| idx >= self.list_item_count())
+                    {
+                        self.list_state.select(Some(self.list_item_count() - 1));
+                    }
+
+                    if added > 0 {
+                        self.set_status(format!("Loaded {} more PRs", added));
+                    }
                 }
             }
         }
@@ -1255,6 +1551,11 @@ impl App {
             return;
         }
         if let Some(pr) = self.selected_pr().cloned() {
+            if let Err(err) = gh::validate_ai_launch_config(&self.ai) {
+                self.set_status(format!("AI launch is not configured: {:#}", err));
+                return;
+            }
+
             let ai_display_name = self.ai.display_name();
             self.launching_ai = true;
             self.set_status(format!(
@@ -1449,7 +1750,7 @@ impl App {
     fn start_merge(&mut self) {
         // Only allow merge in MyPrs mode
         if self.mode != AppMode::MyPrs {
-            self.set_status("Merge only available in --my mode".to_string());
+            self.set_status("Merge only available in My PRs tab".to_string());
             return;
         }
 
@@ -1558,20 +1859,36 @@ impl App {
             return;
         }
         self.refreshing = true;
+        self.loading_next_page = false;
+        self.has_next_page = false;
+        self.next_page_cursor = None;
+        self.reload_exclude_users_from_config();
         self.set_status("Refreshing PR list...".to_string());
 
         let tx = self.async_tx.clone();
-        let repo_list = self.repo_list.clone();
         let username = self.username.clone();
         let include_drafts = self.include_drafts;
+        let exclude_users = self.exclude_users.clone();
+        let repos_root = self.repos_root.clone();
         let mode = self.mode;
 
         thread::spawn(move || {
-            let prs = match mode {
-                AppMode::Review => crate::fetch_all_prs(&repo_list, &username, include_drafts),
-                AppMode::MyPrs => crate::fetch_my_prs(include_drafts),
+            let page = match mode {
+                AppMode::Review => {
+                    crate::fetch_involved_prs(&username, include_drafts, None, &exclude_users)
+                }
+                AppMode::MyPrs => {
+                    crate::fetch_my_prs(&username, include_drafts, None, &exclude_users)
+                }
+                AppMode::Watching => crate::fetch_watching_prs(
+                    &repos_root,
+                    &username,
+                    include_drafts,
+                    None,
+                    &exclude_users,
+                ),
             };
-            let _ = tx.send(AsyncResult::Refresh(prs));
+            let _ = tx.send(AsyncResult::Refresh(mode, page));
         });
     }
 
@@ -1648,6 +1965,11 @@ impl App {
         match self.view {
             View::List => match code {
                 KeyCode::Char('q') => self.should_quit = true,
+                KeyCode::Tab | KeyCode::Right => self.next_list_tab(),
+                KeyCode::BackTab | KeyCode::Left => self.prev_list_tab(),
+                KeyCode::Char('1') => self.select_list_tab(AppMode::Review),
+                KeyCode::Char('2') => self.select_list_tab(AppMode::MyPrs),
+                KeyCode::Char('3') => self.select_list_tab(AppMode::Watching),
                 // Page navigation with Ctrl+d/u (must be before non-Ctrl)
                 KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => self.next_page(),
                 KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1708,7 +2030,17 @@ impl App {
                 }
                 KeyCode::PageDown => self.page_down(),
                 KeyCode::PageUp => self.page_up(),
+                KeyCode::Enter if self.detail_tab == DetailTab::Agent => {
+                    self.attach_agent_session()
+                }
                 KeyCode::Enter if self.showing_large_diff_tree() => self.open_selected_file_diff(),
+                KeyCode::Char('A') if self.detail_tab == DetailTab::Agent => {
+                    self.attach_agent_session()
+                }
+                KeyCode::Char('R') if self.detail_tab == DetailTab::Agent => {
+                    self.agent_preview_cache = None;
+                    self.refresh_agent_preview();
+                }
                 KeyCode::Char('c') => self.start_line_comment(),
                 KeyCode::Char('a') => self.start_approve(),
                 KeyCode::Char('R') => self.start_request_changes(),
@@ -2208,14 +2540,120 @@ fn review_state_span(state: &ReviewState) -> Span<'static> {
 fn draw_list(frame: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(3)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(3),
+        ])
         .split(frame.area());
 
-    let items: Vec<ListItem> = app
+    let tab_specs = [
+        ("Involving Me", AppMode::Review),
+        ("My PRs", AppMode::MyPrs),
+        ("Watching Repos", AppMode::Watching),
+    ];
+    let mut tab_constraints: Vec<Constraint> = tab_specs
+        .iter()
+        .enumerate()
+        .flat_map(|(idx, (label, _))| {
+            let width = label.chars().count() as u16 + 4;
+            let mut parts = vec![Constraint::Length(width)];
+            if idx + 1 < tab_specs.len() {
+                parts.push(Constraint::Length(1));
+            }
+            parts
+        })
+        .collect();
+    tab_constraints.push(Constraint::Min(0));
+    let tab_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(tab_constraints)
+        .split(chunks[0]);
+
+    for (idx, (label, mode)) in tab_specs.iter().enumerate() {
+        let area_idx = idx * 2;
+        let area = tab_chunks[area_idx];
+        if app.mode == *mode {
+            let selected = Paragraph::new(Line::from(Span::styled(
+                *label,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )))
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
+                    .border_style(Style::default().fg(Color::White)),
+            );
+            frame.render_widget(selected, area);
+        } else {
+            let unselected = Paragraph::new(Line::from(Span::styled(
+                *label,
+                Style::default().fg(Color::DarkGray),
+            )))
+            .alignment(Alignment::Center)
+            .block(Block::default().padding(Padding::new(1, 1, 1, 1)));
+            frame.render_widget(unselected, area);
+        }
+    }
+
+    let selected_tab_area = tab_specs
+        .iter()
+        .position(|(_, mode)| *mode == app.mode)
+        .map(|idx| tab_chunks[idx * 2]);
+
+    let border_area = Rect {
+        x: chunks[0].x,
+        y: chunks[0]
+            .y
+            .saturating_add(chunks[0].height.saturating_sub(1)),
+        width: chunks[0].width,
+        height: 1,
+    };
+    let mut border_chars = vec!['─'; usize::from(border_area.width)];
+    if !border_chars.is_empty() {
+        border_chars[0] = '┌';
+        if border_chars.len() > 1 {
+            let last = border_chars.len() - 1;
+            border_chars[last] = '┐';
+        }
+    }
+    if let Some(area) = selected_tab_area {
+        if area.width >= 2 && !border_chars.is_empty() {
+            let start = usize::from(area.x.saturating_sub(chunks[0].x));
+            if start < border_chars.len() {
+                let mut end = start + usize::from(area.width.saturating_sub(1));
+                end = end.min(border_chars.len() - 1);
+                border_chars[start] = if start == 0 { '│' } else { '┘' };
+                border_chars[end] = if end == border_chars.len() - 1 {
+                    '│'
+                } else {
+                    '└'
+                };
+                if end > start + 1 {
+                    for ch in &mut border_chars[(start + 1)..end] {
+                        *ch = ' ';
+                    }
+                }
+            }
+        }
+    }
+    let border_line: String = border_chars.into_iter().collect();
+    frame.render_widget(
+        Paragraph::new(border_line).style(Style::default().fg(Color::White)),
+        border_area,
+    );
+
+    let mut items: Vec<ListItem> = app
         .prs
         .iter()
         .map(|pr| {
-            let stats = format!("+{}/-{}", pr.additions, pr.deletions);
+            let stats = if pr.details_loaded {
+                format!("+{}/-{}", pr.additions, pr.deletions)
+            } else {
+                "+?/-?".to_string()
+            };
             let age = format_age(&pr.updated_at);
             let mut title_spans = vec![
                 Span::styled(
@@ -2252,13 +2690,26 @@ fn draw_list(frame: &mut Frame, app: &mut App) {
         })
         .collect();
 
-    let draft_status = if app.include_drafts { " +drafts" } else { "" };
-    let title = match app.mode {
-        AppMode::Review => format!(" PRs requiring review ({}){} ", app.prs.len(), draft_status),
-        AppMode::MyPrs => format!(" My PRs ({}){} ", app.prs.len(), draft_status),
-    };
+    if app.pagination_row_count() > 0 {
+        let label = if app.loading_next_page {
+            "Loading more PRs..."
+        } else {
+            "More PRs..."
+        };
+        items.push(ListItem::new(Line::from(vec![Span::styled(
+            label,
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        )])));
+    }
+
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(title))
+        .block(
+            Block::default()
+                .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
+                .border_style(Style::default().fg(Color::White)),
+        )
         .highlight_style(
             Style::default()
                 .bg(Color::DarkGray)
@@ -2266,14 +2717,15 @@ fn draw_list(frame: &mut Frame, app: &mut App) {
         )
         .highlight_symbol("▶ ");
 
-    frame.render_stateful_widget(list, chunks[0], &mut app.list_state);
+    frame.render_stateful_widget(list, chunks[1], &mut app.list_state);
+    app.load_next_page_if_pagination_visible(chunks[1].height);
 
     let help = Paragraph::new(
-        " j/k: navigate | Ctrl+d/u: page | Enter: open | /: search | o: browser | y: copy URL | R: refresh | q: quit",
+        " Tab/←/→: switch tabs | j/k: navigate | Ctrl+d/u: page | Enter: open | /: search | o: browser | y: copy URL | R: refresh | q: quit",
     )
     .style(Style::default().fg(Color::DarkGray))
     .block(Block::default().borders(Borders::ALL).title(" Help "));
-    frame.render_widget(help, chunks[1]);
+    frame.render_widget(help, chunks[2]);
 }
 
 fn draw_detail(frame: &mut Frame, app: &mut App) {
@@ -2340,15 +2792,16 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
         Span::styled(format!("@{}", pr.author), Style::default().fg(Color::Green)),
         ci_status,
     ]))
-    .block(Block::default().borders(Borders::ALL));
+    .block(Block::default().borders(Borders::TOP | Borders::LEFT | Borders::RIGHT));
     frame.render_widget(header, chunks[0]);
 
     // Tabs
-    let tabs = Tabs::new(vec!["Description", "Diff", "Comments"])
+    let tabs = Tabs::new(vec!["Description", "Diff", "Comments", "Agent"])
         .select(match app.detail_tab {
             DetailTab::Description => 0,
             DetailTab::Diff => 1,
             DetailTab::Comments => 2,
+            DetailTab::Agent => 3,
         })
         .style(Style::default().fg(Color::White))
         .highlight_style(
@@ -2356,7 +2809,7 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         )
-        .block(Block::default().borders(Borders::ALL));
+        .block(Block::default().borders(Borders::TOP | Borders::LEFT | Borders::RIGHT));
     frame.render_widget(tabs, chunks[1]);
 
     // Build diff title with current line info
@@ -2404,11 +2857,14 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
             DetailTab::Description => " Description ".to_string(),
             DetailTab::Diff => diff_title,
             DetailTab::Comments => " Comments ".to_string(),
+            DetailTab::Agent => " Agent ".to_string(),
         });
 
     match app.detail_tab {
         DetailTab::Description => {
-            let body = if pr.body.is_empty() {
+            let body = if app.loading_details && pr.body.is_empty() {
+                "Loading details...".to_string()
+            } else if pr.body.is_empty() {
                 "No description provided.".to_string()
             } else {
                 pr.body.clone()
@@ -2639,6 +3095,54 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
                 .scroll((app.scroll_offset, 0));
             frame.render_widget(para, chunks[2]);
         }
+        DetailTab::Agent => {
+            if app.agent_preview_cache.is_none() && !app.loading_agent_preview {
+                app.load_agent_preview();
+            }
+
+            let body = if app.loading_agent_preview {
+                "Loading agent session...".to_string()
+            } else if let Some(preview) = app.agent_preview_cache.as_ref() {
+                match (&preview.pane, &preview.error) {
+                    (Some(pane), None) => {
+                        let mut text = format!(
+                            "tmux target: {} | {}:{} | {} | {}\n\n",
+                            pane.target,
+                            pane.session_name,
+                            pane.window_index,
+                            pane.pane_command,
+                            pane.pane_title
+                        );
+                        if preview.output.trim().is_empty() {
+                            text.push_str("Agent pane is currently blank.");
+                        } else {
+                            text.push_str(&preview.output);
+                        }
+                        text
+                    }
+                    (Some(pane), Some(err)) => format!(
+                        "Found tmux target {} for {}, but capture failed:\n\n{}",
+                        pane.target, preview.expected_slug, err
+                    ),
+                    (None, Some(err)) => format!(
+                        "Could not inspect tmux for {}:\n\n{}",
+                        preview.expected_slug, err
+                    ),
+                    (None, None) => format!(
+                        "No agent session found for {}.\n\nPress r to launch a review session, then R to refresh this tab.",
+                        preview.expected_slug
+                    ),
+                }
+            } else {
+                "No agent preview loaded.".to_string()
+            };
+
+            let para = Paragraph::new(body)
+                .block(content_block)
+                .wrap(Wrap { trim: false })
+                .scroll((app.scroll_offset, 0));
+            frame.render_widget(para, chunks[2]);
+        }
     }
 
     // Help - context-aware based on tab and mode
@@ -2652,20 +3156,32 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
             AppMode::Review => {
                 " j/k: scroll | Esc: file tree | t: full diff | /: search | c: comment | D: delta | a: approve | R: request changes | o: browser | y: copy | q: back"
             }
+            AppMode::Watching => {
+                " j/k: scroll | Esc: file tree | t: full diff | /: search | c: comment | D: delta | a: approve | o: browser | y: copy | q: back"
+            }
         }
     } else {
         match (app.detail_tab, app.mode) {
+            (DetailTab::Agent, _) => {
+                " Tab: tabs | j/k: scroll | R: refresh agent | Enter/A: attach | r: launch | q: back"
+            }
             (DetailTab::Diff, AppMode::MyPrs) => {
                 " j/k: scroll | /: search | t: tree | D: delta | m: merge | o: browser | y: copy | q: back"
             }
             (DetailTab::Diff, AppMode::Review) => {
                 " j/k: scroll | /: search | t: tree | c: comment | D: delta | a: approve | R: request changes | o: browser | y: copy | q: back"
             }
+            (DetailTab::Diff, AppMode::Watching) => {
+                " j/k: scroll | /: search | t: tree | c: comment | D: delta | a: approve | o: browser | y: copy | q: back"
+            }
             (_, AppMode::MyPrs) => {
                 " Tab: tabs | j/k: scroll | m: merge | o: browser | y: copy | q: back"
             }
             (_, AppMode::Review) => {
                 " Tab: tabs | j/k: scroll | a: approve | R: request changes | o: browser | y: copy | q: back"
+            }
+            (_, AppMode::Watching) => {
+                " Tab: tabs | j/k: scroll | a: approve | o: browser | y: copy | q: back"
             }
         }
     };
@@ -2971,11 +3487,11 @@ fn draw_goto_input(frame: &mut Frame, app: &App) {
 
 pub fn run(
     repos_root: PathBuf,
-    repo_list: Vec<PathBuf>,
     username: String,
     include_drafts: bool,
     ai: AiConfig,
     mode: AppMode,
+    exclude_users: Vec<String>,
 ) -> Result<()> {
     // Setup terminal
     crossterm::terminal::enable_raw_mode()?;
@@ -2987,7 +3503,14 @@ pub fn run(
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::new(backend)?;
 
-    let mut app = App::new(repos_root, repo_list, username, include_drafts, ai, mode);
+    let mut app = App::new(
+        repos_root,
+        username,
+        include_drafts,
+        exclude_users,
+        ai,
+        mode,
+    );
 
     // Start fetching PRs immediately in background
     app.refresh();
@@ -3012,6 +3535,27 @@ pub fn run(
         }
 
         app.handle_event()?;
+        if let Some(target) = app.take_pending_agent_attach_target() {
+            crossterm::terminal::disable_raw_mode()?;
+            crossterm::execute!(
+                terminal.backend_mut(),
+                crossterm::terminal::LeaveAlternateScreen
+            )?;
+            terminal.show_cursor()?;
+
+            let attach_result = agent::switch_or_attach(&target);
+
+            crossterm::execute!(
+                terminal.backend_mut(),
+                crossterm::terminal::EnterAlternateScreen
+            )?;
+            crossterm::terminal::enable_raw_mode()?;
+            terminal.clear()?;
+            app.needs_clear = true;
+            if let Err(err) = attach_result {
+                app.set_status(format!("Failed to attach agent: {:#}", err));
+            }
+        }
 
         if app.should_quit {
             break;
@@ -3545,6 +4089,7 @@ diff --git a/README.md b/README.md
             number,
             title: title.to_string(),
             author: author.to_string(),
+            author_kind: Some("User".to_string()),
             body: String::new(),
             repo_path: PathBuf::from("/tmp/repo"),
             repo_name: repo.to_string(),
@@ -3554,15 +4099,24 @@ diff --git a/README.md b/README.md
             deletions: 0,
             is_draft: false,
             review_state: ReviewState::Pending,
+            details_loaded: true,
+        }
+    }
+
+    fn make_test_page(prs: Vec<PullRequest>) -> gh::PullRequestPage {
+        gh::PullRequestPage {
+            prs,
+            end_cursor: None,
+            has_next_page: false,
         }
     }
 
     fn make_test_app(mode: AppMode) -> App {
         let mut app = App::new(
             PathBuf::new(),
-            Vec::new(),
             "reviewer".to_string(),
             false,
+            Vec::new(),
             AiConfig::default(),
             mode,
         );
@@ -3650,12 +4204,15 @@ diff --git a/README.md b/README.md
         app.loading_diff = true;
 
         app.async_tx
-            .send(AsyncResult::Refresh(vec![make_test_pr(
-                456,
-                "Refreshed PR",
-                "org/reviewer",
-                "bob",
-            )]))
+            .send(AsyncResult::Refresh(
+                AppMode::Review,
+                make_test_page(vec![make_test_pr(
+                    456,
+                    "Refreshed PR",
+                    "org/reviewer",
+                    "bob",
+                )]),
+            ))
             .unwrap();
         app.poll_async_results();
 
@@ -3725,12 +4282,15 @@ diff --git a/README.md b/README.md
         app.diff_cache = Some("fresh diff".to_string());
 
         app.async_tx
-            .send(AsyncResult::Refresh(vec![make_test_pr(
-                123,
-                "Same PR Refreshed",
-                "org/reviewer",
-                "alice",
-            )]))
+            .send(AsyncResult::Refresh(
+                AppMode::Review,
+                make_test_page(vec![make_test_pr(
+                    123,
+                    "Same PR Refreshed",
+                    "org/reviewer",
+                    "alice",
+                )]),
+            ))
             .unwrap();
         app.poll_async_results();
 
@@ -3831,12 +4391,15 @@ diff --git a/README.md b/README.md
         app.scroll_offset = 12;
 
         app.async_tx
-            .send(AsyncResult::Refresh(vec![make_test_pr(
-                123,
-                "Same PR Refreshed",
-                "org/reviewer",
-                "alice",
-            )]))
+            .send(AsyncResult::Refresh(
+                AppMode::Review,
+                make_test_page(vec![make_test_pr(
+                    123,
+                    "Same PR Refreshed",
+                    "org/reviewer",
+                    "alice",
+                )]),
+            ))
             .unwrap();
         app.poll_async_results();
 
@@ -3861,12 +4424,15 @@ diff --git a/README.md b/README.md
         });
 
         app.async_tx
-            .send(AsyncResult::Refresh(vec![make_test_pr(
-                123,
-                "Same PR Refreshed",
-                "org/reviewer",
-                "alice",
-            )]))
+            .send(AsyncResult::Refresh(
+                AppMode::Review,
+                make_test_page(vec![make_test_pr(
+                    123,
+                    "Same PR Refreshed",
+                    "org/reviewer",
+                    "alice",
+                )]),
+            ))
             .unwrap();
         app.poll_async_results();
 
@@ -3883,7 +4449,12 @@ diff --git a/README.md b/README.md
         app.detail_epoch = 9;
         app.loading_diff = true;
 
-        app.async_tx.send(AsyncResult::Refresh(vec![])).unwrap();
+        app.async_tx
+            .send(AsyncResult::Refresh(
+                AppMode::Review,
+                make_test_page(vec![]),
+            ))
+            .unwrap();
         app.poll_async_results();
 
         assert_eq!(app.detail_epoch, 10);

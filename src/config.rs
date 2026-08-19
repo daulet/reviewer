@@ -8,6 +8,14 @@ fn default_poll_interval_sec() -> u64 {
     60
 }
 
+fn default_only_new_prs_on_start() -> bool {
+    true
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct AiLaunchStepConfig {
@@ -16,13 +24,47 @@ pub struct AiLaunchStepConfig {
     pub args: Vec<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct AiLaunchTmuxConfig {
+    pub session: Option<String>,
+    #[serde(default = "default_true")]
+    pub reuse_existing: bool,
+}
+
+impl Default for AiLaunchTmuxConfig {
+    fn default() -> Self {
+        Self {
+            session: None,
+            reuse_existing: true,
+        }
+    }
+}
+
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct AiLaunchConfig {
+    pub backend: Option<String>,
+    #[serde(default)]
+    pub tmux: AiLaunchTmuxConfig,
     #[serde(default)]
     pub steps: Vec<AiLaunchStepConfig>,
     #[serde(default)]
     pub self_review_steps: Vec<AiLaunchStepConfig>,
+}
+
+impl AiLaunchConfig {
+    pub fn backend_key(&self) -> &str {
+        self.backend.as_deref().unwrap_or("steps")
+    }
+
+    pub fn uses_tmux(&self) -> bool {
+        self.backend_key() == "tmux"
+    }
+
+    pub fn is_configured(&self) -> bool {
+        self.uses_tmux() || !self.steps.is_empty()
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
@@ -68,6 +110,13 @@ impl AiConfig {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AutoApproveRule {
+    pub repo: String,
+    pub user: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonConfig {
@@ -81,6 +130,10 @@ pub struct DaemonConfig {
     pub include_drafts: bool,
     #[serde(default)]
     pub repo_subpath_filters: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub auto_approve: Vec<AutoApproveRule>,
+    #[serde(default = "default_only_new_prs_on_start")]
+    pub only_new_prs_on_start: bool,
 }
 
 impl Default for DaemonConfig {
@@ -91,6 +144,8 @@ impl Default for DaemonConfig {
             initialized: false,
             include_drafts: false,
             repo_subpath_filters: HashMap::new(),
+            auto_approve: Vec::new(),
+            only_new_prs_on_start: default_only_new_prs_on_start(),
         }
     }
 }
@@ -101,6 +156,8 @@ pub struct Config {
     pub repos_root: Option<String>,
     #[serde(default)]
     pub exclude: Vec<String>,
+    #[serde(default)]
+    pub exclude_users: Vec<String>,
     #[serde(default)]
     pub ai: AiConfig,
     #[serde(default)]
@@ -181,7 +238,7 @@ fn merge_with_existing_config(existing: Value, updated: Value) -> Value {
     };
 
     let existing_object = ensure_object(&mut existing);
-    for field in ["repos_root", "exclude"] {
+    for field in ["repos_root", "exclude", "exclude_users"] {
         if let Some(value) = updated_object.get(field) {
             existing_object.insert(field.to_string(), value.clone());
         }
@@ -211,6 +268,8 @@ fn merge_with_existing_config(existing: Value, updated: Value) -> Value {
             "initialized",
             "include_drafts",
             "repo_subpath_filters",
+            "auto_approve",
+            "only_new_prs_on_start",
         ],
     );
 
@@ -304,6 +363,7 @@ mod tests {
     fn merge_with_existing_config_preserves_unknown_daemon_fields() {
         let existing = json!({
           "repos_root": "/tmp/repos",
+          "exclude_users": ["@apps/*"],
           "daemon": {
             "poll_interval_sec": 30,
             "exclude_repos": ["org/legacy"],
@@ -312,6 +372,10 @@ mod tests {
             "repo_subpath_filters": {
               "org/repo": ["services/payments"]
             },
+            "auto_approve": [
+              {"repo": "org/reviewer", "user": "dependabot[bot]"}
+            ],
+            "only_new_prs_on_start": false,
             "future_daemon_field": {
               "enabled": true
             }
@@ -324,6 +388,7 @@ mod tests {
         let updated = json!({
           "repos_root": "/tmp/repos-new",
           "exclude": [],
+          "exclude_users": ["dependabot"],
           "ai": {
             "provider": null,
             "command": null,
@@ -331,6 +396,11 @@ mod tests {
             "skill": null,
             "prompt_template": null,
             "launch": {
+              "backend": null,
+              "tmux": {
+                "session": null,
+                "reuse_existing": true
+              },
               "steps": []
             }
           },
@@ -339,13 +409,18 @@ mod tests {
             "exclude_repos": [],
             "initialized": true,
             "include_drafts": false,
-            "repo_subpath_filters": {}
+            "repo_subpath_filters": {},
+            "auto_approve": [],
+            "only_new_prs_on_start": true
           }
         });
 
         let merged = merge_with_existing_config(existing, updated);
         assert_eq!(merged["repos_root"], json!("/tmp/repos-new"));
+        assert_eq!(merged["exclude_users"], json!(["dependabot"]));
         assert_eq!(merged["daemon"]["initialized"], json!(true));
+        assert_eq!(merged["daemon"]["auto_approve"], json!([]));
+        assert_eq!(merged["daemon"]["only_new_prs_on_start"], json!(true));
         assert_eq!(
             merged["daemon"]["future_daemon_field"],
             json!({"enabled": true})
@@ -364,6 +439,10 @@ mod tests {
             "repo_subpath_filters": {
               "org/repo": ["a/b"]
             },
+            "auto_approve": [
+              {"repo": "org/reviewer", "user": "alice"}
+            ],
+            "only_new_prs_on_start": false,
             "future_daemon_field": "keep"
           }
         });
@@ -371,6 +450,7 @@ mod tests {
         let updated = json!({
           "repos_root": null,
           "exclude": [],
+          "exclude_users": [],
           "ai": {
             "provider": null,
             "command": null,
@@ -378,6 +458,11 @@ mod tests {
             "skill": null,
             "prompt_template": null,
             "launch": {
+              "backend": null,
+              "tmux": {
+                "session": null,
+                "reuse_existing": true
+              },
               "steps": []
             }
           },
@@ -386,7 +471,11 @@ mod tests {
             "exclude_repos": [],
             "initialized": true,
             "include_drafts": false,
-            "repo_subpath_filters": {}
+            "repo_subpath_filters": {},
+            "auto_approve": [
+              {"repo": "org/reviewer", "user": "dependabot[bot]"}
+            ],
+            "only_new_prs_on_start": true
           }
         });
 
@@ -394,6 +483,11 @@ mod tests {
         assert_eq!(merged["daemon"]["poll_interval_sec"], json!(60));
         assert_eq!(merged["daemon"]["exclude_repos"], json!([]));
         assert_eq!(merged["daemon"]["repo_subpath_filters"], json!({}));
+        assert_eq!(
+            merged["daemon"]["auto_approve"],
+            json!([{"repo": "org/reviewer", "user": "dependabot[bot]"}])
+        );
+        assert_eq!(merged["daemon"]["only_new_prs_on_start"], json!(true));
         assert_eq!(merged["daemon"]["future_daemon_field"], json!("keep"));
     }
 
@@ -401,5 +495,30 @@ mod tests {
     fn ai_launch_self_review_steps_default_empty() {
         let cfg = Config::default();
         assert!(cfg.ai.launch.self_review_steps.is_empty());
+    }
+
+    #[test]
+    fn ai_launch_tmux_config_defaults_to_reuse_existing() {
+        let cfg = Config::default();
+        assert!(cfg.ai.launch.tmux.reuse_existing);
+        assert_eq!(cfg.ai.launch.backend_key(), "steps");
+    }
+
+    #[test]
+    fn exclude_users_default_empty() {
+        let cfg = Config::default();
+        assert!(cfg.exclude_users.is_empty());
+    }
+
+    #[test]
+    fn daemon_auto_approve_rules_default_empty() {
+        let cfg = Config::default();
+        assert!(cfg.daemon.auto_approve.is_empty());
+    }
+
+    #[test]
+    fn daemon_only_new_prs_on_start_default_true() {
+        let cfg = Config::default();
+        assert!(cfg.daemon.only_new_prs_on_start);
     }
 }

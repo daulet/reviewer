@@ -1,4 +1,5 @@
-use crate::config::{self, AiConfig, Config};
+use crate::config::{self, AiConfig, AutoApproveRule, Config};
+use crate::filters::{author_excluded, normalize_user_patterns, wildcard_match};
 use crate::gh::{self, PullRequest};
 use crate::repos;
 use anyhow::{anyhow, Context, Result};
@@ -42,6 +43,21 @@ impl ReviewTriggerKind {
         match self {
             Self::Review => "review",
             Self::SelfReview => "self-review",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TriggerAction {
+    Review(ReviewTriggerKind),
+    AutoApprove,
+}
+
+impl TriggerAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Review(kind) => kind.label(),
+            Self::AutoApprove => "auto-approve",
         }
     }
 }
@@ -95,8 +111,11 @@ pub struct DaemonStatus {
     pub initialized: bool,
     pub poll_interval_sec: u64,
     pub include_drafts: bool,
+    pub only_new_prs_on_start: bool,
     pub excluded_repos: Vec<String>,
+    pub excluded_users: Vec<String>,
     pub repo_subpath_filters: Vec<RepoSubpathFilterStatus>,
+    pub auto_approve_rules: Vec<AutoApproveRule>,
     pub reviewed_count: usize,
     pub seeded_count: usize,
     pub success_count: usize,
@@ -316,6 +335,28 @@ fn normalize_subpaths(paths: &[String]) -> Vec<String> {
     normalized
 }
 
+fn normalize_auto_approve_rules(rules: &[AutoApproveRule]) -> Vec<AutoApproveRule> {
+    let mut normalized = Vec::new();
+    let mut seen = HashSet::new();
+
+    for rule in rules {
+        let repo = rule.repo.trim().to_lowercase();
+        let user = rule.user.trim().to_lowercase();
+        if repo.is_empty() || user.is_empty() {
+            continue;
+        }
+
+        if !seen.insert((repo.clone(), user.clone())) {
+            continue;
+        }
+
+        normalized.push(AutoApproveRule { repo, user });
+    }
+
+    normalized.sort_by(|a, b| (&a.repo, &a.user).cmp(&(&b.repo, &b.user)));
+    normalized
+}
+
 fn normalize_repo_subpath_filters(
     repo_subpath_filters: &RepoSubpathFilterMap,
 ) -> RepoSubpathFilterMap {
@@ -394,6 +435,59 @@ fn classify_trigger_kind(pr: &PullRequest, username: &str) -> Option<ReviewTrigg
     Some(ReviewTriggerKind::Review)
 }
 
+fn should_auto_approve(pr: &PullRequest, auto_approve_rules: &[AutoApproveRule]) -> bool {
+    let repo = pr.repo_name.trim().to_lowercase();
+    let author = pr.author.trim().to_lowercase();
+
+    auto_approve_rules.iter().any(|rule| {
+        let repo_pattern = rule.repo.trim().to_lowercase();
+        let user_pattern = rule.user.trim().to_lowercase();
+        if repo_pattern.is_empty() || user_pattern.is_empty() {
+            return false;
+        }
+
+        wildcard_match(&repo_pattern, &repo) && wildcard_match(&user_pattern, &author)
+    })
+}
+
+fn select_trigger_action(
+    pr: &PullRequest,
+    trigger_kind: ReviewTriggerKind,
+    auto_approve_rules: &[AutoApproveRule],
+) -> TriggerAction {
+    if trigger_kind == ReviewTriggerKind::Review && should_auto_approve(pr, auto_approve_rules) {
+        TriggerAction::AutoApprove
+    } else {
+        TriggerAction::Review(trigger_kind)
+    }
+}
+
+fn candidate_action_allowed(
+    candidate: &DaemonReviewCandidate,
+    action: TriggerAction,
+    excluded_users: &[String],
+) -> bool {
+    action == TriggerAction::AutoApprove
+        || !author_excluded(
+            &candidate.pr.author,
+            candidate.pr.author_kind.as_deref(),
+            excluded_users,
+        )
+}
+
+fn trigger_action(
+    pr: &PullRequest,
+    repos_root: &Path,
+    ai: &AiConfig,
+    action: TriggerAction,
+) -> Result<()> {
+    match action {
+        TriggerAction::Review(trigger_kind) => trigger_review(pr, repos_root, ai, trigger_kind),
+        TriggerAction::AutoApprove => gh::approve_pr(pr, None)
+            .with_context(|| format!("Failed to auto-approve {}#{}", pr.repo_name, pr.number)),
+    }
+}
+
 fn collect_open_prs(
     repos: &[RepoDescriptor],
     excluded_repos: &HashSet<String>,
@@ -401,6 +495,28 @@ fn collect_open_prs(
     username: &str,
     include_drafts: bool,
 ) -> Vec<DaemonReviewCandidate> {
+    collect_monitored_prs(
+        repos,
+        excluded_repos,
+        repo_subpath_filters,
+        username,
+        include_drafts,
+    )
+    .into_iter()
+    .filter_map(|pr| {
+        classify_trigger_kind(&pr, username)
+            .map(|trigger_kind| DaemonReviewCandidate { pr, trigger_kind })
+    })
+    .collect()
+}
+
+fn collect_monitored_prs(
+    repos: &[RepoDescriptor],
+    excluded_repos: &HashSet<String>,
+    repo_subpath_filters: &RepoSubpathFilterMap,
+    username: &str,
+    include_drafts: bool,
+) -> Vec<PullRequest> {
     repos
         .par_iter()
         .filter(|repo| !excluded_repos.contains(&repo.name))
@@ -408,13 +524,34 @@ fn collect_open_prs(
             let prs = gh::fetch_prs_for_repo_with_authored(&repo.path, username, include_drafts);
             apply_repo_subpath_filter(repo, prs, repo_subpath_filters)
                 .into_iter()
-                .filter_map(|pr| {
-                    classify_trigger_kind(&pr, username)
-                        .map(|trigger_kind| DaemonReviewCandidate { pr, trigger_kind })
-                })
                 .collect::<Vec<_>>()
         })
         .collect()
+}
+
+pub fn list_watched_prs(
+    cfg: &Config,
+    repos_root: &Path,
+    username: &str,
+    include_drafts: bool,
+) -> Vec<PullRequest> {
+    let repos = discover_repos(repos_root, &cfg.exclude);
+    let excluded_repos = monitored_repo_set(&cfg.daemon.exclude_repos);
+    let repo_subpath_filters = normalize_repo_subpath_filters(&cfg.daemon.repo_subpath_filters);
+    let mut prs = collect_monitored_prs(
+        &repos,
+        &excluded_repos,
+        &repo_subpath_filters,
+        username,
+        include_drafts,
+    );
+    prs.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| a.repo_name.cmp(&b.repo_name))
+            .then_with(|| a.number.cmp(&b.number))
+    });
+    prs
 }
 
 fn build_seed_record(pr: &PullRequest, now: DateTime<Utc>) -> ReviewedPrRecord {
@@ -436,17 +573,13 @@ fn trigger_review(
     ai: &AiConfig,
     trigger_kind: ReviewTriggerKind,
 ) -> Result<()> {
-    let mut ai_for_launch = ai.clone();
-    if trigger_kind == ReviewTriggerKind::SelfReview && !ai.launch.self_review_steps.is_empty() {
-        ai_for_launch.launch.steps = ai.launch.self_review_steps.clone();
-    }
     let worktree_path = gh::create_pr_worktree(pr, repos_root).with_context(|| {
         format!(
             "Failed to create worktree for {}#{}",
             pr.repo_name, pr.number
         )
     })?;
-    gh::launch_ai(&worktree_path, pr, &ai_for_launch).with_context(|| {
+    gh::launch_ai(&worktree_path, pr, ai).with_context(|| {
         format!(
             "Failed to launch AI {} for {}#{}",
             trigger_kind.label(),
@@ -457,6 +590,37 @@ fn trigger_review(
     Ok(())
 }
 
+fn ai_config_for_trigger_kind(ai: &AiConfig, trigger_kind: ReviewTriggerKind) -> Option<AiConfig> {
+    if ai.launch.uses_tmux() {
+        return Some(ai.clone());
+    }
+
+    if !ai.launch.is_configured() {
+        return None;
+    }
+
+    if trigger_kind == ReviewTriggerKind::SelfReview && !ai.launch.self_review_steps.is_empty() {
+        let mut self_review_ai = ai.clone();
+        self_review_ai.launch.steps = ai.launch.self_review_steps.clone();
+        return Some(self_review_ai);
+    }
+
+    Some(ai.clone())
+}
+
+fn ai_config_for_action<'a>(
+    action: TriggerAction,
+    review_ai: &'a Option<AiConfig>,
+    self_review_ai: &'a Option<AiConfig>,
+    default_ai: &'a AiConfig,
+) -> Option<&'a AiConfig> {
+    match action {
+        TriggerAction::AutoApprove => Some(default_ai),
+        TriggerAction::Review(ReviewTriggerKind::Review) => review_ai.as_ref(),
+        TriggerAction::Review(ReviewTriggerKind::SelfReview) => self_review_ai.as_ref(),
+    }
+}
+
 fn seed_existing_open_prs(
     state: &mut DaemonState,
     repos: &[RepoDescriptor],
@@ -464,6 +628,7 @@ fn seed_existing_open_prs(
     username: &str,
 ) -> usize {
     let excluded_repos = monitored_repo_set(&cfg.daemon.exclude_repos);
+    let excluded_users = normalize_user_patterns(&cfg.exclude_users);
     let repo_subpath_filters = normalize_repo_subpath_filters(&cfg.daemon.repo_subpath_filters);
     let prs = collect_open_prs(
         repos,
@@ -471,7 +636,16 @@ fn seed_existing_open_prs(
         &repo_subpath_filters,
         username,
         cfg.daemon.include_drafts,
-    );
+    )
+    .into_iter()
+    .filter(|candidate| {
+        !author_excluded(
+            &candidate.pr.author,
+            candidate.pr.author_kind.as_deref(),
+            &excluded_users,
+        )
+    })
+    .collect::<Vec<_>>();
     let now = Utc::now();
     let mut seeded = 0usize;
 
@@ -510,16 +684,24 @@ pub fn init(cfg: &mut Config, repos_root: &Path, username: &str) -> Result<()> {
     cfg.daemon.initialized = true;
     config::save_config(cfg)?;
 
-    let mut state = load_state();
-    let seeded = seed_existing_open_prs(&mut state, &repos, cfg, username);
-    save_state(&state)?;
-
-    println!(
-        "Daemon initialized. Monitoring {} repos ({} excluded). Seeded {} existing PRs as already seen.",
-        repos.len().saturating_sub(cfg.daemon.exclude_repos.len()),
-        cfg.daemon.exclude_repos.len(),
-        seeded
-    );
+    let monitored_count = repos.len().saturating_sub(cfg.daemon.exclude_repos.len());
+    if cfg.daemon.only_new_prs_on_start {
+        let mut state = load_state();
+        let seeded = seed_existing_open_prs(&mut state, &repos, cfg, username);
+        save_state(&state)?;
+        println!(
+            "Daemon initialized. Monitoring {} repos ({} excluded). Seeded {} existing PRs as already seen.",
+            monitored_count,
+            cfg.daemon.exclude_repos.len(),
+            seeded
+        );
+    } else {
+        println!(
+            "Daemon initialized. Monitoring {} repos ({} excluded). Existing open PRs will be processed on next run.",
+            monitored_count,
+            cfg.daemon.exclude_repos.len()
+        );
+    }
 
     Ok(())
 }
@@ -539,7 +721,56 @@ pub fn poll_once(cfg: &Config, repos_root: &Path, username: &str) -> Result<Poll
         username,
         cfg.daemon.include_drafts,
     );
-    let open_pr_count = open_prs.len();
+    let auto_approve_rules = normalize_auto_approve_rules(&cfg.daemon.auto_approve);
+    let excluded_users = normalize_user_patterns(&cfg.exclude_users);
+    let candidate_actions = open_prs
+        .into_iter()
+        .map(|candidate| {
+            let action =
+                select_trigger_action(&candidate.pr, candidate.trigger_kind, &auto_approve_rules);
+            (candidate, action)
+        })
+        .filter(|(candidate, action)| candidate_action_allowed(candidate, *action, &excluded_users))
+        .collect::<Vec<_>>();
+    let mut review_ai = ai_config_for_trigger_kind(&cfg.ai, ReviewTriggerKind::Review);
+    let mut self_review_ai = ai_config_for_trigger_kind(&cfg.ai, ReviewTriggerKind::SelfReview);
+    let has_review_actions = candidate_actions
+        .iter()
+        .any(|(_, action)| *action == TriggerAction::Review(ReviewTriggerKind::Review));
+    let has_self_review_actions = candidate_actions
+        .iter()
+        .any(|(_, action)| *action == TriggerAction::Review(ReviewTriggerKind::SelfReview));
+    if has_review_actions {
+        if let Some(ai_cfg) = review_ai.as_ref() {
+            if let Err(err) = gh::validate_ai_launch_config(ai_cfg) {
+                eprintln!(
+                    "Skipping review triggers this poll: invalid ai.launch config: {:#}",
+                    err
+                );
+                review_ai = None;
+            }
+        } else {
+            eprintln!(
+                "Skipping review triggers this poll: ai.launch is not configured. Configure ai.launch.steps or ai.launch.backend."
+            );
+        }
+    }
+    if has_self_review_actions {
+        if let Some(ai_cfg) = self_review_ai.as_ref() {
+            if let Err(err) = gh::validate_ai_launch_config(ai_cfg) {
+                eprintln!(
+                    "Skipping self-review triggers this poll: invalid launcher config: {:#}",
+                    err
+                );
+                self_review_ai = None;
+            }
+        } else {
+            eprintln!(
+                "Skipping self-review triggers this poll: ai.launch is not configured. Configure ai.launch.steps, ai.launch.self_review_steps, or ai.launch.backend."
+            );
+        }
+    }
+    let open_pr_count = candidate_actions.len();
 
     let now = Utc::now();
     let mut state = load_state();
@@ -547,8 +778,9 @@ pub fn poll_once(cfg: &Config, repos_root: &Path, username: &str) -> Result<Poll
     let mut triggered = 0usize;
     let mut failed = 0usize;
 
-    for candidate in open_prs {
-        let DaemonReviewCandidate { pr, trigger_kind } = candidate;
+    for (candidate, action) in candidate_actions {
+        let DaemonReviewCandidate { pr, .. } = candidate;
+        let ai_for_action = ai_config_for_action(action, &review_ai, &self_review_ai, &cfg.ai);
         let key = pr_key(&pr.repo_name, pr.number);
         if let Some(existing) = state.prs.get_mut(&key) {
             existing.last_seen_at = now;
@@ -557,14 +789,18 @@ pub fn poll_once(cfg: &Config, repos_root: &Path, username: &str) -> Result<Poll
             if existing.trigger_status != TriggerStatus::Failed {
                 continue;
             }
+            let Some(ai_config) = ai_for_action else {
+                // Missing or invalid launcher config for this action; do not retry yet.
+                continue;
+            };
 
             println!(
                 "Retrying failed {} trigger for {}#{}",
-                trigger_kind.label(),
+                action.label(),
                 pr.repo_name,
                 pr.number
             );
-            match trigger_review(&pr, repos_root, &cfg.ai, trigger_kind) {
+            match trigger_action(&pr, repos_root, ai_config, action) {
                 Ok(()) => {
                     existing.triggered_at = Some(Utc::now());
                     existing.trigger_status = TriggerStatus::Success;
@@ -572,7 +808,7 @@ pub fn poll_once(cfg: &Config, repos_root: &Path, username: &str) -> Result<Poll
                     triggered += 1;
                     println!(
                         "Triggered {} for {}#{}",
-                        trigger_kind.label(),
+                        action.label(),
                         pr.repo_name,
                         pr.number
                     );
@@ -583,7 +819,7 @@ pub fn poll_once(cfg: &Config, repos_root: &Path, username: &str) -> Result<Poll
                     failed += 1;
                     eprintln!(
                         "Failed to retry {} trigger for {}#{}: {:#}",
-                        trigger_kind.label(),
+                        action.label(),
                         pr.repo_name,
                         pr.number,
                         err
@@ -592,25 +828,29 @@ pub fn poll_once(cfg: &Config, repos_root: &Path, username: &str) -> Result<Poll
             }
             continue;
         }
+        let Some(ai_config) = ai_for_action else {
+            // Missing or invalid launcher config for this action; keep PR unseen for future polls.
+            continue;
+        };
 
         new_prs += 1;
         println!(
             "New PR detected for {}: {}#{} - {}",
-            trigger_kind.label(),
+            action.label(),
             pr.repo_name,
             pr.number,
             pr.title
         );
 
         let mut record = build_seed_record(&pr, now);
-        match trigger_review(&pr, repos_root, &cfg.ai, trigger_kind) {
+        match trigger_action(&pr, repos_root, ai_config, action) {
             Ok(()) => {
                 record.triggered_at = Some(Utc::now());
                 record.trigger_status = TriggerStatus::Success;
                 triggered += 1;
                 println!(
                     "Triggered {} for {}#{}",
-                    trigger_kind.label(),
+                    action.label(),
                     pr.repo_name,
                     pr.number
                 );
@@ -621,7 +861,7 @@ pub fn poll_once(cfg: &Config, repos_root: &Path, username: &str) -> Result<Poll
                 failed += 1;
                 eprintln!(
                     "Failed to trigger {} for {}#{}: {:#}",
-                    trigger_kind.label(),
+                    action.label(),
                     pr.repo_name,
                     pr.number,
                     err
@@ -663,8 +903,11 @@ pub fn run(
     let subpath_filter_count =
         normalize_repo_subpath_filter_status(&cfg.daemon.repo_subpath_filters).len();
     println!(
-        "Daemon running. Poll interval: {}s. Include drafts: {}. Repo subpath filters: {}.",
-        poll_interval_sec, cfg.daemon.include_drafts, subpath_filter_count
+        "Daemon running. Poll interval: {}s. Include drafts: {}. Repo subpath filters: {}. Only new PRs on first run: {}.",
+        poll_interval_sec,
+        cfg.daemon.include_drafts,
+        subpath_filter_count,
+        cfg.daemon.only_new_prs_on_start
     );
     let mut auto_restart_watcher = if once {
         None
@@ -723,16 +966,21 @@ pub fn status(cfg: &Config) -> DaemonStatus {
     }
 
     let excluded_repos = normalize_repo_names(cfg.daemon.exclude_repos.clone());
+    let excluded_users = normalize_user_patterns(&cfg.exclude_users);
     let repo_subpath_filters =
         normalize_repo_subpath_filter_status(&cfg.daemon.repo_subpath_filters);
+    let auto_approve_rules = normalize_auto_approve_rules(&cfg.daemon.auto_approve);
 
     DaemonStatus {
         state_path: state_path(),
         initialized: cfg.daemon.initialized,
         poll_interval_sec: cfg.daemon.poll_interval_sec,
         include_drafts: cfg.daemon.include_drafts,
+        only_new_prs_on_start: cfg.daemon.only_new_prs_on_start,
         excluded_repos,
+        excluded_users,
         repo_subpath_filters,
+        auto_approve_rules,
         reviewed_count: state.prs.len(),
         seeded_count,
         success_count,
@@ -1452,6 +1700,7 @@ mod tests {
             number: 42,
             title: "Test PR".to_string(),
             author: author.to_string(),
+            author_kind: Some("User".to_string()),
             body: String::new(),
             repo_path: PathBuf::from("/tmp/repo"),
             repo_name: "org/reviewer".to_string(),
@@ -1461,6 +1710,7 @@ mod tests {
             deletions: 1,
             is_draft,
             review_state: ReviewState::Pending,
+            details_loaded: true,
         }
     }
 
@@ -1520,6 +1770,54 @@ mod tests {
     }
 
     #[test]
+    fn normalize_auto_approve_rules_trims_lowercases_and_dedups() {
+        let rules = vec![
+            AutoApproveRule {
+                repo: " Org/Repo ".to_string(),
+                user: " Alice ".to_string(),
+            },
+            AutoApproveRule {
+                repo: "org/repo".to_string(),
+                user: "alice".to_string(),
+            },
+            AutoApproveRule {
+                repo: "org/other".to_string(),
+                user: "".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            normalize_auto_approve_rules(&rules),
+            vec![AutoApproveRule {
+                repo: "org/repo".to_string(),
+                user: "alice".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn wildcard_match_supports_star_and_question() {
+        assert!(wildcard_match("org/*", "org/reviewer"));
+        assert!(wildcard_match("*bot", "dependabot"));
+        assert!(wildcard_match("renovate[bo?]", "renovate[bot]"));
+        assert!(!wildcard_match("org/*", "other/reviewer"));
+        assert!(!wildcard_match("*bot", "alice"));
+    }
+
+    #[test]
+    fn should_auto_approve_supports_case_insensitive_patterns() {
+        let mut pr = make_test_pr("Dependabot[Bot]", false);
+        pr.repo_name = "Org/Reviewer".to_string();
+
+        let rules = vec![AutoApproveRule {
+            repo: "org/*".to_string(),
+            user: "*bot]".to_string(),
+        }];
+
+        assert!(should_auto_approve(&pr, &rules));
+    }
+
+    #[test]
     fn classify_trigger_kind_marks_other_authors_as_review() {
         let pr = make_test_pr("alice", false);
         assert_eq!(
@@ -1541,6 +1839,103 @@ mod tests {
     fn classify_trigger_kind_skips_authored_draft_prs() {
         let pr = make_test_pr("alice", true);
         assert_eq!(classify_trigger_kind(&pr, "alice"), None);
+    }
+
+    #[test]
+    fn ai_config_for_trigger_kind_requires_review_steps_for_review_action() {
+        let ai = AiConfig::default();
+        assert!(ai_config_for_trigger_kind(&ai, ReviewTriggerKind::Review).is_none());
+    }
+
+    #[test]
+    fn ai_config_for_trigger_kind_accepts_tmux_backend_without_steps() {
+        let mut ai = AiConfig::default();
+        ai.launch.backend = Some("tmux".to_string());
+
+        assert!(ai_config_for_trigger_kind(&ai, ReviewTriggerKind::Review).is_some());
+        assert!(ai_config_for_trigger_kind(&ai, ReviewTriggerKind::SelfReview).is_some());
+    }
+
+    #[test]
+    fn ai_config_for_trigger_kind_self_review_falls_back_to_review_steps() {
+        let mut ai = AiConfig::default();
+        ai.launch.steps = vec![crate::config::AiLaunchStepConfig {
+            command: "maestro".to_string(),
+            args: vec!["start".to_string()],
+        }];
+
+        let self_ai = ai_config_for_trigger_kind(&ai, ReviewTriggerKind::SelfReview)
+            .expect("self-review should use review steps when dedicated steps are absent");
+        assert_eq!(self_ai.launch.steps.len(), 1);
+        assert_eq!(self_ai.launch.steps[0].command, "maestro");
+    }
+
+    #[test]
+    fn ai_config_for_trigger_kind_self_review_prefers_self_review_steps() {
+        let mut ai = AiConfig::default();
+        ai.launch.steps = vec![crate::config::AiLaunchStepConfig {
+            command: "maestro".to_string(),
+            args: vec!["start".to_string()],
+        }];
+        ai.launch.self_review_steps = vec![crate::config::AiLaunchStepConfig {
+            command: "custom-self".to_string(),
+            args: vec!["run".to_string()],
+        }];
+
+        let self_ai = ai_config_for_trigger_kind(&ai, ReviewTriggerKind::SelfReview)
+            .expect("self-review should use dedicated self-review steps when configured");
+        assert_eq!(self_ai.launch.steps.len(), 1);
+        assert_eq!(self_ai.launch.steps[0].command, "custom-self");
+    }
+
+    #[test]
+    fn select_trigger_action_uses_auto_approve_for_matching_review_rule() {
+        let pr = make_test_pr("Alice", false);
+        let rules = vec![AutoApproveRule {
+            repo: "org/reviewer".to_string(),
+            user: "alice".to_string(),
+        }];
+
+        assert_eq!(
+            select_trigger_action(&pr, ReviewTriggerKind::Review, &rules),
+            TriggerAction::AutoApprove
+        );
+    }
+
+    #[test]
+    fn select_trigger_action_keeps_self_review_for_matching_rule() {
+        let pr = make_test_pr("alice", false);
+        let rules = vec![AutoApproveRule {
+            repo: "org/reviewer".to_string(),
+            user: "alice".to_string(),
+        }];
+
+        assert_eq!(
+            select_trigger_action(&pr, ReviewTriggerKind::SelfReview, &rules),
+            TriggerAction::Review(ReviewTriggerKind::SelfReview)
+        );
+    }
+
+    #[test]
+    fn excluded_user_filter_keeps_auto_approve_actions() {
+        let mut pr = make_test_pr("lpu-renovate", false);
+        pr.author_kind = Some("Bot".to_string());
+        let candidate = DaemonReviewCandidate {
+            pr,
+            trigger_kind: ReviewTriggerKind::Review,
+        };
+        let excluded_users = normalize_user_patterns(&["@apps/*".to_string()]);
+
+        assert!(candidate_action_allowed(
+            &candidate,
+            TriggerAction::AutoApprove,
+            &excluded_users
+        ));
+        assert!(!candidate_action_allowed(
+            &candidate,
+            TriggerAction::Review(ReviewTriggerKind::Review),
+            &excluded_users
+        ));
     }
 
     #[test]

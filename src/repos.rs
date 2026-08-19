@@ -23,15 +23,7 @@ impl DiscoveredRepo {
 
 #[derive(Debug, Clone)]
 pub struct RepoScanResult {
-    pub discovered_count: usize,
     pub unique_repos: Vec<DiscoveredRepo>,
-}
-
-impl RepoScanResult {
-    pub fn duplicates_skipped(&self) -> usize {
-        self.discovered_count
-            .saturating_sub(self.unique_repos.len())
-    }
 }
 
 /// Find git repositories under root, excluding specified directories.
@@ -103,7 +95,6 @@ where
 
 pub fn scan_unique_repos(root: &Path, max_depth: usize, exclude: &[String]) -> RepoScanResult {
     let repo_paths = find_repos(root, max_depth, exclude);
-    let discovered_count = repo_paths.len();
 
     let discovered: Vec<DiscoveredRepo> = repo_paths
         .par_iter()
@@ -119,10 +110,7 @@ pub fn scan_unique_repos(root: &Path, max_depth: usize, exclude: &[String]) -> R
         |repo| repo.path.to_string_lossy().to_string(),
     );
 
-    RepoScanResult {
-        discovered_count,
-        unique_repos,
-    }
+    RepoScanResult { unique_repos }
 }
 
 #[cfg(test)]
